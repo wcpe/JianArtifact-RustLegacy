@@ -25,17 +25,26 @@ export default {
     noProxyLabel: '直连绕过（no_proxy）',
     // 每代理独立测试按钮（FR-128 回流 UX 改造）
     testButton: '测试',
+    // 「清除代理」按钮：清空该槽位的 URL / 用户名 / 密码 — 仅影响该代理，不动其它代理。
+    clearProxy: '清除代理',
+    proxyWillClear: '保存后清除该代理',
     // 模态框（每代理各一个「测试」按钮 → 弹出模态框 → 输入 URL → 测试 → 显示结果）
     testModalTitle: '连通性测试',
-    testModalDesc: '经当前生效出站代理访问目标 URL，验证代理是否可达。',
+    testModalDesc: '经当前生效出站代理访问目标 URL，验证代理是否可达。默认 10 秒超时。',
     testUrlLabel: '目标 URL',
     testUrlPlaceholder: 'https://example.com',
     testRunButton: '测试',
     testTesting: '测试中…',
-    testResultOk: '连通（{{status}} · {{elapsed_ms}} ms）',
-    testResultFail: '失败：{{error}}',
+    // 测试按钮旁的辅助按钮（UX 完善：避免用户手敲默认 URL）
+    resetUrl: '重置',
+    // 测试结果展示
+    testResultOk: '连通（{{status}} · {{elapsed}}）',
+    testResultFail: '失败：{{error}}（{{elapsed}}）',
     testResultFailNoError: '连接失败',
     testUrlRequired: '请填写目标 URL',
+    // 错误区辅助
+    timeout: '请求超时',
+    copyError: '复制错误',
   },
   // 单代理三字段子组件（ProxyFields）
   proxyFields: {

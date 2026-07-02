@@ -2,6 +2,10 @@
 // 路径与字段严格对齐后端真实契约。
 
 import { ApiError, getToken, request } from './client';
+
+// 透传 `ApiError` 给上层（设置页等需要按 status 区分超时 / 网络错等异常）；
+// 这里重导出以避免上层直接依赖 `./client`。
+export { ApiError };
 import type {
   ProtectionConfig,
   AclDto,
@@ -557,10 +561,28 @@ export function updateSettings(patch: SettingsPatch): Promise<SettingsView> {
   return request<SettingsView>('/settings', { method: 'PATCH', body: patch });
 }
 
+/** 出站代理连通性测试的可选参数（仅管理员）。 */
+export interface ProxyTestOptions {
+  /**
+   * 请求超时（毫秒）。默认 10000：与后端 `/settings/proxy-test` 的 10s 超时对齐，
+   * 防止 UI 因网络/后端假死而永久卡在「测试中…」。
+   */
+  timeoutMs?: number;
+  /**
+   * 外部 AbortSignal：调用方主动中断时立即取消（常用于模态框关闭 / URL 改动作废旧请求）。
+   */
+  signal?: AbortSignal;
+}
+
 /** 出站代理连通性测试（FR-128，仅管理员）：经当前生效出站代理对给定 URL 发 GET，返回连通性。 */
-export function testProxy(url: string): Promise<ProxyTestResult> {
+export function testProxy(url: string, options: ProxyTestOptions = {}): Promise<ProxyTestResult> {
   const body: ProxyTestRequest = { url };
-  return request<ProxyTestResult>('/settings/proxy-test', { method: 'POST', body });
+  return request<ProxyTestResult>('/settings/proxy-test', {
+    method: 'POST',
+    body,
+    timeoutMs: options.timeoutMs ?? 10_000,
+    signal: options.signal,
+  });
 }
 
 /** 读取动态配置面板各非密钥节的当前 / 待生效值（仅管理员，FR-106）。 */

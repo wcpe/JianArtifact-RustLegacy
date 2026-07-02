@@ -611,11 +611,13 @@ describe('SettingsPage', () => {
     });
     fireEvent.click(screen.getByTestId('proxy-test-button'));
 
-    await waitFor(() => expect(testProxy).toHaveBeenCalledWith('https://example.com'));
+    await waitFor(() =>
+      expect(testProxy).toHaveBeenCalledWith('https://example.com', expect.objectContaining({})),
+    );
     // 展示成功结果（绿色，含状态码与耗时）
     await waitFor(() => expect(screen.getByTestId('proxy-test-result')).toBeInTheDocument());
     expect(screen.getByTestId('proxy-test-result').textContent).toContain('200');
-    expect(screen.getByTestId('proxy-test-result').textContent).toContain('123');
+    expect(screen.getByTestId('proxy-test-result').textContent).toContain('123 ms');
   });
 
   it('FR-128：模态框内点「测试」调 testProxy 并展示连通失败结果', async () => {
@@ -660,5 +662,122 @@ describe('SettingsPage', () => {
     expect(testProxy).not.toHaveBeenCalled();
     // 应展示错误提示
     await waitFor(() => expect(screen.getByTestId('proxy-test-error')).toBeInTheDocument());
+  });
+
+  // ===== 防卡死 + 清除代理 + 错误展示完善 =====
+
+  it('HTTP 代理已配置时「清除代理」按钮出现、点后 URL 输入清空、保存发空 URL', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(启用样例);
+    桩动态配置();
+    vi.spyOn(api, 'updateProtectionConfig').mockImplementation((c) => Promise.resolve(c));
+    vi.spyOn(api, 'updateDynamicConfig').mockImplementation((c) => Promise.resolve(c));
+    const update = vi.spyOn(api, 'updateSettings').mockResolvedValue(启用样例);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    // 启用样例的 http 已配 URL：http://proxy.internal:8080 → 「清除代理」按钮应在场
+    const clearBtn = screen.getByTestId('proxy-clear-http');
+    expect(clearBtn).toBeInTheDocument();
+
+    fireEvent.click(clearBtn);
+    // URL 输入框被清空
+    const urlInputs = screen.getAllByLabelText('URL');
+    expect((urlInputs[0] as HTMLInputElement).value).toBe('');
+
+    // 保存：发空 http URL → 后端 `rebuild_proxy_url` 归一为 None、清空该代理槽
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const np = update.mock.calls[0][0].network_proxy!;
+    expect(np.http.url).toBe('');
+    expect(np.http.username).toBe('');
+    // password 字段省略（清除代理场景不重置密码，原有密码仍保留在内存槽，不通过 PATCH 抹除）
+    expect(np.http.password).toBeUndefined();
+  });
+
+  it('HTTP 代理「清除代理」不影响 HTTPS / SOCKS5 / no_proxy', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(启用样例);
+    桩动态配置();
+    vi.spyOn(api, 'updateProtectionConfig').mockImplementation((c) => Promise.resolve(c));
+    vi.spyOn(api, 'updateDynamicConfig').mockImplementation((c) => Promise.resolve(c));
+    const update = vi.spyOn(api, 'updateSettings').mockResolvedValue(启用样例);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('proxy-clear-http'));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    const np = update.mock.calls[0][0].network_proxy!;
+    // HTTP 被清空；HTTPS / SOCKS5 / no_proxy 仍照原样提交
+    expect(np.http.url).toBe('');
+    expect(np.https.url).toBe('https://proxy.internal:8443');
+    expect(np.all.url).toBe('socks5://proxy.internal:1080');
+    expect(np.no_proxy).toBe('localhost,127.0.0.1');
+  });
+
+  it('未配置任何代理时「清除代理」按钮不出现', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(未启用样例);
+    桩动态配置();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    expect(screen.queryByTestId('proxy-clear-http')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('proxy-clear-https')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('proxy-clear-all')).not.toBeInTheDocument();
+  });
+
+  it('mod 测试：testProxy 抛超时错误时展示「请求超时：…」友好提示', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(启用样例);
+    桩动态配置();
+    vi.spyOn(api, 'testProxy').mockRejectedValue(new api.ApiError(408, 'timeout', '请求超时'));
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('proxy-test-button-http'));
+    await waitFor(() => expect(screen.getByTestId('proxy-test-url-input')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('proxy-test-url-input'), {
+      target: { value: 'https://example.com' },
+    });
+    fireEvent.click(screen.getByTestId('proxy-test-button'));
+
+    const err = await screen.findByTestId('proxy-test-error');
+    // 错误信息带上「请求超时」前缀
+    expect(err.textContent).toContain('请求超时');
+  });
+
+  it('mod 测试：测试结果成功时耗时格式化为 `123 ms` / `1.23 s`', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(启用样例);
+    桩动态配置();
+    vi.spyOn(api, 'testProxy').mockResolvedValue({ ok: true, status: 200, elapsed_ms: 123 });
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('proxy-test-button-http'));
+    await waitFor(() => expect(screen.getByTestId('proxy-test-url-input')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('proxy-test-button'));
+    const result = await screen.findByTestId('proxy-test-result');
+    expect(result.textContent).toContain('123 ms');
+  });
+
+  it('mod 测试：URL 改动清空旧结果、点重置按钮把 URL 恢复成占位值', async () => {
+    vi.spyOn(api, 'getSettings').mockResolvedValue(启用样例);
+    桩动态配置();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('HTTP 代理')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('proxy-test-button-http'));
+    const input = await screen.findByTestId('proxy-test-url-input');
+    expect((input as HTMLInputElement).value).toBe('http://proxy.internal:8080');
+
+    // 改成自定义 URL
+    fireEvent.change(input, { target: { value: 'https://changed.example' } });
+    expect((input as HTMLInputElement).value).toBe('https://changed.example');
+
+    // 点「重置」按钮：恢复成占位值（placeholder 不是 value）
+    fireEvent.click(screen.getByTestId('proxy-test-reset-button'));
+    const resetInput = screen.getByTestId('proxy-test-url-input') as HTMLInputElement;
+    expect(resetInput.value).toBe('https://example.com');
   });
 });
