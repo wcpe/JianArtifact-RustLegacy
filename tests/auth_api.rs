@@ -300,8 +300,8 @@ async fn 连续失败达阈值触发限流_429() {
 
 #[tokio::test]
 async fn 锁定到期后可再次登录() {
-    // 锁定窗口 1 秒，便于验证自动恢复
-    let fx = Fixture::with_auth(3600, 2, 1).await;
+    // 锁定窗口留足 3 秒，避免全量并发测试时调度抖动导致锁定检查前窗口已过期。
+    let fx = Fixture::with_auth(3600, 2, 3).await;
     fx.seed_user("admin", "right", Role::Admin).await;
     for _ in 0..2 {
         let _ = send(
@@ -328,7 +328,7 @@ async fn 锁定到期后可再次登录() {
     .await;
     assert_eq!(locked, StatusCode::TOO_MANY_REQUESTS);
     // 等待越过锁定窗口
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
     let (ok, _) = send(
         fx.router(),
         json_req(
