@@ -19,7 +19,7 @@ use crate::migrate::{
     OnlinePullProgress,
 };
 
-use super::{ApiError, AppState, Identity, MigrationJobs, TaskKind, TaskState};
+use super::{ApiError, AppState, Identity, MigrationJobs, TaskState};
 
 /// 把迁移入口错误映射为 HTTP 错误。
 impl From<MigrateError> for ApiError {
@@ -102,6 +102,10 @@ pub async fn preview_nexus_offline(
     if path.is_empty() {
         return Err(ApiError::BadRequest("blob store 路径不能为空".to_string()));
     }
+    // 离线预览同样会全量扫描 blob store，必须与搬运共用迁移单飞门，避免多标签 / 双击并发打爆磁盘 IO。
+    if state.tasks.migration_in_flight() {
+        return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
+    }
     // 廉价同步预校验：路径必须是存在的目录——对明显错误的路径即时 400，无需起后台任务
     //（一次 stat 开销可忽略；真正高开销的 content/ 遍历 + 读上万 .properties 才放后台异步）
     if !std::path::Path::new(&path).is_dir() {
@@ -110,18 +114,19 @@ pub async fn preview_nexus_offline(
         )));
     }
 
+    // 迁移单飞：原子「检查无在途预览 / 搬运 → 登记统一任务」，已有在途即 409。
+    let job_id = Uuid::new_v4().to_string();
+    if !state
+        .tasks
+        .try_begin_migration(job_id.clone(), Some("离线预览".to_string()))
+    {
+        return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
+    }
     // 登记进度共享态与控制句柄（预览为单次枚举、无逐 asset 边界，控制句柄仅为统一注册表形态、不参与取消），
     // 起后台任务执行枚举，端点立即返回 job_id（202）
-    let job_id = Uuid::new_v4().to_string();
     let progress = Arc::new(Mutex::new(OnlinePullProgress::default()));
     let control = Arc::new(JobControl::default());
     jobs.register(job_id.clone(), progress.clone(), control);
-    // 登记统一任务（FR-131）：预览为枚举、不参与迁移单飞门（可与搬运并行），故用普通 register
-    state.tasks.register_with_id(
-        job_id.clone(),
-        TaskKind::Migration,
-        Some("离线预览".to_string()),
-    );
 
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
@@ -766,5 +771,27 @@ mod tests {
             StatusCode::CONFLICT,
             "无在途迁移时不应被单飞门 409 拦截"
         );
+    }
+
+    #[tokio::test]
+    async fn 离线预览_已有在途迁移时第二个_409() {
+        // 回归 BUG-C1：离线预览本身会扫描大 blob store，也必须占用统一迁移单飞门；
+        // 否则页面刷新 / 双击 / 多标签会并发触发多个离线预览扫描，造成 IO 打爆与 UI 卡死。
+        let (state, _dir) = 测试用状态().await;
+        state
+            .tasks
+            .try_begin_migration("in-flight".to_string(), Some("离线预览占位".to_string()));
+        let blob_dir = tempfile::tempdir().unwrap();
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let resp = 请求(
+            state,
+            "/api/v1/migrate/nexus/offline/preview",
+            &token,
+            serde_json::json!({ "path": blob_dir.path().to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = 读_json(resp).await;
+        assert_eq!(body["error"]["message"], "已有迁移任务在途");
     }
 }

@@ -4,12 +4,12 @@
 // 注：真浏览器轮询时序 jsdom 难全测，标「待真机」。
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
 import { MantineProvider } from '@mantine/core';
 import { MemoryRouter } from 'react-router-dom';
 import { TaskCenterPage } from './TaskCenterPage';
 import * as api from '../api/endpoints';
-import type { TaskRecord } from '../api/types';
+import type { OnlinePullJob, TaskDetailDto, TaskRecord } from '../api/types';
 
 /** 构造一条任务记录。 */
 function 任务(overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -20,6 +20,34 @@ function 任务(overrides: Partial<TaskRecord> = {}): TaskRecord {
     label: '在线拉取迁移',
     started_at: Math.floor(Date.now() / 1000) - 60,
     updated_at: Math.floor(Date.now() / 1000),
+    ...overrides,
+  };
+}
+
+/** 构造一条迁移进度明细。 */
+function 迁移进度(overrides: Partial<OnlinePullJob> = {}): OnlinePullJob {
+  return {
+    job_id: 'task-1',
+    phase: 'downloading',
+    total_assets: 10,
+    done_assets: 3,
+    migrated: 2,
+    skipped: 1,
+    current_repo: 'repo-a',
+    current_path: '/content/a.pom',
+    paused: false,
+    repos: [],
+    skipped_repos: [],
+    error: null,
+    ...overrides,
+  };
+}
+
+/** 构造一条任务详情。 */
+function 任务详情(overrides: Partial<TaskDetailDto> = {}): TaskDetailDto {
+  return {
+    ...任务(),
+    migration: 迁移进度(),
     ...overrides,
   };
 }
@@ -135,5 +163,73 @@ describe('TaskCenterPage', () => {
 
     await waitFor(() => expect(screen.getByText('进行中迁移')).toBeInTheDocument());
     expect(screen.getByText('已完成更新')).toBeInTheDocument();
+  });
+
+  it('点击任务行展开详情而不是直接跳走', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'task-1', kind: 'migration', state: 'running', label: '离线预览任务' }),
+    ]);
+    const detailSpy = vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({
+        id: 'task-1',
+        kind: 'migration',
+        state: 'running',
+        label: '离线预览任务',
+        migration: 迁移进度({ current_repo: 'repo-a' }),
+      }),
+    );
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('离线预览任务')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('离线预览任务'));
+
+    await waitFor(() => expect(detailSpy).toHaveBeenCalledWith('task-1'));
+    expect(screen.getByText('任务详情')).toBeInTheDocument();
+    expect(screen.getByText('repo-a')).toBeInTheDocument();
+  });
+
+  it('迁移任务详情提供暂停和结束控制', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'task-1', kind: 'migration', state: 'running', label: '可控迁移' }),
+    ]);
+    vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({ id: 'task-1', label: '可控迁移', migration: 迁移进度() }),
+    );
+    const pauseSpy = vi.spyOn(api, 'pauseMigrationJob').mockResolvedValue();
+    const cancelSpy = vi.spyOn(api, 'cancelMigrationJob').mockResolvedValue();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('可控迁移')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('可控迁移'));
+    await waitFor(() => expect(screen.getByText('任务详情')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    await waitFor(() => expect(pauseSpy).toHaveBeenCalledWith('task-1'));
+
+    fireEvent.click(screen.getByRole('button', { name: '结束' }));
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith('task-1'));
+  });
+
+  it('已暂停迁移任务详情提供继续控制', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'task-1', kind: 'migration', state: 'paused', label: '暂停迁移' }),
+    ]);
+    vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({
+        id: 'task-1',
+        state: 'paused',
+        label: '暂停迁移',
+        migration: 迁移进度({ phase: 'paused', paused: true }),
+      }),
+    );
+    const resumeSpy = vi.spyOn(api, 'resumeMigrationJob').mockResolvedValue();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('暂停迁移')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('暂停迁移'));
+    await waitFor(() => expect(screen.getByText('任务详情')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: '继续' }));
+    await waitFor(() => expect(resumeSpy).toHaveBeenCalledWith('task-1'));
   });
 });

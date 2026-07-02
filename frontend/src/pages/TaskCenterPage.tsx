@@ -1,6 +1,6 @@
 // 任务中心页（FR-132，仅 Admin）：展示统一任务注册表的活跃+近期任务队列。
-// 依赖 FR-131 后端：GET /api/v1/tasks（TaskRecord[]）。
-// 轮询间隔 3s；卸载时立即 clearInterval；无任务显空状态；点击行跳转续看。
+// 依赖 FR-131 后端：GET /api/v1/tasks（TaskRecord[]）与 GET /api/v1/tasks/{id}（详情）。
+// 轮询间隔 3s；卸载时立即 clearInterval；无任务显空状态；点击行展开详情，详情内提供跳转续看与迁移控制。
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -15,6 +15,8 @@ import {
   Center,
   Alert,
   ThemeIcon,
+  Button,
+  Progress,
 } from '@mantine/core';
 import {
   IconArrowsExchange,
@@ -25,7 +27,7 @@ import {
 } from '@tabler/icons-react';
 import { useNavigate } from 'react-router-dom';
 import * as api from '../api/endpoints';
-import type { TaskRecord, TaskKind, TaskState } from '../api/types';
+import type { OnlinePullJob, TaskDetailDto, TaskKind, TaskRecord, TaskState } from '../api/types';
 import { errorMessage } from '../lib/format';
 
 /** 轮询间隔（毫秒）。 */
@@ -64,6 +66,11 @@ function isActive(state: TaskState): boolean {
   return state === 'running' || state === 'paused';
 }
 
+/** 迁移阶段是否为终态。 */
+function isTerminalMigration(phase: OnlinePullJob['phase']): boolean {
+  return phase === 'done' || phase === 'failed' || phase === 'cancelled';
+}
+
 /** 格式化 Unix 秒为本地时间串。 */
 function fmtUnixSecs(secs: number): string {
   return new Date(secs * 1000).toLocaleString('zh-CN', {
@@ -76,7 +83,7 @@ function fmtUnixSecs(secs: number): string {
   });
 }
 
-/** 点击任务行跳转对应续看页路由（按 kind）。 */
+/** 点击详情内按钮跳转对应续看页路由（按 kind）。 */
 function kindRoute(kind: TaskKind): string {
   switch (kind) {
     case 'migration':
@@ -143,9 +150,176 @@ function TaskRow({ task, onClick }: { task: TaskRecord; onClick: () => void }) {
   );
 }
 
+/** 迁移任务进度详情。 */
+function MigrationDetail({ job }: { job: OnlinePullJob }) {
+  const percent = job.total_assets > 0 ? Math.round((job.done_assets / job.total_assets) * 100) : 0;
+  const terminal = isTerminalMigration(job.phase);
+
+  return (
+    <Stack gap="xs">
+      <Progress value={percent} animated={!terminal && !job.paused} aria-label="迁移进度" />
+      <Group gap="md">
+        <Text size="sm" c="dimmed">
+          进度 {job.done_assets} / {job.total_assets}（{percent}%）
+        </Text>
+        <Text size="sm">已迁 {job.migrated}</Text>
+        <Text size="sm" c="dimmed">
+          已跳过 {job.skipped}
+        </Text>
+      </Group>
+      {job.current_repo && (
+        <Text size="sm">
+          当前仓库：
+          <Text span fw={500}>
+            {job.current_repo}
+          </Text>
+        </Text>
+      )}
+      {job.current_path && (
+        <Text size="xs" c="dimmed" style={{ wordBreak: 'break-all' }}>
+          当前文件：{job.current_path}
+        </Text>
+      )}
+      {job.error && (
+        <Alert color="red" variant="light">
+          {job.error}
+        </Alert>
+      )}
+    </Stack>
+  );
+}
+
+/** 任务详情面板。 */
+function TaskDetailPanel({
+  detail,
+  loading,
+  error,
+  controlling,
+  onPause,
+  onResume,
+  onCancel,
+  onJump,
+}: {
+  detail: TaskDetailDto | null;
+  loading: boolean;
+  error: string | null;
+  controlling: boolean;
+  onPause: () => void;
+  onResume: () => void;
+  onCancel: () => void;
+  onJump: () => void;
+}) {
+  if (loading) {
+    return (
+      <Card withBorder padding="sm">
+        <Group gap="xs">
+          <Loader size="xs" />
+          <Text size="sm" c="dimmed">
+            正在加载任务详情…
+          </Text>
+        </Group>
+      </Card>
+    );
+  }
+
+  if (error !== null) {
+    return (
+      <Alert icon={<IconAlertCircle size={16} />} color="red">
+        {error}
+      </Alert>
+    );
+  }
+
+  if (detail === null) {
+    return null;
+  }
+
+  const migration = detail.migration;
+  const terminal = migration ? isTerminalMigration(migration.phase) : !isActive(detail.state);
+  const paused = migration?.paused ?? detail.state === 'paused';
+  // 离线预览是单次阻塞枚举，目前后端控制信号不参与中断；避免展示不可生效的控制按钮。
+  const canControlMigration = detail.kind === 'migration' && detail.label !== '离线预览';
+  const canPause = canControlMigration && migration !== undefined && !terminal && !paused;
+  const canResume = canControlMigration && migration !== undefined && !terminal && paused;
+  const canCancel = canControlMigration && migration !== undefined && !terminal;
+
+  return (
+    <Card withBorder padding="sm" bg="gray.0">
+      <Stack gap="sm">
+        <Group justify="space-between" wrap="nowrap">
+          <Text fw={600}>任务详情</Text>
+          <Button size="xs" variant="default" onClick={onJump}>
+            跳转查看
+          </Button>
+        </Group>
+
+        <Group gap="md">
+          <Text size="sm">ID：{detail.id}</Text>
+          <Text size="sm" c="dimmed">
+            更新时间：{fmtUnixSecs(detail.updated_at)}
+          </Text>
+        </Group>
+
+        {migration && <MigrationDetail job={migration} />}
+        {detail.update && (
+          <Stack gap={2}>
+            <Text size="sm">更新阶段：{detail.update.phase}</Text>
+            <Text size="sm" c="dimmed">
+              当前版本：{detail.update.current_version}
+            </Text>
+            {detail.update.latest_version && (
+              <Text size="sm" c="dimmed">
+                最新版本：{detail.update.latest_version}
+              </Text>
+            )}
+          </Stack>
+        )}
+        {!migration && !detail.update && (
+          <Text size="sm" c="dimmed">
+            此任务暂无更细进度。
+          </Text>
+        )}
+
+        {canControlMigration && migration && (
+          <Group gap="xs">
+            {paused ? (
+              <Button
+                size="xs"
+                variant="light"
+                onClick={onResume}
+                disabled={!canResume || controlling}
+              >
+                继续
+              </Button>
+            ) : (
+              <Button
+                size="xs"
+                variant="light"
+                onClick={onPause}
+                disabled={!canPause || controlling}
+              >
+                暂停
+              </Button>
+            )}
+            <Button
+              size="xs"
+              variant="light"
+              color="red"
+              onClick={onCancel}
+              disabled={!canCancel || controlling}
+            >
+              结束
+            </Button>
+          </Group>
+        )}
+      </Stack>
+    </Card>
+  );
+}
+
 /**
  * 任务中心页（FR-132，仅 Admin）：展示统一任务注册表的活跃+近期任务，
- * 每行点击跳转对应续看页；轮询 3s 自动刷新；离开页面仍可找回已完成历史。
+ * 点击行展开详情；详情内跳转对应续看页；轮询 3s 自动刷新；离开页面仍可找回已完成历史。
  */
 export function TaskCenterPage() {
   const { t } = useTranslation('taskCenter');
@@ -153,6 +327,47 @@ export function TaskCenterPage() {
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<TaskDetailDto | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [controlling, setControlling] = useState(false);
+
+  const refreshTasks = async () => {
+    const result = await api.listTasks();
+    setTasks(result);
+  };
+
+  const loadDetail = async (id: string) => {
+    setSelectedId(id);
+    setDetailLoading(true);
+    setDetailError(null);
+    try {
+      setDetail(await api.getTask(id));
+    } catch (err) {
+      setDetail(null);
+      setDetailError(errorMessage(err));
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const runMigrationControl = async (action: (id: string) => Promise<void>) => {
+    if (selectedId === null) {
+      return;
+    }
+    setControlling(true);
+    setDetailError(null);
+    try {
+      await action(selectedId);
+      setDetail(await api.getTask(selectedId));
+      await refreshTasks();
+    } catch (err) {
+      setDetailError(errorMessage(err));
+    } finally {
+      setControlling(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -192,8 +407,26 @@ export function TaskCenterPage() {
   }, []);
 
   // 按活跃 / 近期历史分组
-  const activeTasks = tasks.filter((t) => isActive(t.state));
-  const recentTasks = tasks.filter((t) => !isActive(t.state));
+  const activeTasks = tasks.filter((task) => isActive(task.state));
+  const recentTasks = tasks.filter((task) => !isActive(task.state));
+
+  const renderTask = (task: TaskRecord) => (
+    <Stack key={task.id} gap={4}>
+      <TaskRow task={task} onClick={() => void loadDetail(task.id)} />
+      {selectedId === task.id && (
+        <TaskDetailPanel
+          detail={detail}
+          loading={detailLoading}
+          error={detailError}
+          controlling={controlling}
+          onPause={() => void runMigrationControl(api.pauseMigrationJob)}
+          onResume={() => void runMigrationControl(api.resumeMigrationJob)}
+          onCancel={() => void runMigrationControl(api.cancelMigrationJob)}
+          onJump={() => navigate(kindRoute(task.kind))}
+        />
+      )}
+    </Stack>
+  );
 
   if (loading) {
     return (
@@ -229,9 +462,7 @@ export function TaskCenterPage() {
               <Text fw={600} size="sm" c="dimmed">
                 {t('sectionActive')}
               </Text>
-              {activeTasks.map((task) => (
-                <TaskRow key={task.id} task={task} onClick={() => navigate(kindRoute(task.kind))} />
-              ))}
+              {activeTasks.map(renderTask)}
             </Stack>
           )}
           {recentTasks.length > 0 && (
@@ -239,9 +470,7 @@ export function TaskCenterPage() {
               <Text fw={600} size="sm" c="dimmed">
                 {t('sectionRecent')}
               </Text>
-              {recentTasks.map((task) => (
-                <TaskRow key={task.id} task={task} onClick={() => navigate(kindRoute(task.kind))} />
-              ))}
+              {recentTasks.map(renderTask)}
             </Stack>
           )}
         </Stack>
