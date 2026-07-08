@@ -45,6 +45,19 @@ JianArtifact 以单一可执行二进制运行：前端构建产物已在编译�
 - 健康检查端点：`GET /health`。返回成功表示进程已就绪、可对外提供服务。
 - 部署后即用该端点确认服务存活；置于反向代理或进程守护下时，将其配置为存活探针。
 
+### Linux systemd 自动部署（FR-139）
+
+面向 Linux 服务器的推荐自动部署入口为仓库根目录 `make deploy`。该流程在本地 Docker 交叉编译 Linux 产物，再通过 SSH key 上传到服务器并安装 systemd 服务；Docker 仅用于编译，不作为运行时部署形态。
+
+1. 运行 `make env` 创建本地 `.env`（已存在则不覆盖），填写 `DEPLOY_HOST`、`DEPLOY_USER`、`DEPLOY_ARCH`、远端目录、监听端口等变量。`.env` 已被 `.gitignore` 忽略，禁止提交真实服务器地址、管理员口令或密钥。
+2. 运行 `make ssh-key` 生成 `~/.ssh/jianartifact_deploy_ed25519(.pub)`（已存在则不覆盖），把 `.pub` 内容加入目标服务器部署用户的 `~/.ssh/authorized_keys`；`.env` 默认不需要配置 `SSH_KEY_PATH`。
+3. 将 `DEPLOY_ARCH` 设为 `amd64` 或 `arm64`，分别对应 `x86_64-unknown-linux-musl` 与 `aarch64-unknown-linux-musl`。
+4. 运行 `make deploy`：Make 会构建 `Dockerfile.cross` 镜像，执行前端构建与 Rust release 交叉编译，打包 `output/linux/*.tar.gz`，再调用 `scripts/deploy-linux-systemd.sh` 上传并安装。
+5. 部署脚本只使用 SSH key 认证（`BatchMode=yes`、禁用密码认证）。`DEPLOY_USER=root` 时直接执行特权命令；非 root 时使用 `sudo -n`，服务器若需要交互式 sudo 密码会失败。
+6. 远端安装策略是幂等的：创建或复用 `SERVICE_USER`，创建 `INSTALL_DIR` / `CONFIG_DIR` / `DATA_DIR`；替换二进制前先 `systemctl stop`，旧二进制备份为 `${INSTALL_DIR}/jianartifact.bak`；已有 `${CONFIG_DIR}/config.toml` 默认不覆盖；数据目录不删除、不清空。
+7. systemd unit 使用 `ExecStart=${INSTALL_DIR}/jianartifact --config ${CONFIG_DIR}/config.toml --data-dir ${DATA_DIR}`，并通过 `${CONFIG_DIR}/jianartifact.env` 注入 `JIANARTIFACT_*` 运行环境变量。首启管理员引导变量仅空库首次启动使用，部署后建议登录改密并轮换或清理 bootstrap 变量。
+8. 脚本最后执行 `systemctl is-active`，若远端有 `curl`，还会请求 `http://127.0.0.1:${PORT}/health` 做就绪检查。
+
 ### 可选：S3 兼容对象存储后端（FR-30 / ADR-0014）
 
 默认部署 blob 本体落本地文件系统，零外部运行时依赖、开箱即用。若需把 blob 改存 S3 兼容对象存储（应对制品体量超出单机磁盘、或需对象存储级别的持久性/容灾），可启用可选的 S3 后端。

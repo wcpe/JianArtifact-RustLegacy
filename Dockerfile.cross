@@ -1,0 +1,43 @@
+# JianArtifact Linux 交叉编译镜像。
+# 仅用于本地构建 Linux amd64 / arm64 发布包，不作为运行时镜像。
+FROM rust:1.96.1-bookworm
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG NODE_VERSION=22.12.0
+ARG PNPM_VERSION=9.15.9
+ARG ZIG_VERSION=0.14.1
+ARG CARGO_ZIGBUILD_VERSION=0.23.0
+
+ENV CARGO_TERM_COLOR=always \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/opt/zig:${PATH}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        xz-utils \
+        git \
+        build-essential \
+        clang \
+        cmake \
+        make \
+        perl \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && npm install -g "pnpm@${PNPM_VERSION}"
+
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /opt \
+    && mv "/opt/zig-linux-x86_64-${ZIG_VERSION}" /opt/zig
+
+RUN rustup component add rust-src \
+    && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+    && cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
+
+WORKDIR /workspace

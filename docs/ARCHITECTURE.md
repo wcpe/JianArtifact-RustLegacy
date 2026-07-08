@@ -173,6 +173,7 @@ P1 的新增能力不引入新表：制品删除与覆盖/不可变策略作用�
 - 依赖：无需独立数据库或中间件，零外部运行时依赖。
 - TLS：可选地将本程序置于反向代理之后，由反向代理做 TLS 终结。
 - 跨平台：支持 Linux/Windows/macOS，覆盖 x86_64 与 arm64。
+- Linux systemd 自动部署（FR-139）：仓库根 `Makefile` 提供 `make env`、`make ssh-key`、`make cross-image`、`make cross-build`、`make deploy`。本地通过 `Dockerfile.cross` 构建只用于编译的 Docker 环境，产出 Linux `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` tar.gz；部署脚本 `scripts/deploy-linux-systemd.sh` 仅经 SSH key 上传产物与运行环境文件，在远端创建 / 更新 systemd unit。部署保持运行形态不变（单二进制 + `config.toml` + 数据目录），重复执行不清空数据目录、不覆盖已有配置，替换二进制前先停止服务并备份旧文件。
 
 ## 7. 关键裁决与不做项
 
