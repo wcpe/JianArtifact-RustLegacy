@@ -32,9 +32,10 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     | tar -xJ -C /usr/local --strip-components=1 \
     && npm install -g "pnpm@${PNPM_VERSION}"
 
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+# Zig 0.14.x 起压缩包命名 arch/os 顺序对调（zig-x86_64-linux-*，旧的 zig-linux-x86_64-* 已 404）
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
     | tar -xJ -C /opt \
-    && mv "/opt/zig-linux-x86_64-${ZIG_VERSION}" /opt/zig
+    && mv "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig
 
 RUN rustup component add rust-src \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
