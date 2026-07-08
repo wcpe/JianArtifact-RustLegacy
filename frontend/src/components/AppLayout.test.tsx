@@ -4,6 +4,7 @@
 // 3) 左下 footer：展开显许可+收起按钮、收起隐藏许可只留展开按钮；
 // 4) 不回归：角色门控（FR-95）、active 段精确匹配（fix-B）、页眉搜索（FR-94）、更新徽标（FR-101）、内容区 max-width。
 
+import { useState } from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -11,6 +12,7 @@ import { MantineProvider } from '@mantine/core';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { AppLayout } from './AppLayout';
 import { AuthContext, type AuthContextValue } from '../auth/AuthContext';
+import { GlobalProgressContext } from '../hooks/useGlobalProgress';
 import * as api from '../api/endpoints';
 import type { HealthInfo, UpdateCheck } from '../api/types';
 
@@ -93,6 +95,41 @@ function renderAt(initialPath: string, ctx: AuthContextValue = 管理员上下�
           <AppLayout />
           <LocationProbe />
         </MemoryRouter>
+      </AuthContext.Provider>
+    </MantineProvider>,
+  );
+}
+
+/** 在指定全局进度上下文下渲染外壳，用于验证页眉刷新按钮。 */
+function renderAtWithProgress({
+  hasPageRefresh,
+  isPageRefreshing = false,
+  refreshCurrentPage = vi.fn(async () => true),
+}: {
+  hasPageRefresh: boolean;
+  isPageRefreshing?: boolean;
+  refreshCurrentPage?: () => Promise<boolean>;
+}) {
+  return render(
+    <MantineProvider>
+      <AuthContext.Provider value={管理员上下文()}>
+        <GlobalProgressContext.Provider
+          value={{
+            loading: false,
+            inc: () => {},
+            dec: () => {},
+            setRouteLoading: () => {},
+            hasPageRefresh,
+            isPageRefreshing,
+            registerPageRefreshCallback: () => () => {},
+            clearPageRefreshCallback: () => {},
+            refreshCurrentPage,
+          }}
+        >
+          <MemoryRouter initialEntries={['/']}>
+            <AppLayout />
+          </MemoryRouter>
+        </GlobalProgressContext.Provider>
       </AuthContext.Provider>
     </MantineProvider>,
   );
@@ -320,6 +357,90 @@ describe('AppLayout 全局搜索快捷键（FR-114）', () => {
 
     await user.keyboard('{Escape}');
     expect(input).not.toHaveFocus();
+  });
+});
+
+describe('AppLayout 页眉三段式布局与当前页刷新按钮', () => {
+  it('页眉按左 / 中 / 右三段渲染，通知中心归入右侧动作组', async () => {
+    renderAt('/', 管理员上下文());
+
+    const left = screen.getByTestId('header-left-section');
+    const center = screen.getByTestId('header-center-section');
+    const right = screen.getByTestId('header-right-section');
+
+    expect(left).toBeInTheDocument();
+    expect(center).toContainElement(screen.getByLabelText('全局搜索'));
+    expect(right).toContainElement(screen.getByLabelText('当前页暂无可刷新内容'));
+    expect(right).toContainElement(await screen.findByRole('button', { name: /任务通知中心/i }));
+  });
+
+  it('无页面刷新回调时，页眉刷新按钮禁用并提示当前页暂无可刷新内容', () => {
+    renderAtWithProgress({ hasPageRefresh: false });
+
+    const refreshButton = screen.getByRole('button', { name: '当前页暂无可刷新内容' });
+    expect(refreshButton).toBeDisabled();
+  });
+
+  it('有页面刷新回调时，页眉刷新按钮可点击并执行当前页刷新', async () => {
+    const user = userEvent.setup();
+    const refreshCurrentPage = vi.fn(async () => true);
+    renderAtWithProgress({ hasPageRefresh: true, refreshCurrentPage });
+
+    const refreshButton = screen.getByRole('button', { name: '刷新当前内容页' });
+    expect(refreshButton).not.toBeDisabled();
+
+    await user.click(refreshButton);
+    expect(refreshCurrentPage).toHaveBeenCalledTimes(1);
+  });
+
+  it('当前页刷新执行中时按钮禁用，避免重复触发', () => {
+    renderAtWithProgress({ hasPageRefresh: true, isPageRefreshing: true });
+
+    expect(screen.getByRole('button', { name: '刷新当前内容页' })).toBeDisabled();
+  });
+
+  it('路由切换后清理刷新回调，刷新按钮回到禁用态', async () => {
+    const user = userEvent.setup();
+
+    function ProgressHarness() {
+      const [hasPageRefresh, setHasPageRefresh] = useState(true);
+      return (
+        <MantineProvider>
+          <AuthContext.Provider value={管理员上下文()}>
+            <GlobalProgressContext.Provider
+              value={{
+                loading: false,
+                inc: () => {},
+                dec: () => {},
+                setRouteLoading: () => {},
+                hasPageRefresh,
+                isPageRefreshing: false,
+                registerPageRefreshCallback: () => () => {},
+                clearPageRefreshCallback: () => setHasPageRefresh(false),
+                refreshCurrentPage: async () => true,
+              }}
+            >
+              <MemoryRouter initialEntries={['/']}>
+                <AppLayout />
+                <LocationProbe />
+              </MemoryRouter>
+            </GlobalProgressContext.Provider>
+          </AuthContext.Provider>
+        </MantineProvider>
+      );
+    }
+
+    render(<ProgressHarness />);
+
+    expect(screen.getByRole('button', { name: '刷新当前内容页' })).not.toBeDisabled();
+    await user.click(screen.getByLabelText('仓库'));
+
+    await waitFor(() =>
+      expect(screen.getByTestId('location-probe')).toHaveTextContent('/repositories'),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '当前页暂无可刷新内容' })).toBeDisabled(),
+    );
   });
 });
 

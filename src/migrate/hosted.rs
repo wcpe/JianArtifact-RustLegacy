@@ -20,6 +20,7 @@
 //!
 //! 范围纪律：**只做 hosted 仓库配置 + 完整制品搬运**，不重复实现 proxy 搬运（复用 FR-38）。
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::format::{
@@ -45,15 +46,50 @@ enum BumpKind {
     SkippedFailed,
 }
 
+/// 取离线条目声明的逻辑字节数；缺失或非法 size 在枚举阶段已置 None，此处按 0 计入。
+fn entry_size(entry: &super::OfflineBlobEntry) -> u64 {
+    entry.size.unwrap_or(0)
+}
+
+/// 汇总条目逻辑字节数，使用饱和累加避免异常元数据造成溢出。
+fn sum_entry_sizes(entries: &[super::OfflineBlobEntry]) -> u64 {
+    entries
+        .iter()
+        .fold(0u64, |total, entry| total.saturating_add(entry_size(entry)))
+}
+
+/// 仅统计本次选中且可搬运仓库的离线条目，避免未选中仓库污染进度分母。
+fn selected_entry_totals(
+    entries: &[super::OfflineBlobEntry],
+    selected_repos: &HashSet<&str>,
+) -> (usize, u64) {
+    entries
+        .iter()
+        .filter(|entry| selected_repos.contains(entry.repo_name.as_str()))
+        .fold((0usize, 0u64), |(count, bytes), entry| {
+            (count + 1, bytes.saturating_add(entry_size(entry)))
+        })
+}
+
 /// 在一个 blob 处理完成后推进进度计数（FR-125/FR-134）：
-/// `done_assets` +1，按三态分别累加 `migrated` / `skipped_existing` / `skipped`。
-fn bump_progress(progress: &std::sync::Mutex<OnlinePullProgress>, kind: BumpKind) {
+/// `done_assets` +1，按三态分别累加资产数与逻辑字节数。
+fn bump_progress(progress: &std::sync::Mutex<OnlinePullProgress>, kind: BumpKind, bytes: u64) {
     let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
     p.done_assets += 1;
+    p.done_bytes = p.done_bytes.saturating_add(bytes);
     match kind {
-        BumpKind::Migrated => p.migrated += 1,
-        BumpKind::SkippedExisting => p.skipped_existing += 1,
-        BumpKind::SkippedFailed => p.skipped += 1,
+        BumpKind::Migrated => {
+            p.migrated += 1;
+            p.migrated_bytes = p.migrated_bytes.saturating_add(bytes);
+        }
+        BumpKind::SkippedExisting => {
+            p.skipped_existing += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(bytes);
+        }
+        BumpKind::SkippedFailed => {
+            p.skipped += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(bytes);
+        }
     }
 }
 
@@ -141,9 +177,12 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
     let Some(format) = formats.get(&repo.format) else {
         // 仓库已按映射格式建成，注册表理应有对应处理器；缺失则整批跳过（防御）
         tracing::warn!(仓库 = %repo.name, 格式 = %repo.format, "格式处理器未注册，跳过该仓库制品搬运");
+        let skipped_bytes = sum_entry_sizes(entries);
         let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.skipped += entries.len();
         p.done_assets += entries.len();
+        p.done_bytes = p.done_bytes.saturating_add(skipped_bytes);
+        p.skipped_bytes = p.skipped_bytes.saturating_add(skipped_bytes);
         return (0, 0, entries.len(), false);
     };
 
@@ -161,6 +200,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             p.current_repo = Some(repo.name.clone());
             p.current_path = Some(entry.blob_name.clone());
         }
+        let bytes = entry_size(entry);
 
         // 归一化并校验路径：非法路径（穿越 / 空）跳过
         let rel = normalize_blob_path(&entry.blob_name);
@@ -169,7 +209,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "制品路径非法，跳过搬运");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
                 continue;
             }
         };
@@ -180,7 +220,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, 路径 = %entry.bytes_path.display(), 错误 = %e, "读取 blob 本体失败，跳过搬运");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
                 continue;
             }
         };
@@ -192,24 +232,24 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             // 新写入：首次搬运或内容变化后覆盖
             Ok(IngestOutcome::Written(_)) => {
                 migrated += 1;
-                bump_progress(progress, BumpKind::Migrated);
+                bump_progress(progress, BumpKind::Migrated, bytes);
             }
             // 增量跳过：目标已存在且 sha256 一致，幂等重入（FR-134）
             Ok(IngestOutcome::AlreadyExists(_)) => {
                 skipped_existing += 1;
-                bump_progress(progress, BumpKind::SkippedExisting);
+                bump_progress(progress, BumpKind::SkippedExisting, bytes);
                 tracing::debug!(仓库 = %repo.name, blob = %entry.blob_name, "制品已存在且 sha256 一致，增量跳过");
             }
             // 不可覆盖（如 Maven release 已存在不同内容）：按覆盖 / 不可变策略跳过，不中断整批
             Err(ServiceError::OverwriteForbidden) => {
                 tracing::info!(仓库 = %repo.name, blob = %entry.blob_name, "同坐标制品已存在且不可覆盖，跳过搬运");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
             }
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "hosted 制品搬运失败，跳过");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
             }
         }
     }
@@ -246,6 +286,38 @@ pub async fn migrate_hosted_repositories<S: BlobStore, U: Upstream>(
     .await
 }
 
+/// 纯离线执行 hosted 制品搬运：只读 blob store，不访问源 Nexus 在线 REST。
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_hosted_repositories_offline_with_progress<S: BlobStore, U: Upstream>(
+    meta: &MetaStore,
+    artifacts: &ArtifactService<S, U>,
+    formats: &FormatRegistry,
+    offline_root: &Path,
+    selected_repositories: Option<Vec<String>>,
+    max_size: Option<u64>,
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    control: &JobControl,
+) -> Result<HostedMigrationReport, MigrateError> {
+    progress.lock().unwrap_or_else(|e| e.into_inner()).phase = OnlinePullPhase::Enumerating;
+    let entries = super::enumerate_blob_entries(offline_root)?;
+    let source_repos = crate::migrate::infer_source_repos_from_offline_entries(
+        &entries,
+        "hosted",
+        selected_repositories,
+    )?;
+    migrate_hosted_repositories_with_progress(
+        meta,
+        artifacts,
+        formats,
+        &source_repos,
+        offline_root,
+        max_size,
+        progress,
+        control,
+    )
+    .await
+}
+
 /// 执行 hosted 仓库配置创建 + 完整制品搬运，边搬边上报进度、在 blob 边界响应取消 / 暂停（FR-125）。
 ///
 /// 语义同 [`migrate_hosted_repositories`]，额外把进度写入 `progress`（供 `GET /migrate/jobs/{id}` 轮询）、
@@ -265,10 +337,17 @@ pub async fn migrate_hosted_repositories_with_progress<S: BlobStore, U: Upstream
 
     // 离线 blob store 中的可搬运条目，按仓库名归组（一次枚举、避免逐仓库重复遍历磁盘）
     let entries = super::enumerate_blob_entries(offline_root)?;
-    progress
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .total_assets = entries.len();
+    let selected_repos: HashSet<&str> = source_repos
+        .iter()
+        .filter(|src| src.r#type == "hosted" && map_nexus_format(&src.format).is_some())
+        .map(|src| src.name.as_str())
+        .collect();
+    let (total_assets, total_bytes) = selected_entry_totals(&entries, &selected_repos);
+    {
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.total_assets = total_assets;
+        p.total_bytes = total_bytes;
+    }
     let mut by_repo: std::collections::HashMap<&str, Vec<super::OfflineBlobEntry>> =
         std::collections::HashMap::new();
     for e in &entries {
@@ -379,13 +458,21 @@ mod tests {
 
     /// 在临时目录铺一个最小 Nexus 文件型 blob store（content/vol-01/chap-01 下放成对 .properties/.bytes）。
     fn build_store(root: &Path, blobs: &[(&str, &str, &str)]) {
+        let sized_blobs: Vec<_> = blobs
+            .iter()
+            .map(|(repo, blob_name, body)| (*repo, *blob_name, *body, body.len() as u64))
+            .collect();
+        build_store_with_sizes(root, &sized_blobs);
+    }
+
+    /// 在 `.properties` 写入指定逻辑 size，物理 `.bytes` 可保持很小。
+    fn build_store_with_sizes(root: &Path, blobs: &[(&str, &str, &str, u64)]) {
         let chap = root.join("content").join("vol-01").join("chap-01");
         fs::create_dir_all(&chap).unwrap();
-        for (i, (repo, blob_name, body)) in blobs.iter().enumerate() {
+        for (i, (repo, blob_name, body, size)) in blobs.iter().enumerate() {
             let stem = format!("blob-{i}");
             let props = format!(
-                "@Bucket.repo-name={repo}\n@BlobStore.blob-name={blob_name}\nsize={}\nsha1=x\ndeleted=false\n",
-                body.len()
+                "@Bucket.repo-name={repo}\n@BlobStore.blob-name={blob_name}\nsize={size}\nsha1=x\ndeleted=false\n"
             );
             fs::write(chap.join(format!("{stem}.properties")), props).unwrap();
             fs::write(chap.join(format!("{stem}.bytes")), body).unwrap();
@@ -653,6 +740,37 @@ mod tests {
         let p = progress.lock().unwrap();
         assert_eq!(p.phase, OnlinePullPhase::Cancelled);
         assert_eq!(p.migrated, 0);
+    }
+
+    #[tokio::test]
+    async fn with_progress_按_properties_size_统计_1tb_逻辑字节() {
+        const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        let (meta, svc, formats, store_dir) = 新建().await;
+        let blob_root = store_dir.path().join("nexus");
+        build_store_with_sizes(
+            &blob_root,
+            &[
+                ("raw-hosted", "/ok.bin", "A", ONE_TIB - 1),
+                ("raw-hosted", "/../evil.bin", "B", 1),
+            ],
+        );
+        let src = vec![src_repo("raw-hosted", "raw", "hosted")];
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        let control = JobControl::default();
+
+        let report = migrate_hosted_repositories_with_progress(
+            &meta, &svc, &formats, &src, &blob_root, None, &progress, &control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.repos[0].migrated_artifacts, 1);
+        assert_eq!(report.repos[0].skipped_artifacts, 1);
+        let p = progress.lock().unwrap();
+        assert_eq!(p.total_bytes, ONE_TIB);
+        assert_eq!(p.done_bytes, ONE_TIB);
+        assert_eq!(p.migrated_bytes, ONE_TIB - 1);
+        assert_eq!(p.skipped_bytes, 1);
     }
 
     // ---------- FR-134：增量幂等续传计数 ----------

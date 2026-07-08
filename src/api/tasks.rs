@@ -35,6 +35,23 @@ pub async fn list_tasks(
     Ok(Json(state.tasks.list()))
 }
 
+/// 生成任务详情使用的迁移进度快照：离线预览只保留仓库摘要，避免返回巨大 blob 明细。
+fn 迁移详情快照(
+    mut progress: crate::migrate::OnlinePullProgress,
+) -> crate::migrate::OnlinePullProgress {
+    progress.offline_preview = progress.offline_preview.map(|repos| {
+        repos
+            .into_iter()
+            .map(|repo| crate::migrate::OfflineRepoSummary {
+                repo_name: repo.repo_name,
+                blob_count: repo.blob_count,
+                blobs: Vec::new(),
+            })
+            .collect()
+    });
+    progress
+}
+
 /// 查询某任务统一记录 + 进度明细（仅 Admin，FR-131）。未知 id 返回 404。
 pub async fn get_task(
     State(state): State<AppState>,
@@ -48,9 +65,9 @@ pub async fn get_task(
     // 据 kind 从对应 kind 专表取进度明细（取不到——如已被专表淘汰——则仅回记录）
     let (migration, update) = match record.kind {
         TaskKind::Migration => {
-            let p = migration_jobs
-                .get(&id)
-                .map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            let p = migration_jobs.get(&id).map(|slot| {
+                迁移详情快照(slot.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            });
             (p, None)
         }
         TaskKind::Update => {
@@ -176,6 +193,107 @@ mod tests {
         // vuln 任务无 kind 专表进度
         assert!(body.get("migration").is_none());
         assert!(body.get("update").is_none());
+    }
+
+    #[tokio::test]
+    async fn 详情_迁移任务不返回巨大离线预览且保留基础字段() {
+        let (state, _dir) = 测试用状态().await;
+        let id = state
+            .tasks
+            .register(TaskKind::Migration, Some("离线预览".to_string()));
+        let jobs = Arc::new(MigrationJobs::default());
+        let blobs = (0..4096)
+            .map(|i| crate::migrate::OfflineBlobSummary {
+                blob_name: format!("com/example/app/{i}/app-{i}.jar"),
+                sha1: Some(format!("sha1-{i}")),
+                size: Some(1024 * 1024),
+            })
+            .collect::<Vec<_>>();
+        let blob_count = blobs.len();
+        let progress = Arc::new(std::sync::Mutex::new(crate::migrate::OnlinePullProgress {
+            phase: crate::migrate::OnlinePullPhase::Done,
+            total_assets: blob_count,
+            done_assets: blob_count,
+            total_bytes: (blob_count as u64) * 1024 * 1024,
+            done_bytes: (blob_count as u64) * 1024 * 1024,
+            migrated_bytes: 7 * 1024 * 1024,
+            skipped_bytes: 5 * 1024 * 1024,
+            migrated: 7,
+            skipped_existing: 3,
+            skipped: 2,
+            current_repo: Some("repo-a".to_string()),
+            current_path: Some("com/example/app/app.jar".to_string()),
+            paused: false,
+            repos: vec![crate::migrate::OnlineRepoMigrationOutcome {
+                source_repo: "repo-a".to_string(),
+                target_repo: "repo-a".to_string(),
+                format: "maven".to_string(),
+                created: false,
+                migrated_artifacts: 7,
+                skipped_existing_artifacts: 3,
+                skipped_artifacts: 2,
+            }],
+            skipped_repos: vec!["npm-proxy".to_string()],
+            error: None,
+            offline_preview: Some(vec![crate::migrate::OfflineRepoSummary {
+                repo_name: "repo-a".to_string(),
+                blob_count,
+                blobs,
+            }]),
+        }));
+        jobs.register(
+            id.clone(),
+            progress,
+            Arc::new(crate::migrate::JobControl::default()),
+        );
+
+        let app = axum::Router::new()
+            .route("/api/v1/tasks/{id}", axum::routing::get(super::get_task))
+            .with_state(state)
+            .layer(Extension(Arc::new(UpdateJobs::default())))
+            .layer(Extension(jobs));
+        let mut req = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/tasks/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(crate::auth::AuthIdentity::Authenticated(
+                crate::auth::AuthUser {
+                    user_id: "admin-id".to_string(),
+                    username: "admin".to_string(),
+                    role: Role::Admin,
+                },
+            ));
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = 读_json(resp).await;
+        assert_eq!(body["id"], id);
+        assert_eq!(body["kind"], "migration");
+        assert_eq!(body["label"], "离线预览");
+        let migration = body["migration"].as_object().expect("应返回迁移进度");
+        assert_eq!(migration["phase"], "done");
+        assert_eq!(migration["total_assets"], blob_count);
+        assert_eq!(migration["done_assets"], blob_count);
+        assert_eq!(migration["migrated"], 7);
+        assert_eq!(migration["skipped_existing"], 3);
+        assert_eq!(migration["skipped"], 2);
+        assert_eq!(migration["current_repo"], "repo-a");
+        assert_eq!(migration["current_path"], "com/example/app/app.jar");
+        assert_eq!(migration["repos"].as_array().unwrap().len(), 1);
+        assert_eq!(migration["skipped_repos"].as_array().unwrap().len(), 1);
+        let preview = migration["offline_preview"]
+            .as_array()
+            .expect("任务详情应保留离线预览仓库摘要");
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0]["repo_name"], "repo-a");
+        assert_eq!(preview[0]["blob_count"], blob_count);
+        assert_eq!(
+            preview[0]["blobs"].as_array().unwrap().len(),
+            0,
+            "任务详情不应返回巨大 blob 明细"
+        );
     }
 
     #[tokio::test]

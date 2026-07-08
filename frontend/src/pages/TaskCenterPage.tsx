@@ -2,7 +2,7 @@
 // 依赖 FR-131 后端：GET /api/v1/tasks（TaskRecord[]）与 GET /api/v1/tasks/{id}（详情）。
 // 轮询间隔 3s；卸载时立即 clearInterval；无任务显空状态；点击行展开详情，详情内提供跳转续看与迁移控制。
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Stack,
@@ -29,6 +29,7 @@ import { useNavigate } from 'react-router-dom';
 import * as api from '../api/endpoints';
 import type { OnlinePullJob, TaskDetailDto, TaskKind, TaskRecord, TaskState } from '../api/types';
 import { errorMessage } from '../lib/format';
+import { useGlobalProgress } from '../hooks/useGlobalProgress';
 
 /** 轮询间隔（毫秒）。 */
 const POLL_INTERVAL_MS = 3000;
@@ -84,10 +85,10 @@ function fmtUnixSecs(secs: number): string {
 }
 
 /** 点击详情内按钮跳转对应续看页路由（按 kind）。 */
-function kindRoute(kind: TaskKind): string {
-  switch (kind) {
+function kindRoute(task: TaskRecord): string {
+  switch (task.kind) {
     case 'migration':
-      return '/migration';
+      return `/migration?job_id=${encodeURIComponent(task.id)}`;
     case 'update':
       return '/system';
     case 'vuln':
@@ -151,9 +152,17 @@ function TaskRow({ task, onClick }: { task: TaskRecord; onClick: () => void }) {
 }
 
 /** 迁移任务进度详情。 */
-function MigrationDetail({ job }: { job: OnlinePullJob }) {
+function MigrationDetail({
+  job,
+  isOfflinePreview,
+}: {
+  job: OnlinePullJob;
+  isOfflinePreview: boolean;
+}) {
   const percent = job.total_assets > 0 ? Math.round((job.done_assets / job.total_assets) * 100) : 0;
   const terminal = isTerminalMigration(job.phase);
+  const previewRepos = job.offline_preview ?? [];
+  const previewBlobCount = previewRepos.reduce((sum, repo) => sum + repo.blob_count, 0);
 
   return (
     <Stack gap="xs">
@@ -162,11 +171,31 @@ function MigrationDetail({ job }: { job: OnlinePullJob }) {
         <Text size="sm" c="dimmed">
           进度 {job.done_assets} / {job.total_assets}（{percent}%）
         </Text>
-        <Text size="sm">已迁 {job.migrated}</Text>
-        <Text size="sm" c="dimmed">
-          已跳过 {job.skipped}
-        </Text>
+        {isOfflinePreview ? (
+          <Text size="sm" c="dimmed">
+            离线预览不搬运制品
+          </Text>
+        ) : (
+          <>
+            <Text size="sm">已迁 {job.migrated}</Text>
+            <Text size="sm" c="dimmed">
+              已跳过 {job.skipped}
+            </Text>
+          </>
+        )}
       </Group>
+      {isOfflinePreview && terminal && (
+        <Stack gap={4}>
+          <Text size="sm">
+            离线预览已完成：共 {previewRepos.length} 个仓库、{previewBlobCount} 个 blob。
+          </Text>
+          {previewRepos.map((repo) => (
+            <Text key={repo.repo_name} size="xs" c="dimmed">
+              {repo.repo_name}：{repo.blob_count} 个 blob
+            </Text>
+          ))}
+        </Stack>
+      )}
       {job.current_repo && (
         <Text size="sm">
           当前仓库：
@@ -237,8 +266,9 @@ function TaskDetailPanel({
   const migration = detail.migration;
   const terminal = migration ? isTerminalMigration(migration.phase) : !isActive(detail.state);
   const paused = migration?.paused ?? detail.state === 'paused';
+  const isOfflinePreview = detail.label === '离线预览' || migration?.offline_preview !== undefined;
   // 离线预览是单次阻塞枚举，目前后端控制信号不参与中断；避免展示不可生效的控制按钮。
-  const canControlMigration = detail.kind === 'migration' && detail.label !== '离线预览';
+  const canControlMigration = detail.kind === 'migration' && !isOfflinePreview;
   const canPause = canControlMigration && migration !== undefined && !terminal && !paused;
   const canResume = canControlMigration && migration !== undefined && !terminal && paused;
   const canCancel = canControlMigration && migration !== undefined && !terminal;
@@ -260,7 +290,7 @@ function TaskDetailPanel({
           </Text>
         </Group>
 
-        {migration && <MigrationDetail job={migration} />}
+        {migration && <MigrationDetail job={migration} isOfflinePreview={isOfflinePreview} />}
         {detail.update && (
           <Stack gap={2}>
             <Text size="sm">更新阶段：{detail.update.phase}</Text>
@@ -324,6 +354,7 @@ function TaskDetailPanel({
 export function TaskCenterPage() {
   const { t } = useTranslation('taskCenter');
   const navigate = useNavigate();
+  const { registerPageRefreshCallback } = useGlobalProgress();
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -332,42 +363,75 @@ export function TaskCenterPage() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [controlling, setControlling] = useState(false);
+  const selectedIdRef = useRef<string | null>(null);
+  const detailRequestSeqRef = useRef(0);
 
-  const refreshTasks = async () => {
+  const refreshTasks = useCallback(async () => {
     const result = await api.listTasks();
     setTasks(result);
-  };
+  }, []);
 
   const loadDetail = async (id: string) => {
+    const requestSeq = detailRequestSeqRef.current + 1;
+    detailRequestSeqRef.current = requestSeq;
+
+    if (selectedIdRef.current === id) {
+      selectedIdRef.current = null;
+      setSelectedId(null);
+      setDetail(null);
+      setDetailError(null);
+      setDetailLoading(false);
+      return;
+    }
+
+    selectedIdRef.current = id;
     setSelectedId(id);
     setDetailLoading(true);
     setDetailError(null);
     try {
-      setDetail(await api.getTask(id));
+      const nextDetail = await api.getTask(id);
+      if (detailRequestSeqRef.current === requestSeq) {
+        setDetail(nextDetail);
+      }
     } catch (err) {
-      setDetail(null);
-      setDetailError(errorMessage(err));
+      if (detailRequestSeqRef.current === requestSeq) {
+        setDetail(null);
+        setDetailError(errorMessage(err));
+      }
     } finally {
-      setDetailLoading(false);
+      if (detailRequestSeqRef.current === requestSeq) {
+        setDetailLoading(false);
+      }
     }
   };
 
   const runMigrationControl = async (action: (id: string) => Promise<void>) => {
-    if (selectedId === null) {
+    const controlId = selectedIdRef.current;
+    if (controlId === null) {
       return;
     }
     setControlling(true);
     setDetailError(null);
     try {
-      await action(selectedId);
-      setDetail(await api.getTask(selectedId));
+      await action(controlId);
+      const nextDetail = await api.getTask(controlId);
+      if (selectedIdRef.current === controlId) {
+        setDetail(nextDetail);
+      }
       await refreshTasks();
     } catch (err) {
-      setDetailError(errorMessage(err));
+      if (selectedIdRef.current === controlId) {
+        setDetailError(errorMessage(err));
+      }
     } finally {
       setControlling(false);
     }
   };
+
+  useEffect(
+    () => registerPageRefreshCallback(refreshTasks),
+    [registerPageRefreshCallback, refreshTasks],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -422,7 +486,7 @@ export function TaskCenterPage() {
           onPause={() => void runMigrationControl(api.pauseMigrationJob)}
           onResume={() => void runMigrationControl(api.resumeMigrationJob)}
           onCancel={() => void runMigrationControl(api.cancelMigrationJob)}
-          onJump={() => navigate(kindRoute(task.kind))}
+          onJump={() => navigate(kindRoute(task))}
         />
       )}
     </Stack>

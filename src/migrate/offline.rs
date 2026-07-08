@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::MigrateError;
+use super::{MigrateError, NexusRepoSummary};
 
 /// Nexus 文件型 blob store 根下存放 blob 的内容子目录名。
 const CONTENT_DIR: &str = "content";
@@ -348,7 +348,7 @@ pub fn enumerate_blob_store(root: &Path) -> Result<Vec<OfflineRepoSummary>, Migr
     Ok(repos)
 }
 
-/// 离线 blob store 中可搬运的单个 blob 条目：含所属 repo、逻辑名与本体 `.bytes` 文件路径。
+/// 离线 blob store 中可搬运的单个 blob 条目：含所属 repo、逻辑名、本体路径与逻辑大小。
 ///
 /// 与预览项 [`OfflineBlobSummary`] 的区别：本条目额外携带 `.bytes` 本体路径，供搬运阶段（FR-38）
 /// 流式读取内容。仅当同目录存在同主干的 `.bytes` 文件时才产出（缺本体的元数据无可搬运内容）。
@@ -358,6 +358,8 @@ pub struct OfflineBlobEntry {
     pub repo_name: String,
     /// blob 逻辑名（源系统中的路径 / 坐标，取自 `@BlobStore.blob-name`）。
     pub blob_name: String,
+    /// blob 字节大小（取自 `size`；缺失或非法为 None）。
+    pub size: Option<u64>,
     /// blob 本体文件（`.bytes`）的绝对路径。
     pub bytes_path: PathBuf,
 }
@@ -387,6 +389,7 @@ pub fn enumerate_blob_entries(root: &Path) -> Result<Vec<OfflineBlobEntry>, Migr
             Some(OfflineBlobEntry {
                 repo_name: pe.parsed.repo_name,
                 blob_name: pe.parsed.summary.blob_name,
+                size: pe.parsed.summary.size,
                 bytes_path,
             })
         })
@@ -398,6 +401,139 @@ pub fn enumerate_blob_entries(root: &Path) -> Result<Vec<OfflineBlobEntry>, Migr
             .then_with(|| a.blob_name.cmp(&b.blob_name))
     });
     Ok(entries)
+}
+
+/// 据仓库名与 blob 路径粗略推断本系统格式；无法判断时按 raw 保底导入。
+fn infer_offline_format(repo_name: &str, entries: &[&OfflineBlobEntry]) -> &'static str {
+    let mut scores = BTreeMap::<&'static str, usize>::new();
+    let repo = repo_name.to_ascii_lowercase();
+    for (needle, format) in [
+        ("maven", "maven"),
+        ("npm", "npm"),
+        ("docker", "docker"),
+        ("nuget", "nuget"),
+        ("pypi", "pypi"),
+        ("python", "pypi"),
+        ("cargo", "cargo"),
+        ("crates", "cargo"),
+        ("golang", "go"),
+        ("go-", "go"),
+        ("raw", "raw"),
+    ] {
+        if repo.contains(needle) {
+            *scores.entry(format).or_default() += 10;
+        }
+    }
+
+    for entry in entries {
+        let path = entry.blob_name.trim_start_matches('/').to_ascii_lowercase();
+        let file = path.rsplit('/').next().unwrap_or(&path);
+        if path.contains("/-/") && file.ends_with(".tgz") {
+            *scores.entry("npm").or_default() += 6;
+        }
+        if path.contains("maven-metadata.xml") || is_maven_artifact_path(&path) {
+            *scores.entry("maven").or_default() += 5;
+        }
+        if path.contains("v3-flatcontainer/")
+            || file.ends_with(".nupkg")
+            || file.ends_with(".nuspec")
+        {
+            *scores.entry("nuget").or_default() += 6;
+        }
+        if path.starts_with("packages/")
+            && (file.ends_with(".whl")
+                || file.ends_with(".egg")
+                || file.ends_with(".tar.gz")
+                || file.ends_with(".zip"))
+        {
+            *scores.entry("pypi").or_default() += 6;
+        }
+        if path.contains("/@v/")
+            && (file.ends_with(".mod") || file.ends_with(".zip") || file.ends_with(".info"))
+        {
+            *scores.entry("go").or_default() += 6;
+        }
+        if path.starts_with("crates/") || path.starts_with("index/") || file.ends_with(".crate") {
+            *scores.entry("cargo").or_default() += 6;
+        }
+        if path.contains("blobs/sha256")
+            || path.contains("manifests/")
+            || path.contains("_uploads/")
+        {
+            *scores.entry("docker").or_default() += 6;
+        }
+    }
+
+    [
+        "maven", "npm", "docker", "nuget", "pypi", "go", "cargo", "raw",
+    ]
+    .into_iter()
+    .max_by_key(|format| scores.get(format).copied().unwrap_or(0))
+    .filter(|format| scores.get(format).copied().unwrap_or(0) > 0)
+    .unwrap_or("raw")
+}
+
+/// Maven 常见构件路径：至少 group/artifact/version/file，且文件名含常见 Maven 扩展。
+fn is_maven_artifact_path(path: &str) -> bool {
+    let segments = path.split('/').collect::<Vec<_>>();
+    if segments.len() < 4 {
+        return false;
+    }
+    let file = segments.last().copied().unwrap_or_default();
+    [".pom", ".jar", ".war", ".ear", ".module"]
+        .iter()
+        .any(|ext| file.ends_with(ext))
+}
+
+/// 从离线 blob 条目生成搬运用仓库摘要，完全不访问源 Nexus 在线 REST。
+pub(crate) fn infer_source_repos_from_offline_entries(
+    entries: &[OfflineBlobEntry],
+    repo_type: &str,
+    selected: Option<Vec<String>>,
+) -> Result<Vec<NexusRepoSummary>, MigrateError> {
+    let mut by_repo: BTreeMap<String, Vec<&OfflineBlobEntry>> = BTreeMap::new();
+    for entry in entries {
+        by_repo
+            .entry(entry.repo_name.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let names = match selected {
+        Some(selected) => {
+            let names = selected
+                .into_iter()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                return Err(MigrateError::Invalid("未选择要迁移的仓库".to_string()));
+            }
+            for name in &names {
+                if !by_repo.contains_key(name) {
+                    return Err(MigrateError::Invalid(format!(
+                        "离线 blob store 中不存在仓库: {name}"
+                    )));
+                }
+            }
+            names
+        }
+        None => by_repo.keys().cloned().collect(),
+    };
+
+    Ok(names
+        .into_iter()
+        .filter_map(|name| {
+            let entries = by_repo.get(&name)?;
+            Some(NexusRepoSummary {
+                format: infer_offline_format(&name, entries).to_string(),
+                name,
+                r#type: repo_type.to_string(),
+                upstream_url: None,
+                group_members: vec![],
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -697,7 +833,50 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].repo_name, "maven-proxy");
         assert_eq!(entries[0].blob_name, "/a/app-1.0.jar");
+        assert_eq!(entries[0].size, Some(10));
         assert!(entries[0].bytes_path.is_file());
+    }
+
+    #[test]
+    fn 可搬运条目保留_1tb_逻辑_size_且不依赖物理本体大小() {
+        const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        build_sample_store(
+            root,
+            &[
+                (
+                    "blob-1.properties",
+                    &sample_properties(
+                        "raw-hosted",
+                        "/large-a.bin",
+                        "sha-a",
+                        &(ONE_TIB / 2).to_string(),
+                    ),
+                ),
+                ("blob-1.bytes", "A"),
+                (
+                    "blob-2.properties",
+                    &sample_properties(
+                        "raw-hosted",
+                        "/large-b.bin",
+                        "sha-b",
+                        &(ONE_TIB / 2).to_string(),
+                    ),
+                ),
+                ("blob-2.bytes", "B"),
+            ],
+        );
+
+        let entries = enumerate_blob_entries(root).unwrap();
+        let logical_total: u64 = entries.iter().filter_map(|e| e.size).sum();
+        let physical_total: u64 = entries
+            .iter()
+            .map(|e| fs::metadata(&e.bytes_path).unwrap().len())
+            .sum();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(logical_total, ONE_TIB);
+        assert_eq!(physical_total, 2, "测试仅模拟逻辑 1TB，不真实写入大文件");
     }
 
     /// 本 FR 命门：并发分片枚举的结果集必须与单线程串行枚举一致（顺序无关、归组 / 去重不变）。

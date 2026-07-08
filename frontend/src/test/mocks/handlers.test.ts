@@ -141,6 +141,12 @@ describe('新增 MSW handlers（管理员端点不返 401）', () => {
 
     const job = await api.getMigrationJob(created.job_id);
     expect(job.job_id).toBe(created.job_id);
+    expect(job.phase).toBe('downloading');
+    expect(job.current_path).toBe('com/example/app/1.0.0/app-1.0.0.jar');
+
+    const detail = await api.getTask(created.job_id);
+    expect(detail.label).toBe('在线拉取导入队列');
+    expect(detail.migration?.phase).toBe('done');
 
     // 任务控制为幂等空操作（200/204），不抛错。
     await expect(api.pauseMigrationJob(created.job_id)).resolves.toBeUndefined();

@@ -10,6 +10,8 @@ export default {
   close: '关闭',
   back: '返回',
   refresh: '刷新',
+  refreshCurrentPage: '刷新当前内容页',
+  noRefreshableContent: '当前页暂无可刷新内容',
   search: '搜索',
   loading: '加载中…',
   saving: '保存中…',

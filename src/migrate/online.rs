@@ -161,6 +161,14 @@ pub struct OnlinePullProgress {
     pub total_assets: usize,
     /// 已处理 asset 数（migrated + skipped_existing + skipped）。
     pub done_assets: usize,
+    /// 待搬运 asset 的逻辑总字节数；未知大小的条目按 0 计入。
+    pub total_bytes: u64,
+    /// 已处理 asset 的逻辑字节数（migrated_bytes + skipped_bytes）。
+    pub done_bytes: u64,
+    /// 成功新写入的逻辑字节数。
+    pub migrated_bytes: u64,
+    /// 跳过或失败的逻辑字节数（含增量跳过与失败跳过）。
+    pub skipped_bytes: u64,
     /// 成功新写入数（首次搬运或内容变化后覆盖写入）。
     pub migrated: usize,
     /// 增量跳过数（FR-134）：目标已存在且 sha256 一致，本次幂等重入跳过落盘。
@@ -287,7 +295,8 @@ where
 
         tracing::info!(
             源仓库 = %src.name, 目标仓库 = %sel.target_repo,
-            新建 = created, 已搬运 = pulled.migrated, 已跳过 = pulled.skipped, 已取消 = pulled.cancelled,
+            新建 = created, 已搬运 = pulled.migrated, 增量跳过 = pulled.skipped_existing,
+            失败跳过 = pulled.skipped, 已取消 = pulled.cancelled,
             "Maven hosted 仓库在线拉取迁移结束"
         );
         let outcome = OnlineRepoMigrationOutcome {
@@ -296,8 +305,7 @@ where
             format: "maven".to_string(),
             created,
             migrated_artifacts: pulled.migrated,
-            // 在线拉取路径不区分增量跳过（AlreadyExists 已计入 migrated）
-            skipped_existing_artifacts: 0,
+            skipped_existing_artifacts: pulled.skipped_existing,
             skipped_artifacts: pulled.skipped,
         };
         lock_progress(progress).repos.push(outcome.clone());
@@ -326,12 +334,22 @@ pub(crate) fn mark_cancelled(progress: &std::sync::Mutex<OnlinePullProgress>) {
 
 /// 单仓库在线拉取的结果：成功 / 跳过计数 + 是否在搬运中途被取消（FR-91）。
 struct RepoPullResult {
-    /// 成功搬运的 asset 数。
+    /// 成功新写入的 asset 数。
     migrated: usize,
+    /// 目标已存在且 sha256 一致的增量跳过数。
+    skipped_existing: usize,
     /// 跳过 / 失败的 asset 数。
     skipped: usize,
     /// 是否在 asset 边界被取消（取消则提前结束本仓库、未搬完）。
     cancelled: bool,
+}
+
+/// 单个在线 asset 的落定结果。
+enum PullOneOutcome {
+    /// 成功新写入。
+    Migrated,
+    /// 目标已存在且 sha256 一致，增量跳过。
+    SkippedExisting,
 }
 
 /// 枚举某源仓库的全部 components（已知总数）再逐 asset 下载搬运，边搬边上报进度。
@@ -361,6 +379,7 @@ where
         tracing::warn!(仓库 = %target_repo.name, 格式 = %target_repo.format, "格式处理器未注册，跳过在线拉取");
         return Ok(RepoPullResult {
             migrated: 0,
+            skipped_existing: 0,
             skipped: 0,
             cancelled: false,
         });
@@ -389,12 +408,14 @@ where
 
     // 阶段2：逐 asset 下载 + 落地，边搬边更新进度（下载 / 落盘在锁外）
     let mut migrated = 0usize;
+    let mut skipped_existing = 0usize;
     let mut skipped = 0usize;
     for asset in &assets {
         // 每个 asset 边界先响应控制信号（FR-91）：取消则提前结束；暂停则挂起等待
         if await_control(control, progress).await {
             return Ok(RepoPullResult {
                 migrated,
+                skipped_existing,
                 skipped,
                 cancelled: true,
             });
@@ -402,7 +423,7 @@ where
 
         lock_progress(progress).current_path = Some(asset.path.clone());
 
-        let ok = pull_one_asset(
+        let outcome = pull_one_asset(
             client,
             artifacts,
             format,
@@ -411,22 +432,29 @@ where
             credential,
             max_size,
         )
-        .await
-        .is_ok();
+        .await;
 
         let mut p = lock_progress(progress);
-        if ok {
-            migrated += 1;
-            p.migrated += 1;
-        } else {
-            skipped += 1;
-            p.skipped += 1;
+        match outcome {
+            Ok(PullOneOutcome::Migrated) => {
+                migrated += 1;
+                p.migrated += 1;
+            }
+            Ok(PullOneOutcome::SkippedExisting) => {
+                skipped_existing += 1;
+                p.skipped_existing += 1;
+            }
+            Err(()) => {
+                skipped += 1;
+                p.skipped += 1;
+            }
         }
         p.done_assets += 1;
     }
 
     Ok(RepoPullResult {
         migrated,
+        skipped_existing,
         skipped,
         cancelled: false,
     })
@@ -487,7 +515,7 @@ async fn pull_one_asset<C, S, U>(
     asset: &NexusAsset,
     credential: Option<&NexusCredential>,
     max_size: Option<u64>,
-) -> Result<(), ()>
+) -> Result<PullOneOutcome, ()>
 where
     C: NexusClient,
     S: BlobStore,
@@ -505,7 +533,7 @@ where
     // 下载 + 流式写入；网络中断 / 流式解码失败等瞬时错误自动重试（指数退避），
     // 确定性失败（不可覆盖 / 超限 / 路径非法等）不重试。
     let mut attempt = 0u32;
-    let record = loop {
+    let outcome = loop {
         attempt += 1;
 
         // 流式下载（不整体载入内存）
@@ -526,8 +554,7 @@ where
             .ingest_hosted(repo, format, &coords, reader, max_size)
             .await
         {
-            // 无论新写还是幂等重入（AlreadyExists），在线拉取路径均视为已处理
-            Ok(outcome) => break outcome.into_record(),
+            Ok(outcome) => break outcome,
             // 不可覆盖为确定性失败，不重试
             Err(ServiceError::OverwriteForbidden) => {
                 tracing::info!(仓库 = %repo.name, 路径 = %asset.path, "同坐标制品已存在且不可覆盖，跳过");
@@ -544,6 +571,9 @@ where
         }
     };
 
+    let written = outcome.is_written();
+    let record = outcome.into_record();
+
     // 文件一致：落定 sha256 须与源报告一致，否则视为下载损坏，回滚该制品并跳过
     if let Some(expected) = &asset.sha256 {
         if !record.sha256.eq_ignore_ascii_case(expected) {
@@ -553,7 +583,11 @@ where
         }
     }
 
-    Ok(())
+    if written {
+        Ok(PullOneOutcome::Migrated)
+    } else {
+        Ok(PullOneOutcome::SkippedExisting)
+    }
 }
 
 #[cfg(test)]
@@ -712,6 +746,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, FIXTURE);
+    }
+
+    #[tokio::test]
+    async fn 在线拉取二次同sha256计入增量跳过而非新搬() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let url = "https://nx/repository/r3d/com/foo/lib/1.0/lib-1.0.jar";
+        let page = format!(
+            r#"{{ "items": [ {{ "assets": [
+                {{ "path": "com/foo/lib/1.0/lib-1.0.jar", "downloadUrl": "{url}", "checksum": {{ "sha256": "{FIXTURE_SHA256}" }} }}
+            ]}} ], "continuationToken": null }}"#
+        );
+        let client = MockOnline {
+            pages: vec![page],
+            assets: HashMap::from([(url.to_string(), FIXTURE.to_vec())]),
+        };
+        let selection = [sel(src("r3d", "maven2", "hosted"), "r3d")];
+
+        let progress1 = std::sync::Mutex::new(OnlinePullProgress::default());
+        let control1 = JobControl::default();
+        let first = migrate_online_with_progress(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &selection,
+            None,
+            &progress1,
+            &control1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.repos[0].migrated_artifacts, 1);
+        assert_eq!(first.repos[0].skipped_existing_artifacts, 0);
+
+        let progress2 = std::sync::Mutex::new(OnlinePullProgress::default());
+        let control2 = JobControl::default();
+        let second = migrate_online_with_progress(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &selection,
+            None,
+            &progress2,
+            &control2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.repos[0].migrated_artifacts, 0, "二次跑无新写入");
+        assert_eq!(
+            second.repos[0].skipped_existing_artifacts, 1,
+            "二次跑应计入增量跳过"
+        );
+        assert_eq!(second.repos[0].skipped_artifacts, 0);
+        let p = progress2.lock().unwrap();
+        assert_eq!(p.total_assets, 1);
+        assert_eq!(p.done_assets, 1);
+        assert_eq!(p.migrated, 0);
+        assert_eq!(p.skipped_existing, 1);
+        assert_eq!(p.skipped, 0);
+        assert_eq!(p.repos[0].migrated_artifacts, 0);
+        assert_eq!(p.repos[0].skipped_existing_artifacts, 1);
     }
 
     #[tokio::test]

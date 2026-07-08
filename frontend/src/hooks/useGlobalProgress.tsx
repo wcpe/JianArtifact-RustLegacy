@@ -1,16 +1,29 @@
 // 全局进度条上下文（FR-127）：统一管理「在途请求数」与「路由切换」的进度状态，
-// 供全局进度条组件消费；自研，不引第三方依赖。
+// 供全局进度条组件消费；同时提供当前内容页局部刷新回调注册能力。
+// 自研，不引第三方依赖。
 //
 // 设计：
 // - 用进程内原子计数（useRef + useState）跟踪在途请求数，>0 则 loading=true。
 // - 路由切换另设独立的 routeLoading，由 RouteProgressTrigger 在 location 变化时
 //   短暂置 true → 下一帧 false（视觉上一闪而过的伪进度，给「瞬切」页面也有反馈感）。
+// - 当前页刷新回调仅保存一份；页面卸载或路由切换时清理，避免旧页面回调残留。
 // - 两路取 OR：只要有一路为 true，整体 loading 即为 true。
 
-import { createContext, useCallback, useContext, useRef, useState } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+
+/** 当前内容页刷新回调。 */
+type PageRefreshCallback = () => void | Promise<void>;
 
 /** 全局进度上下文值。 */
-interface GlobalProgressContextValue {
+interface GlobalProgressContextBaseValue {
   /** 综合加载状态：在途请求 OR 路由切换任一为真时为 true。 */
   loading: boolean;
   /** 在途请求数加 1（发请求时调用）。 */
@@ -21,20 +34,50 @@ interface GlobalProgressContextValue {
   setRouteLoading: (v: boolean) => void;
 }
 
-// eslint-disable-next-line react-refresh/only-export-components -- context 与 hook 同文件导出是常见 React 模式，此处刻意不拆分
-export const GlobalProgressContext = createContext<GlobalProgressContextValue>({
+interface GlobalProgressRefreshValue {
+  /** 当前内容页是否注册了局部刷新回调。 */
+  hasPageRefresh: boolean;
+  /** 当前内容页刷新是否正在执行。 */
+  isPageRefreshing: boolean;
+  /** 注册当前内容页刷新回调；返回注销函数，页面卸载时必须调用。 */
+  registerPageRefreshCallback: (callback: PageRefreshCallback) => () => void;
+  /** 清理当前内容页刷新回调，路由切换时由外壳调用。 */
+  clearPageRefreshCallback: () => void;
+  /** 执行当前内容页刷新；无回调时返回 false。 */
+  refreshCurrentPage: () => Promise<boolean>;
+}
+
+/** 全量上下文值；Provider 外部注入测试值时允许省略刷新字段并由 hook 补齐默认值。 */
+type GlobalProgressContextValue = GlobalProgressContextBaseValue & GlobalProgressRefreshValue;
+type GlobalProgressContextProviderValue = GlobalProgressContextBaseValue &
+  Partial<GlobalProgressRefreshValue>;
+
+const DEFAULT_GLOBAL_PROGRESS_VALUE: GlobalProgressContextValue = {
   loading: false,
   inc: () => {},
   dec: () => {},
   setRouteLoading: () => {},
-});
+  hasPageRefresh: false,
+  isPageRefreshing: false,
+  registerPageRefreshCallback: () => () => {},
+  clearPageRefreshCallback: () => {},
+  refreshCurrentPage: async () => false,
+};
+
+// eslint-disable-next-line react-refresh/only-export-components -- context 与 hook 同文件导出是常见 React 模式，此处刻意不拆分
+export const GlobalProgressContext = createContext<GlobalProgressContextProviderValue>(
+  DEFAULT_GLOBAL_PROGRESS_VALUE,
+);
 
 /** 全局进度提供者：包裹在路由与应用根节点之外。 */
 export function GlobalProgressProvider({ children }: { children: React.ReactNode }) {
   // inflight：在途请求计数（用 ref 保证并发更新不丢失）。
   const inflightRef = useRef(0);
+  const pageRefreshRef = useRef<PageRefreshCallback | null>(null);
   const [reqLoading, setReqLoading] = useState(false);
   const [routeLoading, setRouteLoading] = useState(false);
+  const [hasPageRefresh, setHasPageRefresh] = useState(false);
+  const [isPageRefreshing, setIsPageRefreshing] = useState(false);
 
   const inc = useCallback(() => {
     inflightRef.current += 1;
@@ -48,16 +91,73 @@ export function GlobalProgressProvider({ children }: { children: React.ReactNode
     }
   }, []);
 
+  const registerPageRefreshCallback = useCallback((callback: PageRefreshCallback) => {
+    pageRefreshRef.current = callback;
+    setHasPageRefresh(true);
+
+    return () => {
+      if (pageRefreshRef.current !== callback) return;
+      pageRefreshRef.current = null;
+      setHasPageRefresh(false);
+    };
+  }, []);
+
+  const clearPageRefreshCallback = useCallback(() => {
+    if (!pageRefreshRef.current) return;
+    pageRefreshRef.current = null;
+    setHasPageRefresh(false);
+  }, []);
+
+  const refreshCurrentPage = useCallback(async () => {
+    const callback = pageRefreshRef.current;
+    if (!callback) return false;
+
+    setIsPageRefreshing(true);
+    try {
+      await callback();
+      return true;
+    } finally {
+      setIsPageRefreshing(false);
+    }
+  }, []);
+
+  useEffect(
+    () => () => {
+      pageRefreshRef.current = null;
+    },
+    [],
+  );
+
   const loading = reqLoading || routeLoading;
 
-  return (
-    <GlobalProgressContext.Provider value={{ loading, inc, dec, setRouteLoading }}>
-      {children}
-    </GlobalProgressContext.Provider>
+  const value = useMemo(
+    () => ({
+      loading,
+      inc,
+      dec,
+      setRouteLoading,
+      hasPageRefresh,
+      isPageRefreshing,
+      registerPageRefreshCallback,
+      clearPageRefreshCallback,
+      refreshCurrentPage,
+    }),
+    [
+      loading,
+      inc,
+      dec,
+      hasPageRefresh,
+      isPageRefreshing,
+      registerPageRefreshCallback,
+      clearPageRefreshCallback,
+      refreshCurrentPage,
+    ],
   );
+
+  return <GlobalProgressContext.Provider value={value}>{children}</GlobalProgressContext.Provider>;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components -- hook 与 context/provider 同文件是常见 React 模式
-export function useGlobalProgress() {
-  return useContext(GlobalProgressContext);
+export function useGlobalProgress(): GlobalProgressContextValue {
+  return { ...DEFAULT_GLOBAL_PROGRESS_VALUE, ...useContext(GlobalProgressContext) };
 }

@@ -109,6 +109,11 @@ fn offline_req(auth: Option<&str>, body: Value) -> Request<Body> {
     json_post("/api/v1/migrate/nexus/offline/preview", auth, body)
 }
 
+/// 构造带 JSON 体的 proxy 仓库搬运请求。
+fn proxy_migrate_req(auth: Option<&str>, body: Value) -> Request<Body> {
+    json_post("/api/v1/migrate/nexus/proxy/migrate", auth, body)
+}
+
 /// 构造带 JSON 体的 hosted 仓库搬运请求。
 fn hosted_migrate_req(auth: Option<&str>, body: Value) -> Request<Body> {
     json_post("/api/v1/migrate/nexus/hosted/migrate", auth, body)
@@ -341,10 +346,7 @@ async fn hosted_搬运匿名返回_401() {
     let (state, _dir) = 测试用状态().await;
     let (status, _) = send(
         build_router(state),
-        hosted_migrate_req(
-            None,
-            json!({ "base_url": "https://nexus.example", "offline_path": "/whatever" }),
-        ),
+        hosted_migrate_req(None, json!({ "offline_path": "/whatever" })),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -358,7 +360,7 @@ async fn hosted_搬运普通用户返回_403() {
         build_router(state),
         hosted_migrate_req(
             Some(&format!("Bearer {token}")),
-            json!({ "base_url": "https://nexus.example", "offline_path": "/whatever" }),
+            json!({ "offline_path": "/whatever" }),
         ),
     )
     .await;
@@ -369,16 +371,40 @@ async fn hosted_搬运普通用户返回_403() {
 async fn hosted_搬运管理员空_offline_path_返回_400() {
     let (state, _dir) = 测试用状态().await;
     let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
-    // offline_path 为空白应在调用源系统前以 400 短路
+    // offline_path 为空白应在启动后台搬运前以 400 短路
     let (status, body) = send(
         build_router(state),
         hosted_migrate_req(
             Some(&format!("Bearer {token}")),
-            json!({ "base_url": "https://nexus.example", "offline_path": "   " }),
+            json!({ "offline_path": "   " }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn 离线搬运带旧在线字段被拒绝() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let auth = format!("Bearer {token}");
+    let app = build_router(state);
+    let body = json!({
+        "base_url": "https://nexus.example",
+        "auth_ref": "NEXUS_SRC",
+        "offline_path": "/whatever",
+        "repositories": ["maven-proxy"]
+    });
+
+    let (proxy_status, _) = send(app.clone(), proxy_migrate_req(Some(&auth), body.clone())).await;
+    let (hosted_status, _) = send(app, hosted_migrate_req(Some(&auth), body)).await;
+
+    for status in [proxy_status, hosted_status] {
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY,
+            "旧在线字段应被拒绝，实际状态: {status}"
+        );
+    }
 }
 
 #[tokio::test]

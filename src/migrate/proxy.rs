@@ -1,15 +1,15 @@
 //! Nexus 迁移**proxy 仓库配置 + 缓存制品搬运**（FR-38，ADR-0006）。
 //!
 //! 把源 Nexus 的 **proxy 类型仓库**搬到本系统，分两步：
-//! - **仓库配置**：据在线 REST 枚举到的 proxy 仓库配置（格式 + 上游 `remoteUrl`，见
-//!   [`super::NexusRepoSummary`]）在本系统创建对应 proxy 仓库；
+//! - **仓库配置**：在线摘要路径据 REST 枚举到的 proxy 仓库配置（格式 + 上游 `remoteUrl`，见
+//!   [`super::NexusRepoSummary`]）建仓；纯离线路径则只从 blob store 推断仓库名 / 格式，不读取源 URL；
 //! - **缓存制品搬运**：从离线 blob store 读取源已缓存的 proxy 制品本体，经既有
 //!   [`ArtifactService::ingest_cached`] 写入本系统对应仓库的缓存（blob 先落盘并校验 sha256
 //!   再写元数据索引，失败回滚不留孤儿；流式不整体载入内存）。
 //!
-//! 数据来源分工：proxy 仓库的**类型 / 上游地址**仅在线 REST 枚举（FR-36）携带，故配置取自
-//! `NexusRepoSummary`；制品**本体**在离线 blob store 的 `.bytes` 文件（FR-37 已能枚举其元数据），
-//! 故搬运取自离线 blob store。二者按仓库名关联。
+//! 数据来源分工：在线摘要路径用 `NexusRepoSummary` 承载类型 / 格式 / 上游地址；纯离线路径从
+//! `.properties` 元数据推断仓库名和格式，上游地址留空，后续由运维按需配置。制品**本体**始终来自
+//! 离线 blob store 的 `.bytes` 文件（FR-37 已能枚举其元数据），二者按仓库名关联。
 //!
 //! 幂等与容错（testing-and-quality §2.5）：
 //! - 同名仓库已存在则复用（不重复建仓）；
@@ -18,6 +18,7 @@
 //!
 //! 范围纪律：**只做 proxy 仓库配置 + 缓存制品搬运**，不做 hosted 仓库制品搬运（FR-39）。
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::format::{ArtifactCoordinates, ArtifactService, FormatRegistry, IngestOutcome};
@@ -41,15 +42,50 @@ enum BumpKind {
     SkippedFailed,
 }
 
+/// 取离线条目声明的逻辑字节数；缺失或非法 size 在枚举阶段已置 None，此处按 0 计入。
+fn entry_size(entry: &super::OfflineBlobEntry) -> u64 {
+    entry.size.unwrap_or(0)
+}
+
+/// 汇总条目逻辑字节数，使用饱和累加避免异常元数据造成溢出。
+fn sum_entry_sizes(entries: &[super::OfflineBlobEntry]) -> u64 {
+    entries
+        .iter()
+        .fold(0u64, |total, entry| total.saturating_add(entry_size(entry)))
+}
+
+/// 仅统计本次选中且可搬运仓库的离线条目，避免未选中仓库污染进度分母。
+fn selected_entry_totals(
+    entries: &[super::OfflineBlobEntry],
+    selected_repos: &HashSet<&str>,
+) -> (usize, u64) {
+    entries
+        .iter()
+        .filter(|entry| selected_repos.contains(entry.repo_name.as_str()))
+        .fold((0usize, 0u64), |(count, bytes), entry| {
+            (count + 1, bytes.saturating_add(entry_size(entry)))
+        })
+}
+
 /// 在一个 blob 处理完成后推进进度计数（FR-125/FR-134）：
-/// `done_assets` +1，按三态分别累加 `migrated` / `skipped_existing` / `skipped`。
-fn bump_progress(progress: &std::sync::Mutex<OnlinePullProgress>, kind: BumpKind) {
+/// `done_assets` +1，按三态分别累加资产数与逻辑字节数。
+fn bump_progress(progress: &std::sync::Mutex<OnlinePullProgress>, kind: BumpKind, bytes: u64) {
     let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
     p.done_assets += 1;
+    p.done_bytes = p.done_bytes.saturating_add(bytes);
     match kind {
-        BumpKind::Migrated => p.migrated += 1,
-        BumpKind::SkippedExisting => p.skipped_existing += 1,
-        BumpKind::SkippedFailed => p.skipped += 1,
+        BumpKind::Migrated => {
+            p.migrated += 1;
+            p.migrated_bytes = p.migrated_bytes.saturating_add(bytes);
+        }
+        BumpKind::SkippedExisting => {
+            p.skipped_existing += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(bytes);
+        }
+        BumpKind::SkippedFailed => {
+            p.skipped += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(bytes);
+        }
     }
 }
 
@@ -87,7 +123,7 @@ async fn ensure_proxy_repo(
     meta: &MetaStore,
     name: &str,
     format: &str,
-    upstream_url: &str,
+    upstream_url: Option<&str>,
 ) -> Result<(RepositoryRecord, bool), MigrateError> {
     if let Some(existing) = meta
         .get_repository_by_name(name)
@@ -103,7 +139,7 @@ async fn ensure_proxy_repo(
             format,
             r#type: RepoType::Proxy,
             visibility: Visibility::Public,
-            upstream_url: Some(upstream_url),
+            upstream_url,
             // 迁移不搬运源系统上游凭据：凭据真源在 env / 配置，需运维另行配置（凭据不入库）
             upstream_auth_ref: None,
         })
@@ -136,9 +172,12 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
     let Some(format) = formats.get(&repo.format) else {
         // 仓库已按映射格式建成，注册表理应有对应处理器；缺失则整批跳过（防御）
         tracing::warn!(仓库 = %repo.name, 格式 = %repo.format, "格式处理器未注册，跳过该仓库制品搬运");
+        let skipped_bytes = sum_entry_sizes(entries);
         let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
         p.skipped += entries.len();
         p.done_assets += entries.len();
+        p.done_bytes = p.done_bytes.saturating_add(skipped_bytes);
+        p.skipped_bytes = p.skipped_bytes.saturating_add(skipped_bytes);
         return (0, 0, entries.len(), false);
     };
 
@@ -156,6 +195,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             p.current_repo = Some(repo.name.clone());
             p.current_path = Some(entry.blob_name.clone());
         }
+        let bytes = entry_size(entry);
 
         // 归一化并校验路径：非法路径（穿越 / 空）跳过
         let rel = normalize_blob_path(&entry.blob_name);
@@ -164,7 +204,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "制品路径非法，跳过搬运");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
                 continue;
             }
         };
@@ -175,7 +215,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, 路径 = %entry.bytes_path.display(), 错误 = %e, "读取 blob 本体失败，跳过搬运");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
                 continue;
             }
         };
@@ -184,18 +224,18 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
             // 新写入：首次搬运或内容变化后覆盖
             Ok(IngestOutcome::Written(_)) => {
                 migrated += 1;
-                bump_progress(progress, BumpKind::Migrated);
+                bump_progress(progress, BumpKind::Migrated, bytes);
             }
             // 增量跳过：目标已存在且 sha256 一致，幂等重入（FR-134）
             Ok(IngestOutcome::AlreadyExists(_)) => {
                 skipped_existing += 1;
-                bump_progress(progress, BumpKind::SkippedExisting);
+                bump_progress(progress, BumpKind::SkippedExisting, bytes);
                 tracing::debug!(仓库 = %repo.name, blob = %entry.blob_name, "制品已存在且 sha256 一致，增量跳过");
             }
             Err(e) => {
                 tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "缓存制品搬运失败，跳过");
                 skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed);
+                bump_progress(progress, BumpKind::SkippedFailed, bytes);
             }
         }
     }
@@ -229,6 +269,36 @@ pub async fn migrate_proxy_repositories<S: BlobStore, U: Upstream>(
     .await
 }
 
+/// 纯离线执行 proxy 缓存制品搬运：只读 blob store，不访问源 Nexus 在线 REST。
+pub async fn migrate_proxy_repositories_offline_with_progress<S: BlobStore, U: Upstream>(
+    meta: &MetaStore,
+    artifacts: &ArtifactService<S, U>,
+    formats: &FormatRegistry,
+    offline_root: &Path,
+    selected_repositories: Option<Vec<String>>,
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    control: &JobControl,
+) -> Result<ProxyMigrationReport, MigrateError> {
+    progress.lock().unwrap_or_else(|e| e.into_inner()).phase = OnlinePullPhase::Enumerating;
+    let entries = crate::migrate::enumerate_blob_entries(offline_root)?;
+    let source_repos = crate::migrate::infer_source_repos_from_offline_entries(
+        &entries,
+        "proxy",
+        selected_repositories,
+    )?;
+    migrate_proxy_repositories_with_progress_inner(
+        meta,
+        artifacts,
+        formats,
+        &source_repos,
+        offline_root,
+        progress,
+        control,
+        true,
+    )
+    .await
+}
+
 /// 执行 proxy 仓库配置创建 + 缓存制品搬运，边搬边上报进度、在 blob 边界响应取消 / 暂停（FR-125）。
 ///
 /// 语义同 [`migrate_proxy_repositories`]，额外把进度写入 `progress`（供 `GET /migrate/jobs/{id}` 轮询）、
@@ -242,15 +312,45 @@ pub async fn migrate_proxy_repositories_with_progress<S: BlobStore, U: Upstream>
     progress: &std::sync::Mutex<OnlinePullProgress>,
     control: &JobControl,
 ) -> Result<ProxyMigrationReport, MigrateError> {
+    migrate_proxy_repositories_with_progress_inner(
+        meta,
+        artifacts,
+        formats,
+        source_repos,
+        offline_root,
+        progress,
+        control,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn migrate_proxy_repositories_with_progress_inner<S: BlobStore, U: Upstream>(
+    meta: &MetaStore,
+    artifacts: &ArtifactService<S, U>,
+    formats: &FormatRegistry,
+    source_repos: &[NexusRepoSummary],
+    offline_root: &Path,
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    control: &JobControl,
+    allow_missing_upstream: bool,
+) -> Result<ProxyMigrationReport, MigrateError> {
     progress.lock().unwrap_or_else(|e| e.into_inner()).phase = OnlinePullPhase::Enumerating;
 
     // 离线 blob store 中的可搬运条目，按仓库名归组（一次枚举、避免逐仓库重复遍历磁盘）
     let entries = crate::migrate::enumerate_blob_entries(offline_root)?;
-    // total_assets 作进度分母：离线 store 全部可搬运条目数
-    progress
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .total_assets = entries.len();
+    let selected_repos: HashSet<&str> = source_repos
+        .iter()
+        .filter(|src| src.r#type == "proxy" && map_nexus_format(&src.format).is_some())
+        .map(|src| src.name.as_str())
+        .collect();
+    let (total_assets, total_bytes) = selected_entry_totals(&entries, &selected_repos);
+    {
+        let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+        p.total_assets = total_assets;
+        p.total_bytes = total_bytes;
+    }
     let mut by_repo: std::collections::HashMap<&str, Vec<super::OfflineBlobEntry>> =
         std::collections::HashMap::new();
     for e in &entries {
@@ -282,9 +382,9 @@ pub async fn migrate_proxy_repositories_with_progress<S: BlobStore, U: Upstream>
                 .push(src.name.clone());
             continue;
         };
-        // proxy 仓库须有上游地址；缺失则跳过（无法建合法 proxy 仓库）
-        let Some(upstream_url) = src.upstream_url.as_deref().filter(|u| !u.is_empty()) else {
-            tracing::warn!(仓库 = %src.name, "proxy 仓库缺上游地址，跳过迁移");
+        let upstream_url = src.upstream_url.as_deref().filter(|u| !u.is_empty());
+        if !allow_missing_upstream && upstream_url.is_none() {
+            tracing::info!(仓库 = %src.name, "proxy 仓库缺少上游地址，跳过迁移");
             report.skipped_repos.push(src.name.clone());
             progress
                 .lock()
@@ -292,8 +392,7 @@ pub async fn migrate_proxy_repositories_with_progress<S: BlobStore, U: Upstream>
                 .skipped_repos
                 .push(src.name.clone());
             continue;
-        };
-
+        }
         let (repo, created) = ensure_proxy_repo(meta, &src.name, format, upstream_url).await?;
 
         let repo_entries = by_repo.remove(src.name.as_str()).unwrap_or_default();
@@ -366,13 +465,21 @@ mod tests {
 
     /// 在临时目录铺一个最小 Nexus 文件型 blob store（content/vol-01/chap-01 下放成对 .properties/.bytes）。
     fn build_store(root: &Path, blobs: &[(&str, &str, &str)]) {
+        let sized_blobs: Vec<_> = blobs
+            .iter()
+            .map(|(repo, blob_name, body)| (*repo, *blob_name, *body, body.len() as u64))
+            .collect();
+        build_store_with_sizes(root, &sized_blobs);
+    }
+
+    /// 在 `.properties` 写入指定逻辑 size，物理 `.bytes` 可保持很小。
+    fn build_store_with_sizes(root: &Path, blobs: &[(&str, &str, &str, u64)]) {
         let chap = root.join("content").join("vol-01").join("chap-01");
         fs::create_dir_all(&chap).unwrap();
-        for (i, (repo, blob_name, body)) in blobs.iter().enumerate() {
+        for (i, (repo, blob_name, body, size)) in blobs.iter().enumerate() {
             let stem = format!("blob-{i}");
             let props = format!(
-                "@Bucket.repo-name={repo}\n@BlobStore.blob-name={blob_name}\nsize={}\nsha1=x\ndeleted=false\n",
-                body.len()
+                "@Bucket.repo-name={repo}\n@BlobStore.blob-name={blob_name}\nsize={size}\nsha1=x\ndeleted=false\n"
             );
             fs::write(chap.join(format!("{stem}.properties")), props).unwrap();
             fs::write(chap.join(format!("{stem}.bytes")), body).unwrap();
@@ -440,6 +547,40 @@ mod tests {
             .unwrap();
         assert_eq!(repo.r#type, "proxy");
         assert_eq!(repo.upstream_url.as_deref(), Some("https://up.example"));
+        let svc = Arc::new(svc);
+        let coords = ArtifactCoordinates {
+            path: "dir/a.bin".to_string(),
+        };
+        let (mut h, _) = svc.get(&repo, &RawFormat, &coords).await.unwrap();
+        let mut buf = Vec::new();
+        h.blob.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, "内容A".as_bytes());
+    }
+
+    #[tokio::test]
+    async fn 纯离线_proxy_从_blob_store_推断仓库且无需上游地址() {
+        let (meta, svc, formats, store_dir) = 新建().await;
+        let blob_root = store_dir.path().join("nexus");
+        build_store(&blob_root, &[("raw-proxy", "/dir/a.bin", "内容A")]);
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        let control = JobControl::default();
+
+        let report = migrate_proxy_repositories_offline_with_progress(
+            &meta, &svc, &formats, &blob_root, None, &progress, &control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.repos.len(), 1);
+        assert_eq!(report.repos[0].repo_name, "raw-proxy");
+        assert_eq!(report.repos[0].migrated_artifacts, 1);
+        let repo = meta
+            .get_repository_by_name("raw-proxy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo.r#type, "proxy");
+        assert_eq!(repo.upstream_url, None);
         let svc = Arc::new(svc);
         let coords = ArtifactCoordinates {
             path: "dir/a.bin".to_string(),
@@ -606,6 +747,42 @@ mod tests {
         let p = progress.lock().unwrap();
         assert_eq!(p.phase, OnlinePullPhase::Cancelled);
         assert_eq!(p.migrated, 0);
+    }
+
+    #[tokio::test]
+    async fn with_progress_按_properties_size_统计_1tb_逻辑字节() {
+        const ONE_TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        let (meta, svc, formats, store_dir) = 新建().await;
+        let blob_root = store_dir.path().join("nexus");
+        build_store_with_sizes(
+            &blob_root,
+            &[
+                ("raw-proxy", "/ok.bin", "A", ONE_TIB - 1),
+                ("raw-proxy", "/../evil.bin", "B", 1),
+            ],
+        );
+        let src = vec![src_repo(
+            "raw-proxy",
+            "raw",
+            "proxy",
+            Some("https://up.example"),
+        )];
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        let control = JobControl::default();
+
+        let report = migrate_proxy_repositories_with_progress(
+            &meta, &svc, &formats, &src, &blob_root, &progress, &control,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.repos[0].migrated_artifacts, 1);
+        assert_eq!(report.repos[0].skipped_artifacts, 1);
+        let p = progress.lock().unwrap();
+        assert_eq!(p.total_bytes, ONE_TIB);
+        assert_eq!(p.done_bytes, ONE_TIB);
+        assert_eq!(p.migrated_bytes, ONE_TIB - 1);
+        assert_eq!(p.skipped_bytes, 1);
     }
 
     // ---------- FR-134：增量幂等续传计数 ----------

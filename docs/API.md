@@ -316,7 +316,7 @@
 - **请求**：JSON 体 `{ "base_url", "auth_ref"? }`。`base_url` 为源 Nexus 基址（如 `https://nexus.example`）；`auth_ref` 为上游凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `JIANARTIFACT_MIGRATE_<NAME>_PASSWORD`，不入库、不回显），匿名可访问的源系统可省略。仅管理员可调用。
 - **行为**：连接在线 Nexus，经其 `service/rest/v1/repositories` 枚举可迁移仓库列表与基本元数据。这是迁移的**发现 / 预览**步骤，**不搬运任何制品**（搬运为后续分期能力）。
 - **响应**：仓库摘要数组，每项含 `name`、`format`（Nexus 原样格式，如 `maven2` / `npm`）、`type`（`hosted` / `proxy` / `group`）、`upstream_url`（仅 proxy 仓库有值，取自源系统 `attributes.proxy.remoteUrl`）。
-- **错误**：`400` 参数不合法或 `auth_ref` 对应凭据未在环境变量中配置；`401` 未认证；`403` 非管理员；`502` 连接源系统失败 / 鉴权失败 / 响应异常（不向调用方泄露源系统内部细节）。
+- **错误**：`400` `base_url` 为空、参数不合法或 `auth_ref` 对应凭据未在环境变量中配置；`401` 未认证；`403` 非管理员；`502` 连接源系统失败 / 鉴权失败 / 响应异常（不向调用方泄露源系统内部细节）。
 
 ### 预览 Nexus 可迁移内容（离线 blob store 入口）
 
@@ -329,20 +329,20 @@
 ### 迁移 Nexus proxy 仓库（配置 + 缓存制品搬运）
 
 - **方法 / 路径**：`POST /api/v1/migrate/nexus/proxy/migrate`
-- **请求**：JSON 体 `{ "base_url", "auth_ref"?, "offline_path" }`。`base_url` 为源 Nexus 基址（经其 REST API 枚举 proxy 仓库配置：格式 / 上游地址）；`auth_ref` 为在线访问凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `PASSWORD`，不入库、不回显，匿名可访问的源系统可省略）；`offline_path` 为源 Nexus 文件型 blob store 根目录的本地路径（其下应含 `content/` 子目录），提供已缓存 proxy 制品本体。仅管理员可调用。
-- **行为**：把源 Nexus 的 **proxy 类型仓库**搬到本系统：① 据在线枚举的 proxy 仓库配置在本系统创建对应 proxy 仓库（映射 Nexus 格式名 → 本系统已实现格式：`maven2`→`maven` 等；同名仓库已存在则复用、不重复建仓、不改其既有配置；格式未实现或缺上游地址的仓库整体跳过）；② 从离线 blob store 按仓库名取该仓库的缓存制品本体（成对的 `.properties` + `.bytes`，缺本体者跳过），经既有制品机理流式写入缓存——**blob 先落盘并校验 sha256 再写元数据索引（标记 `cached`），写索引失败回滚不留孤儿，不整体载入内存**。搬运幂等可重入（同坐标同内容跳过），单个制品搬运失败（路径非法 / 读本体失败 / 写入失败）记录跳过、不中断整批。仅迁移 proxy 仓库；hosted 仓库制品完整搬运为后续分期能力。迁移**不搬运源系统上游凭据**（凭据真源 env / 配置，需运维另行配置）。
-- **异步化（FR-125）**：上万 blob 的同步搬运会在前置反代后超时（504），故搬运改为**后台异步任务**——同步阶段只做在线枚举源仓库配置（失败即 400/502、不开任务），随后**立即返回 `202 + job_id`**，实际建仓 + 离线 blob 流式 ingest 在后台执行，进度经 `GET /api/v1/migrate/jobs/{id}` 轮询，**支持取消 / 暂停**（FR-91，每个 blob 与每个仓库边界响应）。
-- **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`。任务进度含 `total_assets` / `done_assets` / `migrated` / `skipped` / `current_repo` / `current_path` / `repos`（各仓库 `source_repo` / `target_repo` / `created` / `migrated_artifacts` / `skipped_artifacts`，proxy `target` 同源名）/ `skipped_repos`（因格式未实现或缺上游地址整体跳过）；`phase` 终态 `done` / `cancelled`（取消，已搬运保留）/ `failed`（`error` 载因）。
-- **错误**（同步阶段）：`400` `offline_path` 为空；`401` 未认证；`403` 非管理员；`502` 连接 / 鉴权 / 解析源 Nexus 失败（在线枚举阶段）。离线目录不存在 / 缺 `content/` 等搬运期错误反映为任务 `failed` 阶段。
+- **请求**：JSON 体 `{ "offline_path", "repositories"? }`。`offline_path` 为源 Nexus 文件型 blob store 根目录的本地路径（其下应含 `content/` 子目录），提供已缓存 proxy 制品本体；`repositories` 为可选源仓库名白名单，缺省时按离线 blob store 内全部仓库迁移。仅管理员可调用。**离线搬运不要求也不读取源 Nexus URL、凭据或 API Key；传入 `base_url` / `auth_ref` 等旧在线字段会被拒绝**。
+- **行为**：把本地 blob store 中推断出的 **proxy 类型仓库**搬到本系统：① 按离线 `.properties` 的仓库名与 blob 路径推断格式，在本系统创建 / 复用对应 proxy 仓库（同名仓库已存在则复用、不重复建仓、不改其既有配置；格式未实现的仓库整体跳过；没有源上游地址时仍允许建 proxy 仓库，后续由运维按需配置上游）；② 从离线 blob store 按仓库名取缓存制品本体（成对的 `.properties` + `.bytes`，缺本体者跳过），经既有制品机理流式写入缓存——**blob 先落盘并校验 sha256 再写元数据索引（标记 `cached`），写索引失败回滚不留孤儿，不整体载入内存**。搬运幂等可重入（同坐标同内容跳过），单个制品搬运失败（路径非法 / 读本体失败 / 写入失败）记录跳过、不中断整批。迁移**不搬运源系统上游凭据**。
+- **异步化（FR-125）**：上万 blob 的同步搬运会在前置反代后超时（504），故搬运改为**后台异步任务**——同步阶段只校验请求体并返回 `202 + job_id`，实际离线枚举 + 建仓 + blob 流式 ingest 在后台执行，进度经 `GET /api/v1/migrate/jobs/{id}` 轮询，**支持取消 / 暂停**（FR-91，每个 blob 与每个仓库边界响应）。
+- **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`。任务进度含 `total_assets` / `done_assets` / `migrated` / `skipped` / `current_repo` / `current_path` / `repos`（各仓库 `source_repo` / `target_repo` / `created` / `migrated_artifacts` / `skipped_artifacts`，proxy `target` 同源名）/ `skipped_repos`（因格式未实现整体跳过）；`phase` 终态 `done` / `cancelled`（取消，已搬运保留）/ `failed`（`error` 载因）。
+- **错误**（同步阶段）：`400` `offline_path` 为空；`401` 未认证；`403` 非管理员；`409` 已有迁移任务在途。离线目录不存在 / 缺 `content/` / `repositories` 为空或包含未知仓库等搬运期错误反映为任务 `failed` 阶段。
 
 ### 迁移 Nexus hosted 仓库（配置 + 完整制品搬运）
 
 - **方法 / 路径**：`POST /api/v1/migrate/nexus/hosted/migrate`
-- **请求**：JSON 体 `{ "base_url", "auth_ref"?, "offline_path" }`。`base_url` 为源 Nexus 基址（经其 REST API 枚举 hosted 仓库配置：格式 / 可见性）；`auth_ref` 为在线访问凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `PASSWORD`，不入库、不回显，匿名可访问的源系统可省略）；`offline_path` 为源 Nexus 文件型 blob store 根目录的本地路径（其下应含 `content/` 子目录），提供 hosted 仓库制品本体。仅管理员可调用。
-- **行为**：把源 Nexus 的 **hosted 类型仓库**完整搬到本系统：① 据在线枚举的 hosted 仓库配置在本系统创建对应 hosted 仓库（映射 Nexus 格式名 → 本系统已实现格式：`maven2`→`maven` 等；同名仓库已存在则复用、不重复建仓、不改其既有配置；格式未实现的仓库整体跳过）；② 从离线 blob store 按仓库名取该仓库的全部制品本体（成对的 `.properties` + `.bytes`，缺本体者跳过），经既有制品机理流式写入——**blob 先落盘并校验 sha256 再写元数据索引（`cached=false`，hosted 正常制品语义），写索引失败回滚不留孤儿，不整体载入内存**。按各格式覆盖 / 不可变策略处理重复搬运（同坐标不同内容且不可覆盖如 Maven release 则跳过该制品、不中断整批；可覆盖如 Raw / Docker tag 则落定新内容）；超过 `limits.max_artifact_size` 的制品按跳过处理（不留半截 blob）。搬运幂等可重入（同坐标同内容跳过），单个制品搬运失败记录跳过、不中断整批。仅迁移 hosted 仓库（proxy 走 `proxy/migrate` 端点）。迁移**不搬运源系统上游凭据**。
-- **异步化（FR-125）**：同 proxy/migrate——同步只做在线枚举（失败即 400/502），随后**立即返回 `202 + job_id`**，搬运在后台任务执行、进度经 `GET /api/v1/migrate/jobs/{id}` 轮询、**支持取消 / 暂停**（FR-91）。
+- **请求**：JSON 体 `{ "offline_path", "repositories"? }`。`offline_path` 为源 Nexus 文件型 blob store 根目录的本地路径（其下应含 `content/` 子目录），提供 hosted 仓库制品本体；`repositories` 为可选源仓库名白名单，缺省时按离线 blob store 内全部仓库迁移。仅管理员可调用。**离线搬运不要求也不读取源 Nexus URL、凭据或 API Key；传入 `base_url` / `auth_ref` 等旧在线字段会被拒绝**。
+- **行为**：把本地 blob store 中推断出的 **hosted 类型仓库**完整搬到本系统：① 按离线 `.properties` 的仓库名与 blob 路径推断格式，在本系统创建 / 复用对应 hosted 仓库（同名仓库已存在则复用、不重复建仓、不改其既有配置；格式未实现的仓库整体跳过）；② 从离线 blob store 按仓库名取全部制品本体（成对的 `.properties` + `.bytes`，缺本体者跳过），经既有制品机理流式写入——**blob 先落盘并校验 sha256 再写元数据索引（`cached=false`，hosted 正常制品语义），写索引失败回滚不留孤儿，不整体载入内存**。按各格式覆盖 / 不可变策略处理重复搬运；超过 `limits.max_artifact_size` 的制品按跳过处理（不留半截 blob）。搬运幂等可重入，单个制品搬运失败记录跳过、不中断整批。仅迁移 hosted 仓库（proxy 走 `proxy/migrate` 端点）。迁移**不搬运源系统上游凭据**。
+- **异步化（FR-125）**：同 proxy/migrate——同步只校验请求体并返回 `202 + job_id`，离线枚举与搬运在后台任务执行、进度经 `GET /api/v1/migrate/jobs/{id}` 轮询、**支持取消 / 暂停**（FR-91）。
 - **响应**：`202 Accepted`，体 `{ "job_id": string }`。任务进度结构同上（含各仓库 `migrated_artifacts` / `skipped_artifacts`（含路径非法 / 不可覆盖 / 超限）/ `skipped_repos`）；`phase` 终态 `done` / `cancelled` / `failed`。
-- **错误**（同步阶段）：`400` `offline_path` 为空；`401` 未认证；`403` 非管理员；`502` 连接 / 鉴权 / 解析源 Nexus 失败（在线枚举阶段）。搬运期错误（缺 `content/` 等）反映为任务 `failed`。
+- **错误**（同步阶段）：`400` `offline_path` 为空；`401` 未认证；`403` 非管理员；`409` 已有迁移任务在途。搬运期错误（目录不存在、缺 `content/`、`repositories` 为空或包含未知仓库等）反映为任务 `failed`。
 
 ### Nexus 在线拉取迁移（FR-82 / 异步任务 FR-83）
 
@@ -350,7 +350,7 @@
 - **请求**：JSON 体 `{ "base_url", "auth_ref"?, "repositories": [{ "source", "target"? }] }`。`base_url` 为源 Nexus 基址；`auth_ref` 为在线访问凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `PASSWORD`，不入库、不回显，匿名源可省略）；`repositories` 为选中的源仓库，`source` 为源仓库名、`target` 为本系统目标仓库名（省略 / 空则与源同名，允许改名）。仅管理员可调用。**与 `hosted/migrate` 的区别：本端点不需离线 blob store 目录**——经源 Nexus REST 在线拉取制品。
 - **行为**：把所选 **Maven（`maven2`）hosted** 仓库经在线 HTTP 搬到本系统。**同步阶段**只做：枚举源仓库配置、匹配所选 `source`、解析凭据（失败即 `400` / `502`，不开任务）；随后**立即返回 `job_id`（`202`）**，实际搬运在**后台任务**异步执行（FR-83），进度经 `GET /migrate/jobs/{id}` 轮询。后台任务：① 建 / 复用目标 hosted 仓库（名取 `target`，允许与源不同名）；② 经 `service/rest/v1/components?repository=X`（`continuationToken` 分页）枚举该仓库全部 asset，按各 asset 的 `downloadUrl` HTTP 流式下载（不整体载入内存），经既有制品机理写入——**blob 先落盘并校验 sha256 再写元数据索引（`cached=false`），写索引失败回滚不留孤儿**；落定后比对下载内容 sha256 与源报告值，不符即视为损坏、回滚该制品并跳过（保证文件字节一致，含 `.sha1`/`.md5`/`.sha256`/`.sha512` sidecar 一并搬运）。下载 / 写入瞬时失败（网络中断 / 流式解码失败）**自动重试、指数退避**（确定性失败不重试）。按各格式覆盖 / 不可变策略处理重复，超 `limits.max_artifact_size` 跳过；搬运幂等可重入，单 asset 失败记录跳过、不中断整批。**仅 `maven2` hosted 参与**，其余整体跳过。迁移**不搬运源系统上游凭据**。
 - **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`。
-- **错误**：`400` 未选择仓库 / 源仓库不存在；`401` 未认证；`403` 非管理员；`502` 连接 / 鉴权 / 解析源 Nexus 失败（同步枚举阶段）。
+- **错误**：`400` `base_url` 为空 / 未选择仓库 / 源仓库不存在；`401` 未认证；`403` 非管理员；`502` 连接 / 鉴权 / 解析源 Nexus 失败（同步枚举阶段）。
 
 ### Nexus group 仓库本体迁移（FR-137）
 
@@ -380,7 +380,7 @@
 
 - **方法 / 路径**：`GET /api/v1/tasks`（跨 kind 活跃 + 近期列表）、`GET /api/v1/tasks/{id}`（单任务统一记录 + 进度明细）。仅管理员可调用。
 - **列表响应**（`tasks`）：`[{ "id", "kind", "state", "label"?, "started_at", "updated_at", "finished_at"?, "error"? }]`，按登记时序。`kind` ∈ `migration` / `update` / `vuln`；`state` ∈ `running` / `paused` / `succeeded` / `failed` / `cancelled`；时间为 Unix 秒。
-- **详情响应**（`tasks/{id}`）：上述统一记录字段（展平）+ 可选 `migration`（`kind == migration` 且专表仍有该 job 时为 `OnlinePullProgress` 进度）/ `update`（`kind == update` 时为 `UpdateProgress` 进度）。
+- **详情响应**（`tasks/{id}`）：上述统一记录字段（展平）+ 可选 `migration`（`kind == migration` 且专表仍有该 job 时为 `OnlinePullProgress` 进度）/ `update`（`kind == update` 时为 `UpdateProgress` 进度）。为避免大库离线预览撑大任务中心响应，`migration.offline_preview` 在本端点只保留每个仓库的 `repo_name` / `blob_count` 摘要，`blobs` 明细置空；需要完整明细的专用迁移进度契约仍以 `GET /api/v1/migrate/jobs/{id}` 为准。
 - **错误**：`401` 未认证；`403` 非管理员；`404` 未知 `id`。
 - **迁移单飞**：迁移**搬运**触发（`online/migrate`、`proxy/migrate`、`hosted/migrate`）同时只允许一个在途，已有在途时第二个返回 `409`「已有迁移任务在途」；离线**预览**（枚举）不受单飞约束、可与搬运并行。
 

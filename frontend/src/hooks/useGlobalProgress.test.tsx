@@ -1,19 +1,47 @@
-// 全局进度上下文单元测试（FR-127）：
+// 全局进度上下文单元测试（FR-127 / 页眉刷新基础设施）：
 // 1) GlobalProgressProvider 提供的 inc/dec 正确切换 loading；
 // 2) 并发 inc 后需全部 dec 才变 false；
 // 3) setRouteLoading 独立控制路由维度进度；
-// 4) 两路独立：req 与 route 各自为 true 时 loading 均为 true，均为 false 才为 false。
+// 4) 当前内容页刷新回调可注册、注销、执行，并避免旧注销清掉新回调。
 
-import { describe, it, expect } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { useRef, useState } from 'react';
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, act, waitFor } from '@testing-library/react';
 import { GlobalProgressProvider, useGlobalProgress } from './useGlobalProgress';
 
-/** 探针组件：把 loading 暴露到 DOM 供断言。 */
-function Probe() {
-  const { loading, inc, dec, setRouteLoading } = useGlobalProgress();
+/** 探针组件：把 loading 与刷新状态暴露到 DOM 供断言。 */
+function Probe({
+  onRefresh = () => {},
+  onAltRefresh = () => {},
+}: {
+  onRefresh?: () => void | Promise<void>;
+  onAltRefresh?: () => void | Promise<void>;
+}) {
+  const {
+    loading,
+    inc,
+    dec,
+    setRouteLoading,
+    hasPageRefresh,
+    isPageRefreshing,
+    registerPageRefreshCallback,
+    clearPageRefreshCallback,
+    refreshCurrentPage,
+  } = useGlobalProgress();
+  const firstCleanupRef = useRef<() => void>(() => {});
+  const secondCleanupRef = useRef<() => void>(() => {});
+  const [refreshResult, setRefreshResult] = useState('unset');
+
+  const executeRefresh = () => {
+    void refreshCurrentPage().then((result) => setRefreshResult(result ? 'true' : 'false'));
+  };
+
   return (
     <div>
       <span data-testid="loading">{loading ? 'true' : 'false'}</span>
+      <span data-testid="has-refresh">{hasPageRefresh ? 'true' : 'false'}</span>
+      <span data-testid="is-refreshing">{isPageRefreshing ? 'true' : 'false'}</span>
+      <span data-testid="refresh-result">{refreshResult}</span>
       <button onClick={inc} data-testid="inc">
         inc
       </button>
@@ -26,14 +54,42 @@ function Probe() {
       <button onClick={() => setRouteLoading(false)} data-testid="route-off">
         route-off
       </button>
+      <button
+        onClick={() => {
+          firstCleanupRef.current = registerPageRefreshCallback(onRefresh);
+        }}
+        data-testid="register-refresh"
+      >
+        register-refresh
+      </button>
+      <button
+        onClick={() => {
+          secondCleanupRef.current = registerPageRefreshCallback(onAltRefresh);
+        }}
+        data-testid="register-alt-refresh"
+      >
+        register-alt-refresh
+      </button>
+      <button onClick={() => firstCleanupRef.current()} data-testid="unregister-refresh">
+        unregister-refresh
+      </button>
+      <button onClick={() => secondCleanupRef.current()} data-testid="unregister-alt-refresh">
+        unregister-alt-refresh
+      </button>
+      <button onClick={clearPageRefreshCallback} data-testid="clear-refresh">
+        clear-refresh
+      </button>
+      <button onClick={executeRefresh} data-testid="execute-refresh">
+        execute-refresh
+      </button>
     </div>
   );
 }
 
-function renderProbe() {
+function renderProbe(props: Parameters<typeof Probe>[0] = {}) {
   return render(
     <GlobalProgressProvider>
-      <Probe />
+      <Probe {...props} />
     </GlobalProgressProvider>,
   );
 }
@@ -148,5 +204,97 @@ describe('GlobalProgressProvider 两路 OR 逻辑', () => {
       screen.getByTestId('route-off').click();
     });
     expect(screen.getByTestId('loading')).toHaveTextContent('false');
+  });
+});
+
+describe('GlobalProgressProvider 当前页刷新回调', () => {
+  it('未注册刷新回调时执行返回 false', async () => {
+    renderProbe();
+
+    await act(async () => {
+      screen.getByTestId('execute-refresh').click();
+    });
+
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('false');
+    expect(screen.getByTestId('refresh-result')).toHaveTextContent('false');
+  });
+
+  it('注册后可执行当前页刷新回调，注销后不可执行', async () => {
+    const onRefresh = vi.fn();
+    renderProbe({ onRefresh });
+
+    act(() => {
+      screen.getByTestId('register-refresh').click();
+    });
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('true');
+
+    await act(async () => {
+      screen.getByTestId('execute-refresh').click();
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('refresh-result')).toHaveTextContent('true');
+
+    act(() => {
+      screen.getByTestId('unregister-refresh').click();
+    });
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('false');
+  });
+
+  it('clearPageRefreshCallback 会清理当前页刷新回调', () => {
+    renderProbe();
+
+    act(() => {
+      screen.getByTestId('register-refresh').click();
+    });
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('true');
+
+    act(() => {
+      screen.getByTestId('clear-refresh').click();
+    });
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('false');
+  });
+
+  it('旧注销函数不会清掉后来注册的新回调，避免路由切换残留误清理', async () => {
+    const onRefresh = vi.fn();
+    const onAltRefresh = vi.fn();
+    renderProbe({ onRefresh, onAltRefresh });
+
+    act(() => {
+      screen.getByTestId('register-refresh').click();
+      screen.getByTestId('register-alt-refresh').click();
+      screen.getByTestId('unregister-refresh').click();
+    });
+    expect(screen.getByTestId('has-refresh')).toHaveTextContent('true');
+
+    await act(async () => {
+      screen.getByTestId('execute-refresh').click();
+    });
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(onAltRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('执行异步刷新期间标记 isPageRefreshing=true，完成后恢复 false', async () => {
+    let resolveRefresh: () => void = () => {};
+    const onRefresh = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+    renderProbe({ onRefresh });
+
+    act(() => {
+      screen.getByTestId('register-refresh').click();
+    });
+    act(() => {
+      screen.getByTestId('execute-refresh').click();
+    });
+
+    expect(screen.getByTestId('is-refreshing')).toHaveTextContent('true');
+
+    await act(async () => {
+      resolveRefresh();
+    });
+    await waitFor(() => expect(screen.getByTestId('is-refreshing')).toHaveTextContent('false'));
   });
 });

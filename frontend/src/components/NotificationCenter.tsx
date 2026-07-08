@@ -71,10 +71,10 @@ function stateLabel(state: TaskState): string {
 }
 
 /** 点击任务行跳转对应续看页路由（按 kind）。 */
-function kindRoute(kind: TaskKind): string {
-  switch (kind) {
+function taskRoute(task: TaskRecord): string {
+  switch (task.kind) {
     case 'migration':
-      return '/migration';
+      return `/migration?job_id=${encodeURIComponent(task.id)}`;
     case 'update':
       return '/system';
     case 'vuln':
@@ -193,7 +193,7 @@ export function NotificationCenter({ isAdmin }: { isAdmin: boolean }) {
                   <KindIcon kind={task.kind} />
                 </ThemeIcon>
               }
-              onClick={() => navigate(kindRoute(task.kind))}
+              onClick={() => navigate(taskRoute(task))}
             >
               <Group justify="space-between" wrap="nowrap" gap="xs">
                 <Text size="sm" truncate="end" style={{ minWidth: 0, flex: 1 }}>

@@ -422,6 +422,9 @@ export interface RepoMigrationOutcome {
   format: string;
   created: boolean;
   migrated_artifacts: number;
+  /** 已存在且 sha256 一致，本次幂等跳过的制品数。 */
+  skipped_existing_artifacts?: number;
+  /** 失败跳过的制品数。 */
   skipped_artifacts: number;
 }
 
@@ -445,11 +448,10 @@ export interface NexusOfflinePreviewRequest {
   path: string;
 }
 
-/** proxy / hosted 搬运请求体（在线枚举配置 + 离线 blob store 提供制品本体）。 */
+/** proxy / hosted 离线搬运请求体（仅本地 blob store 提供制品本体）。 */
 export interface NexusMigrateRequest {
-  base_url: string;
-  auth_ref?: string | null;
   offline_path: string;
+  repositories?: string[];
 }
 
 // —— Nexus 在线拉取迁移（FR-82，对接后端 /migrate/nexus/online/migrate） ——
@@ -485,6 +487,9 @@ export interface OnlineRepoMigrationOutcome {
   format: string;
   created: boolean;
   migrated_artifacts: number;
+  /** 已存在且 sha256 一致，本次幂等跳过的制品数。 */
+  skipped_existing_artifacts?: number;
+  /** 失败跳过的制品数。 */
   skipped_artifacts: number;
 }
 
@@ -536,7 +541,18 @@ export interface OnlinePullJob {
   total_assets: number;
   done_assets: number;
   migrated: number;
+  /** 已存在且 sha256 一致，本次幂等跳过的资产数。 */
+  skipped_existing?: number;
+  /** 失败跳过的资产数。 */
   skipped: number;
+  /** 字节级总量（新后端提供；旧快照缺省时前端退回资产数进度）。 */
+  total_bytes?: number;
+  /** 已处理字节数。 */
+  done_bytes?: number;
+  /** 已成功迁移字节数。 */
+  migrated_bytes?: number;
+  /** 已跳过字节数。 */
+  skipped_bytes?: number;
   current_repo: string | null;
   current_path: string | null;
   /** 是否处于暂停态（FR-91）：暂停期间为真，继续后置假。 */

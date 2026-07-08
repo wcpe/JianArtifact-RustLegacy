@@ -5,11 +5,12 @@
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, waitFor, act, fireEvent } from '@testing-library/react';
-import { MantineProvider } from '@mantine/core';
-import { MemoryRouter } from 'react-router-dom';
+import { Button, MantineProvider } from '@mantine/core';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { TaskCenterPage } from './TaskCenterPage';
 import * as api from '../api/endpoints';
 import type { OnlinePullJob, TaskDetailDto, TaskRecord } from '../api/types';
+import { GlobalProgressProvider, useGlobalProgress } from '../hooks/useGlobalProgress';
 
 /** 构造一条任务记录。 */
 function 任务(overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -52,15 +53,48 @@ function 任务详情(overrides: Partial<TaskDetailDto> = {}): TaskDetailDto {
   };
 }
 
+/** 展示当前路由，便于断言跳转结果。 */
+function CurrentLocation() {
+  const location = useLocation();
+  return <span data-testid="current-location">{`${location.pathname}${location.search}`}</span>;
+}
+
+/** 测试页眉刷新按钮的最小消费者。 */
+function TestRefreshButton() {
+  const { refreshCurrentPage } = useGlobalProgress();
+  return <Button onClick={() => void refreshCurrentPage()}>触发页眉刷新</Button>;
+}
+
 /** 在 Mantine + Router Provider 下渲染任务中心页。 */
-function renderPage() {
-  return render(
+function renderPage(withProgressProvider = false) {
+  const content = (
     <MemoryRouter>
       <MantineProvider>
-        <TaskCenterPage />
+        {withProgressProvider ? (
+          <GlobalProgressProvider>
+            <TestRefreshButton />
+            <TaskCenterPage />
+            <CurrentLocation />
+          </GlobalProgressProvider>
+        ) : (
+          <>
+            <TaskCenterPage />
+            <CurrentLocation />
+          </>
+        )}
       </MantineProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  return render(content);
+}
+
+/** 构造可手动完成的 Promise，用于验证请求竞态。 */
+function 延迟响应<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe('TaskCenterPage', () => {
@@ -188,6 +222,119 @@ describe('TaskCenterPage', () => {
     expect(screen.getByText('repo-a')).toBeInTheDocument();
   });
 
+  it('点击同一任务两次可收起详情', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'task-1', kind: 'migration', state: 'running', label: '可收起迁移' }),
+    ]);
+    const detailSpy = vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({
+        id: 'task-1',
+        label: '可收起迁移',
+        migration: 迁移进度({ current_repo: 'repo-a' }),
+      }),
+    );
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('可收起迁移')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('可收起迁移'));
+    await waitFor(() => expect(screen.getByText('任务详情')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('可收起迁移'));
+
+    expect(screen.queryByText('任务详情')).not.toBeInTheDocument();
+    expect(screen.queryByText('repo-a')).not.toBeInTheDocument();
+    expect(detailSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('快速切换任务时旧详情响应不会覆盖新详情', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'task-1', kind: 'migration', state: 'running', label: '旧任务' }),
+      任务({ id: 'task-2', kind: 'migration', state: 'running', label: '新任务' }),
+    ]);
+    const 旧响应 = 延迟响应<TaskDetailDto>();
+    const 新响应 = 延迟响应<TaskDetailDto>();
+    vi.spyOn(api, 'getTask').mockImplementation((id) => {
+      if (id === 'task-1') return 旧响应.promise;
+      return 新响应.promise;
+    });
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('旧任务')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('旧任务'));
+    fireEvent.click(screen.getByText('新任务'));
+
+    await act(async () => {
+      新响应.resolve(
+        任务详情({
+          id: 'task-2',
+          label: '新任务',
+          migration: 迁移进度({ job_id: 'task-2', current_repo: 'repo-new' }),
+        }),
+      );
+    });
+    await waitFor(() => expect(screen.getByText('repo-new')).toBeInTheDocument());
+
+    await act(async () => {
+      旧响应.resolve(
+        任务详情({
+          id: 'task-1',
+          label: '旧任务',
+          migration: 迁移进度({ job_id: 'task-1', current_repo: 'repo-old' }),
+        }),
+      );
+    });
+
+    expect(screen.getByText('repo-new')).toBeInTheDocument();
+    expect(screen.queryByText('repo-old')).not.toBeInTheDocument();
+  });
+
+  it('离线预览任务详情返回后显示预览摘要而不是搬运计数', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'preview-1', kind: 'migration', state: 'succeeded', label: '离线预览' }),
+    ]);
+    const 详情响应 = 延迟响应<TaskDetailDto>();
+    vi.spyOn(api, 'getTask').mockReturnValue(详情响应.promise);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('离线预览')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('离线预览'));
+    expect(screen.getByText(/正在加载任务详情/)).toBeInTheDocument();
+
+    await act(async () => {
+      详情响应.resolve(
+        任务详情({
+          id: 'preview-1',
+          kind: 'migration',
+          state: 'succeeded',
+          label: '离线预览',
+          migration: 迁移进度({
+            job_id: 'preview-1',
+            phase: 'done',
+            total_assets: 4,
+            done_assets: 4,
+            migrated: 0,
+            skipped: 0,
+            current_repo: null,
+            current_path: null,
+            offline_preview: [{ repo_name: 'raw-hosted', blob_count: 4, blobs: [] }],
+          }),
+        }),
+      );
+    });
+
+    await waitFor(() => expect(screen.queryByText(/正在加载任务详情/)).not.toBeInTheDocument());
+    expect(screen.getByText('任务详情')).toBeInTheDocument();
+    expect(screen.getByText('ID：preview-1')).toBeInTheDocument();
+    expect(screen.getByText(/进度 4 \/ 4/)).toBeInTheDocument();
+    expect(screen.getByText('离线预览已完成：共 1 个仓库、4 个 blob。')).toBeInTheDocument();
+    expect(screen.getByText('raw-hosted：4 个 blob')).toBeInTheDocument();
+    expect(screen.queryByText('已迁 0')).not.toBeInTheDocument();
+    expect(screen.queryByText('已跳过 0')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '暂停' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '继续' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '结束' })).not.toBeInTheDocument();
+  });
+
   it('迁移任务详情提供暂停和结束控制', async () => {
     vi.spyOn(api, 'listTasks').mockResolvedValue([
       任务({ id: 'task-1', kind: 'migration', state: 'running', label: '可控迁移' }),
@@ -208,6 +355,68 @@ describe('TaskCenterPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '结束' }));
     await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith('task-1'));
+  });
+
+  it('任务中心：离线搬运详情展示当前文件，跳转查看携带同一 job_id', async () => {
+    const 当前文件 = 'pool/vol-01/chap-01/com/example/demo/1.0/demo-1.0.jar';
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'off-live', kind: 'migration', state: 'running', label: '离线 proxy 搬运' }),
+    ]);
+    vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({
+        id: 'off-live',
+        kind: 'migration',
+        state: 'running',
+        label: '离线 proxy 搬运',
+        migration: 迁移进度({
+          job_id: 'off-live',
+          current_repo: 'raw-hosted',
+          current_path: 当前文件,
+        }),
+      }),
+    );
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('离线 proxy 搬运')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('离线 proxy 搬运'));
+
+    await waitFor(() => expect(screen.getByText('任务详情')).toBeInTheDocument());
+    expect(screen.getByText('raw-hosted')).toBeInTheDocument();
+    expect(screen.getByText(`当前文件：${当前文件}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '跳转查看' }));
+
+    expect(screen.getByTestId('current-location')).toHaveTextContent('/migration?job_id=off-live');
+  });
+
+  it('迁移任务详情跳转查看携带 job_id', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'mig-1', kind: 'migration', state: 'succeeded', label: '已完成迁移' }),
+    ]);
+    vi.spyOn(api, 'getTask').mockResolvedValue(
+      任务详情({ id: 'mig-1', state: 'succeeded', label: '已完成迁移', migration: 迁移进度() }),
+    );
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('已完成迁移')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('已完成迁移'));
+    await waitFor(() => expect(screen.getByText('任务详情')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '跳转查看' }));
+
+    expect(screen.getByTestId('current-location')).toHaveTextContent('/migration?job_id=mig-1');
+  });
+
+  it('已注册页眉刷新回调时可刷新任务列表', async () => {
+    const listSpy = vi
+      .spyOn(api, 'listTasks')
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([任务({ id: 'refresh-1', label: '刷新出现的任务' })]);
+    renderPage(true);
+
+    await waitFor(() => expect(screen.getByText('暂无任务')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '触发页眉刷新' }));
+
+    await waitFor(() => expect(screen.getByText('刷新出现的任务')).toBeInTheDocument());
+    expect(listSpy).toHaveBeenCalledTimes(2);
   });
 
   it('已暂停迁移任务详情提供继续控制', async () => {

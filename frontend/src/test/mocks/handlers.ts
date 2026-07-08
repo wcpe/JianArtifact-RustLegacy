@@ -18,6 +18,7 @@ import type {
   Permission,
   ProtectionConfig,
   SearchHit,
+  TaskRecord,
   UpdateRepositoryRequest,
   UpdateUserRequest,
 } from '../../api/types';
@@ -40,6 +41,137 @@ import {
 
 /** 管理 API 前缀（与 client.ts API_BASE 一致）。 */
 const API = '/api/v1';
+
+/** mock 迁移任务标签：OnlinePullJob 契约不含 label，统一任务表需保留用户可见任务名。 */
+const migrationJobLabels = new Map<string, string>();
+
+/** 需要在首次读取后自动推进到完成态的 mock 迁移任务集合。 */
+const advancingMigrationJobReads = new Map<string, number>();
+
+/** mock 迁移任务转统一任务记录。 */
+function migrationTaskRecord(job: OnlinePullJob): TaskRecord {
+  const terminal = job.phase === 'done' || job.phase === 'failed' || job.phase === 'cancelled';
+  return {
+    id: job.job_id,
+    kind: 'migration',
+    state:
+      job.phase === 'failed'
+        ? 'failed'
+        : job.phase === 'cancelled'
+          ? 'cancelled'
+          : terminal
+            ? 'succeeded'
+            : job.paused
+              ? 'paused'
+              : 'running',
+    label: migrationJobLabels.get(job.job_id) ?? 'Nexus 迁移',
+    started_at: 1_767_066_000,
+    updated_at: 1_767_066_000,
+    finished_at: terminal ? 1_767_066_060 : undefined,
+    error: job.error ?? undefined,
+  };
+}
+
+/** 克隆 mock 迁移快照，避免响应后自动推进污染本次返回值。 */
+function cloneMigrationJob(job: OnlinePullJob): OnlinePullJob {
+  return {
+    ...job,
+    repos: job.repos.map((repo) => ({ ...repo })),
+    skipped_repos: [...job.skipped_repos],
+    offline_preview: job.offline_preview?.map((repo) => ({
+      ...repo,
+      blobs: repo.blobs.map((blob) => ({ ...blob })),
+    })),
+  };
+}
+
+/** 返回当前迁移快照；进行中的 mock 搬运任务首次被读取后推进到完成态，便于真浏览器观察实时文件后自动完成。 */
+function snapshotMigrationJob(job: OnlinePullJob): OnlinePullJob {
+  const snapshot = cloneMigrationJob(job);
+  const reads = advancingMigrationJobReads.get(job.job_id);
+  if (reads === 0 && job.phase === 'downloading' && !job.paused) {
+    job.phase = 'done';
+    job.done_assets = job.total_assets;
+    job.migrated = job.total_assets;
+    job.done_bytes = job.total_bytes;
+    job.migrated_bytes = job.total_bytes;
+    job.current_repo = null;
+    job.current_path = null;
+    advancingMigrationJobReads.delete(job.job_id);
+  } else if (reads !== undefined) {
+    advancingMigrationJobReads.set(job.job_id, reads + 1);
+  }
+  return snapshot;
+}
+
+/** 构造 mock 迁移任务快照。 */
+function createMigrationJob(
+  label: string,
+  options: { repoName?: string; running?: boolean } = {},
+): OnlinePullJob {
+  const jobId = nextId('job');
+  const repoName =
+    options.repoName ?? (label.includes('proxy') ? 'maven-central' : 'maven-internal');
+  const totalAssets = options.running ? 2 : 1;
+  const doneAssets = options.running ? 1 : totalAssets;
+  const totalBytes = totalAssets * 2048;
+  const doneBytes = doneAssets * 2048;
+  const job: OnlinePullJob = {
+    job_id: jobId,
+    phase: options.running ? 'downloading' : 'done',
+    total_assets: totalAssets,
+    done_assets: doneAssets,
+    migrated: doneAssets,
+    skipped: 0,
+    total_bytes: totalBytes,
+    done_bytes: doneBytes,
+    migrated_bytes: doneBytes,
+    skipped_bytes: 0,
+    current_repo: options.running ? repoName : null,
+    current_path: options.running ? 'com/example/app/1.0.0/app-1.0.0.jar' : null,
+    paused: false,
+    repos: [
+      {
+        source_repo: repoName,
+        target_repo: repoName,
+        format: 'maven',
+        created: false,
+        migrated_artifacts: totalAssets,
+        skipped_artifacts: 0,
+      },
+    ],
+    skipped_repos: [],
+    error: null,
+  };
+  migrationJobLabels.set(jobId, label);
+  if (options.running) {
+    advancingMigrationJobReads.set(jobId, 0);
+  }
+  return job;
+}
+
+/** 从迁移请求中读取用户选择的首个仓库名，用于让 mock 报告与前端选择保持一致。 */
+async function firstRequestedRepository(request: Request, fallback: string): Promise<string> {
+  try {
+    const body = (await request.json()) as { repositories?: unknown[] };
+    const first = body.repositories?.[0];
+    if (typeof first === 'string' && first.trim() !== '') {
+      return first;
+    }
+    if (
+      typeof first === 'object' &&
+      first !== null &&
+      'source' in first &&
+      typeof first.source === 'string' &&
+      first.source.trim() !== ''
+    ) {
+      return first.source;
+    }
+  } catch {
+    // 请求体缺失或不是 JSON 时使用兜底仓库名，保持 mock 可用。
+  }
+  return fallback;
+}
 
 /** 统一错误响应（对齐后端 {error:{code,message}} 结构）。 */
 function error(status: number, code: string, message: string): Response {
@@ -736,7 +868,7 @@ export const handlers = [
     if (isResponse(guard)) return guard;
     const job = state.migrationJobs.find((j) => j.job_id === params.id);
     if (!job) return error(404, 'not_found', '任务不存在');
-    return HttpResponse.json(job);
+    return HttpResponse.json(snapshotMigrationJob(job));
   }),
 
   http.post(`${API}/migrate/jobs/:id/cancel`, ({ request, params }) => {
@@ -787,48 +919,60 @@ export const handlers = [
   http.post(`${API}/migrate/nexus/offline/preview`, ({ request }) => {
     const guard = requireUser(request, { admin: true });
     if (isResponse(guard)) return guard;
-    return HttpResponse.json([
+    const job = createMigrationJob('离线预览');
+    job.repos = [];
+    job.offline_preview = [
       {
         repo_name: 'maven-internal',
         blob_count: 1,
         blobs: [{ blob_name: 'com/example/app-1.0.0.jar', sha1: 'a1b2c3', size: 2048 }],
       },
-    ]);
-  }),
-
-  http.post(`${API}/migrate/nexus/proxy/migrate`, ({ request }) => {
-    const guard = requireUser(request, { admin: true });
-    if (isResponse(guard)) return guard;
-    return HttpResponse.json({ repos: [], skipped_repos: [] });
-  }),
-
-  http.post(`${API}/migrate/nexus/hosted/migrate`, ({ request }) => {
-    const guard = requireUser(request, { admin: true });
-    if (isResponse(guard)) return guard;
-    return HttpResponse.json({ repos: [], skipped_repos: [] });
-  }),
-
-  http.post(`${API}/migrate/nexus/online/migrate`, ({ request }) => {
-    const guard = requireUser(request, { admin: true });
-    if (isResponse(guard)) return guard;
-    // 发起异步任务：建一个已完成的任务并返回句柄（202 Accepted）。
-    const jobId = nextId('job');
-    const job: OnlinePullJob = {
-      job_id: jobId,
-      phase: 'done',
-      total_assets: 0,
-      done_assets: 0,
-      migrated: 0,
-      skipped: 0,
-      current_repo: null,
-      current_path: null,
-      paused: false,
-      repos: [],
-      skipped_repos: [],
-      error: null,
-    };
+    ];
     state.migrationJobs.push(job);
-    return HttpResponse.json({ job_id: jobId }, { status: 202 });
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
+  http.post(`${API}/migrate/nexus/proxy/migrate`, async ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const repoName = await firstRequestedRepository(request, 'maven-central');
+    const job = createMigrationJob('离线 proxy 搬运', { repoName, running: true });
+    state.migrationJobs.push(job);
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
+  http.post(`${API}/migrate/nexus/hosted/migrate`, async ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const repoName = await firstRequestedRepository(request, 'maven-internal');
+    const job = createMigrationJob('离线 hosted 搬运', { repoName, running: true });
+    state.migrationJobs.push(job);
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
+  http.post(`${API}/migrate/nexus/online/migrate`, async ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    // 发起异步任务：先返回进行中快照，随后自动推进完成，便于验证任务页续看。
+    const repoName = await firstRequestedRepository(request, 'maven-internal');
+    const job = createMigrationJob('在线拉取导入队列', { repoName, running: true });
+    state.migrationJobs.push(job);
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
+  http.get(`${API}/tasks`, ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    return HttpResponse.json(state.migrationJobs.map(migrationTaskRecord));
+  }),
+
+  http.get(`${API}/tasks/:id`, ({ request, params }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const job = state.migrationJobs.find((j) => j.job_id === params.id);
+    if (!job) return error(404, 'not_found', '任务不存在');
+    const snapshot = snapshotMigrationJob(job);
+    return HttpResponse.json({ ...migrationTaskRecord(snapshot), migration: snapshot });
   }),
 
   http.get(`${API}/licenses`, () => {

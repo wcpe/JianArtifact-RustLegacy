@@ -17,6 +17,7 @@ import {
   Tooltip,
   TextInput,
   UnstyledButton,
+  ActionIcon,
 } from '@mantine/core';
 import { useDisclosure, useDebouncedCallback } from '@mantine/hooks';
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
@@ -40,6 +41,7 @@ import {
   IconLicense,
   IconArrowUpCircle,
   IconListCheck,
+  IconRefresh,
 } from '@tabler/icons-react';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
@@ -49,6 +51,7 @@ import { useDocumentTitle } from '../hooks/useDocumentTitle';
 import { getCachedCheck, getHealth } from '../api/endpoints';
 import { GlobalTopProgressBar } from './GlobalTopProgressBar';
 import { NotificationCenter } from './NotificationCenter';
+import { useGlobalProgress } from '../hooks/useGlobalProgress';
 
 /** 品牌蓝（logo 主色，FR-113）：集中一处常量，避免散落魔法值。 */
 const BRAND_BLUE = '#228be6';
@@ -231,8 +234,12 @@ export function AppLayout() {
   const { user, isAdmin, signOut } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const { hasPageRefresh, isPageRefreshing, refreshCurrentPage, clearPageRefreshCallback } =
+    useGlobalProgress();
   // 按路由动态设置浏览器标签页标题（FR-113）：「<当前页名> - JianArtifact」
   useDocumentTitle(location.pathname);
+  // 路由切换时先清理上一页注册的刷新回调，避免旧页面回调残留到新页面。
+  useEffect(() => () => clearPageRefreshCallback(), [location.key, clearPageRefreshCallback]);
   // 页眉全局搜索（FR-94）：输入关键字 → 跳转 /search?q=；回车立即跳，停止输入防抖后自动跳。
   const [searchValue, setSearchValue] = useState('');
   // 全局搜索框引用（FR-114）：供 Ctrl/Cmd+K 快捷键聚焦、Esc 失焦。
@@ -344,6 +351,11 @@ export function AppLayout() {
     }
   };
 
+  const handleRefreshCurrentPage = () => {
+    if (!hasPageRefresh || isPageRefreshing) return;
+    void refreshCurrentPage();
+  };
+
   // 角色感知导航过滤（FR-95）：匿名只见公开浏览入口；登录用户按 adminOnly 门控。
   const isItemVisible = (item: NavItem): boolean =>
     user ? !item.adminOnly || isAdmin : Boolean(item.publicVisible);
@@ -369,8 +381,13 @@ export function AppLayout() {
         {/* 全局顶部进度条（FR-127）：fixed 定位于视口最顶端，z-index 高于页眉，
             路由切换 / 数据加载时显示；置于 Header 内确保与 AppShell 同级生命周期。 */}
         <GlobalTopProgressBar />
-        <Group h="100%" px="md" justify="space-between">
-          <Group gap="sm" wrap="nowrap">
+        <Group h="100%" px="md" wrap="nowrap" justify="space-between">
+          <Group
+            data-testid="header-left-section"
+            gap="sm"
+            wrap="nowrap"
+            style={{ flex: 1, minWidth: 0 }}
+          >
             <Burger opened={mobileOpened} onClick={toggleMobile} hiddenFrom="sm" size="sm" />
             {/* 更新徽标（FR-101，仅 Admin 且确有可更新时显）：常显于页眉、点击跳设置页在线更新区。
                 置于页眉而非收起态窄导航内，保证任何导航开合态下都可见、不被 64px 窄栏裁剪。 */}
@@ -396,56 +413,94 @@ export function AppLayout() {
               </Badge>
             )}
           </Group>
-          {/* 全局搜索框（FR-94）：回车立即跳、停止输入防抖后自动跳到 /search?q=。
-              FR-114：ref 供 Ctrl/Cmd+K 聚焦；右侧「Ctrl K」提示徽标。 */}
-          <TextInput
-            ref={searchRef}
-            visibleFrom="sm"
-            size="xs"
-            w={240}
-            leftSection={<IconSearch size={14} />}
-            rightSection={
-              <Badge color="gray" variant="light" size="xs" aria-hidden="true">
-                Ctrl K
-              </Badge>
-            }
-            rightSectionWidth={56}
-            placeholder={t('searchPlaceholder')}
-            aria-label={t('searchAriaLabel')}
-            value={searchValue}
-            onChange={(e) => handleSearchChange(e.currentTarget.value)}
-            onKeyDown={handleSearchKeyDown}
-          />
-          {/* 通知中心（FR-132，仅 Admin）：铃铛图标+下拉，轮询 /tasks 推状态跃迁通知 */}
-          <NotificationCenter isAdmin={!!isAdmin} />
-          {/* 角色感知页眉（FR-95）：登录态显示用户名 + 登出；匿名态显示「登录」按钮 */}
-          {user ? (
-            <Group>
-              <Text size="sm" c="dimmed">
-                {user.username}
-                {t('userSuffix', {
-                  role: user.role === 'admin' ? t('common:roleAdmin') : t('common:roleUser'),
-                })}
-              </Text>
-              <Button
-                variant="subtle"
-                size="xs"
-                leftSection={<IconLogout size={16} />}
-                onClick={handleSignOut}
-              >
-                {t('signOut')}
-              </Button>
-            </Group>
-          ) : (
-            <Button
-              variant="light"
+          <Group
+            data-testid="header-center-section"
+            justify="center"
+            wrap="nowrap"
+            style={{ flex: 1, minWidth: 0 }}
+          >
+            {/* 全局搜索框（FR-94）：回车立即跳、停止输入防抖后自动跳到 /search?q=。
+                FR-114：ref 供 Ctrl/Cmd+K 聚焦；右侧「Ctrl K」提示徽标。 */}
+            <TextInput
+              ref={searchRef}
+              visibleFrom="sm"
               size="xs"
-              leftSection={<IconLogin size={16} />}
-              onClick={() => navigate('/login')}
+              w={240}
+              leftSection={<IconSearch size={14} />}
+              rightSection={
+                <Badge color="gray" variant="light" size="xs" aria-hidden="true">
+                  Ctrl K
+                </Badge>
+              }
+              rightSectionWidth={56}
+              placeholder={t('searchPlaceholder')}
+              aria-label={t('searchAriaLabel')}
+              value={searchValue}
+              onChange={(e) => handleSearchChange(e.currentTarget.value)}
+              onKeyDown={handleSearchKeyDown}
+            />
+          </Group>
+          <Group
+            data-testid="header-right-section"
+            gap="sm"
+            wrap="nowrap"
+            justify="flex-end"
+            style={{ flex: 1, minWidth: 0 }}
+          >
+            <Tooltip
+              label={
+                hasPageRefresh ? t('common:refreshCurrentPage') : t('common:noRefreshableContent')
+              }
+              withArrow
             >
-              {t('signIn')}
-            </Button>
-          )}
+              <span style={{ display: 'inline-flex' }}>
+                <ActionIcon
+                  variant="subtle"
+                  size="sm"
+                  aria-label={
+                    hasPageRefresh
+                      ? t('common:refreshCurrentPage')
+                      : t('common:noRefreshableContent')
+                  }
+                  disabled={!hasPageRefresh || isPageRefreshing}
+                  loading={isPageRefreshing}
+                  onClick={handleRefreshCurrentPage}
+                >
+                  <IconRefresh size={16} />
+                </ActionIcon>
+              </span>
+            </Tooltip>
+            {/* 通知中心（FR-132，仅 Admin）：铃铛图标+下拉，轮询 /tasks 推状态跃迁通知 */}
+            <NotificationCenter isAdmin={!!isAdmin} />
+            {/* 角色感知页眉（FR-95）：登录态显示用户名 + 登出；匿名态显示「登录」按钮 */}
+            {user ? (
+              <Group gap="sm" wrap="nowrap">
+                <Text size="sm" c="dimmed" truncate>
+                  {user.username}
+                  {t('userSuffix', {
+                    role: user.role === 'admin' ? t('common:roleAdmin') : t('common:roleUser'),
+                  })}
+                </Text>
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  leftSection={<IconLogout size={16} />}
+                  onClick={handleSignOut}
+                >
+                  {t('signOut')}
+                </Button>
+              </Group>
+            ) : (
+              <Button
+                variant="light"
+                size="xs"
+                leftSection={<IconLogin size={16} />}
+                onClick={() => navigate('/login')}
+              >
+                {t('signIn')}
+              </Button>
+            )}
+          </Group>
         </Group>
       </AppShell.Header>
 

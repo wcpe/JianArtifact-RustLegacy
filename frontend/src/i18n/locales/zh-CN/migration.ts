@@ -3,12 +3,12 @@ export default {
   // 页头
   title: 'Nexus 迁移',
   intro:
-    '从源 Nexus OSS 迁移仓库与制品：在线 REST 或离线 blob store 预览 → 勾选 → 执行 → 查看报告。源 Nexus 凭据仅以引用名提供，明文不入库、不回显。',
+    '从源 Nexus OSS 迁移仓库与制品：在线 REST 或离线 blob store 预览 → 勾选 → 执行 → 查看报告。离线迁移只依赖本地 blob store 路径；在线迁移凭据仅以引用名提供，明文不入库、不回显。',
 
   // 步骤条（Stepper.Step 的 label / description）
   step: {
     sourceLabel: '选源与预览',
-    sourceDesc: '填源地址或离线路径',
+    sourceDesc: '在线填源地址，离线填本地路径',
     selectLabel: '勾选执行',
     selectDesc: '选仓库、选方式并搬运',
     reportLabel: '迁移报告',
@@ -79,8 +79,9 @@ export default {
       '在线拉取建仓 + 经 HTTP 下载同步制品；仅 maven2 hosted 仓库被处理，其余进报告 的整仓跳过列表。',
     runProxy: '执行 proxy 搬运',
     runHosted: '执行 hosted 搬运',
+    activeMigrationBlocked: '已有迁移任务在途，请在任务中心或本页续看',
     offlineFootnote:
-      'proxy 搬运建仓 + 搬运缓存制品；hosted 搬运建仓 + 搬运完整制品。两者均按源仓库 类型在后端各取所需，非目标类型仓库会被跳过并列入报告。',
+      '离线搬运只读取本地 blob store，不需要源 Nexus 地址或凭据；proxy 搬运缓存制品，hosted 搬运完整制品。',
   },
 
   // 迁移报告区
@@ -114,8 +115,18 @@ export default {
     cancel: '取消',
     progressAria: '导入进度',
     progress: '进度 {{done}} / {{total}}（{{percent}}%）',
-    migrated: '已迁 {{count}}',
+    byteProgress: '进度 {{done}} / {{total}}（{{percent}}%）',
+    pendingTitle: '迁移任务已启动',
+    pendingDesc: '任务已启动，正在加载首次进度快照',
+    pendingJobId: '任务 ID：{{id}}',
+    missingJobId: '后端未返回任务 ID，请稍后重试',
+    offlinePreviewTitle: '离线预览',
+    offlinePreviewSummary: '离线预览已完成：共 {{repos}} 个仓库、{{blobs}} 个 blob。',
+    offlinePreviewNoRepos: '离线预览已完成，但未发现可迁移仓库。',
+    migrated: '新搬 {{count}}',
     skipped: '已跳过 {{count}}',
+    skippedExisting: '已存在跳过 {{count}}',
+    skippedFailed: '失败跳过 {{count}}',
     currentRepo: '当前仓库：',
     currentPath: '当前文件：',
     failedTitle: '任务失败',
@@ -124,10 +135,17 @@ export default {
     thTargetRepo: '目标仓库',
     thFormat: '格式',
     thCreated: '新建仓库',
-    thMigrated: '已迁制品',
+    thMigrated: '新搬制品',
+    thSkippedExisting: '已存在跳过',
+    thSkippedFailed: '失败跳过',
     thSkipped: '跳过制品',
+    thBlobCount: 'blob 数',
+    summaryTotal: '总数 {{count}}',
+    summaryMigrated: '新搬 {{count}}',
+    summarySkippedExisting: '已存在跳过 {{count}}',
+    summarySkippedFailed: '失败跳过 {{count}}',
     createdYes: '是',
     createdExisting: '已存在',
-    skippedRepos: '整仓跳过（非 maven hosted）：',
+    skippedRepos: '整仓跳过：',
   },
 } as const;

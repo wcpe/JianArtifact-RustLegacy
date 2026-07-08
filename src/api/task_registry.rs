@@ -9,8 +9,8 @@
 //! 注册表**有界**（保留近期 N 个、超出按登记时序淘汰）且**保留已完成 / 失败任务**供找回。
 //! **进程内、不落库、重启即清**——与 ADR-0019「不落库」一致，不引入任务持久化。
 //!
-//! **迁移单飞**：离线预览 / 迁移搬运任务同时只允许一个在途，[`TaskRegistry::try_begin_migration`] 在同一把
-//! 写锁内原子完成「检查无在途迁移 → 登记」，杜绝竞态双开。
+//! **迁移单飞**：仅迁移搬运任务同时只允许一个在途，离线预览不占搬运单飞门；[`TaskRegistry::try_begin_migration`]
+//! 在同一把写锁内原子完成「检查无在途搬运 → 登记」，杜绝竞态双开。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
@@ -79,6 +79,12 @@ pub struct TaskRecord {
     /// 失败 / 异常原因（`state == failed` 时）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 是否占用迁移搬运单飞门；离线预览对外仍是 migration，但不占门。
+    #[serde(skip)]
+    blocks_migration_single_flight: bool,
+    /// 是否支持迁移控制接口同步暂停 / 继续状态；离线预览不可控。
+    #[serde(skip)]
+    controllable_migration: bool,
 }
 
 /// 取当前 Unix 秒（系统时钟回拨等异常时回 0，不 panic）。
@@ -141,6 +147,8 @@ impl TaskRegistry {
             updated_at: now,
             finished_at: None,
             error: None,
+            blocks_migration_single_flight: false,
+            controllable_migration: false,
         };
         // 同 id 重复登记视为覆盖（不重复入 order，避免淘汰指针错乱）
         if g.tasks.insert(id.clone(), record).is_none() {
@@ -153,26 +161,34 @@ impl TaskRegistry {
         }
     }
 
-    /// 是否已有迁移任务在途（`Migration` 且非终态）。供触发端点在昂贵同步阶段前**早拒**第二个迁移
+    /// 以调用方给定 id 登记离线预览任务。预览对外仍是 `Migration`，但不占用搬运单飞门、不可控。
+    pub fn register_migration_preview_with_id(&self, id: String, label: Option<String>) {
+        self.register_with_id(id, TaskKind::Migration, label);
+    }
+
+    /// 是否已有迁移搬运任务在途（占门 `Migration` 且非终态）。供触发端点在昂贵同步阶段前**早拒**第二个搬运
     /// （快路径优化 + 可测）；真正杜绝竞态仍以 [`Self::try_begin_migration`] 的原子判定为准。
     pub fn migration_in_flight(&self) -> bool {
         let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        g.tasks
-            .values()
-            .any(|t| t.kind == TaskKind::Migration && !t.state.is_terminal())
+        g.tasks.values().any(|t| {
+            t.kind == TaskKind::Migration
+                && t.blocks_migration_single_flight
+                && !t.state.is_terminal()
+        })
     }
 
-    /// 原子「检查无在途迁移 → 登记」：单飞门。
+    /// 原子「检查无在途迁移搬运 → 登记」：搬运单飞门。
     ///
-    /// 若已有 `Migration` 任务处于非终态（`Running`/`Paused`）则返回 `false`（拒第二个）；
+    /// 若已有占门 `Migration` 搬运任务处于非终态（`Running`/`Paused`）则返回 `false`（拒第二个）；
     /// 否则在同一把写锁内登记并返回 `true`。判定与登记同临界区完成，杜绝并发竞态双开。
     pub fn try_begin_migration(&self, id: String, label: Option<String>) -> bool {
         let now = now_unix_secs();
         let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let in_flight = g
-            .tasks
-            .values()
-            .any(|t| t.kind == TaskKind::Migration && !t.state.is_terminal());
+        let in_flight = g.tasks.values().any(|t| {
+            t.kind == TaskKind::Migration
+                && t.blocks_migration_single_flight
+                && !t.state.is_terminal()
+        });
         if in_flight {
             return false;
         }
@@ -185,6 +201,8 @@ impl TaskRegistry {
             updated_at: now,
             finished_at: None,
             error: None,
+            blocks_migration_single_flight: true,
+            controllable_migration: true,
         };
         if g.tasks.insert(id.clone(), record).is_none() {
             g.order.push_back(id);
@@ -211,6 +229,21 @@ impl TaskRegistry {
                 t.error = Some(e);
             }
         }
+    }
+
+    /// 仅更新可控迁移搬运任务的运行态；离线预览不可控，不会被暂停 / 继续改写。
+    pub fn set_controllable_migration_state(&self, id: &str, state: TaskState) -> bool {
+        let now = now_unix_secs();
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = g.tasks.get_mut(id) else {
+            return false;
+        };
+        if t.kind != TaskKind::Migration || !t.controllable_migration || t.state.is_terminal() {
+            return false;
+        }
+        t.state = state;
+        t.updated_at = now;
+        true
     }
 
     /// 取某任务记录快照（未知返回 None）。
@@ -293,18 +326,49 @@ mod tests {
     }
 
     #[test]
-    fn 迁移单飞_第二个被拒() {
+    fn 迁移搬运单飞_第二个被拒() {
         let reg = TaskRegistry::with_capacity(10);
         assert!(
             reg.try_begin_migration("m1".to_string(), None),
-            "首个迁移应放行"
+            "首个迁移搬运应放行"
         );
         assert!(
             !reg.try_begin_migration("m2".to_string(), None),
-            "已有在途迁移时第二个应被拒"
+            "已有在途迁移搬运时第二个应被拒"
         );
         // 第二个被拒后不应入表
         assert!(reg.get("m2").is_none());
+    }
+
+    #[test]
+    fn 离线预览不占用迁移搬运单飞门() {
+        let reg = TaskRegistry::with_capacity(10);
+        reg.register_migration_preview_with_id("preview".to_string(), Some("离线预览".to_string()));
+
+        assert!(!reg.migration_in_flight(), "离线预览不应被视为在途搬运");
+        assert!(
+            reg.try_begin_migration("move".to_string(), Some("离线搬运".to_string())),
+            "离线预览在途时仍应允许启动真正搬运"
+        );
+    }
+
+    #[test]
+    fn 迁移控制状态只同步可控搬运任务() {
+        let reg = TaskRegistry::with_capacity(10);
+        reg.register_migration_preview_with_id("preview".to_string(), Some("离线预览".to_string()));
+        assert!(reg.try_begin_migration("move".to_string(), Some("在线拉取".to_string())));
+
+        assert!(reg.set_controllable_migration_state("move", TaskState::Paused));
+        assert_eq!(reg.get("move").unwrap().state, TaskState::Paused);
+        assert!(
+            !reg.try_begin_migration("blocked".to_string(), None),
+            "暂停中的搬运仍应占用单飞门"
+        );
+        assert!(reg.set_controllable_migration_state("move", TaskState::Running));
+        assert_eq!(reg.get("move").unwrap().state, TaskState::Running);
+
+        assert!(!reg.set_controllable_migration_state("preview", TaskState::Paused));
+        assert_eq!(reg.get("preview").unwrap().state, TaskState::Running);
     }
 
     #[test]

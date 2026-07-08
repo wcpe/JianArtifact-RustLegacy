@@ -28,21 +28,23 @@ mod proxy;
 
 pub use group::{migrate_group_repositories, GroupMigrationReport, GroupRepoOutcome};
 pub use hosted::{
-    migrate_hosted_repositories, migrate_hosted_repositories_with_progress, HostedMigrationReport,
-    HostedRepoMigrationOutcome,
+    migrate_hosted_repositories, migrate_hosted_repositories_offline_with_progress,
+    migrate_hosted_repositories_with_progress, HostedMigrationReport, HostedRepoMigrationOutcome,
 };
 pub use http::HttpNexusClient;
+pub(crate) use offline::infer_source_repos_from_offline_entries;
 pub use offline::{
     enumerate_blob_entries, enumerate_blob_store, OfflineBlobEntry, OfflineBlobSummary,
     OfflineRepoSummary,
 };
+
 pub use online::{
     migrate_online_repositories, migrate_online_with_progress, JobControl, OnlineMigrationReport,
     OnlinePullPhase, OnlinePullProgress, OnlinePullSelection, OnlineRepoMigrationOutcome,
 };
 pub use proxy::{
-    migrate_proxy_repositories, migrate_proxy_repositories_with_progress, ProxyMigrationReport,
-    RepoMigrationOutcome,
+    migrate_proxy_repositories, migrate_proxy_repositories_offline_with_progress,
+    migrate_proxy_repositories_with_progress, ProxyMigrationReport, RepoMigrationOutcome,
 };
 
 /// 把 Nexus 原样格式名映射为本系统已实现的格式名；无法映射（未实现格式）返回 None。

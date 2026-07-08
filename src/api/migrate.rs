@@ -69,12 +69,16 @@ pub async fn preview_nexus_repositories(
 ) -> Result<Json<Vec<NexusRepoSummary>>, ApiError> {
     identity.require_admin()?;
 
+    let base_url = req.base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err(ApiError::BadRequest("base_url 不能为空".to_string()));
+    }
+
     // 复用 proxy 上游超时配置，避免慢速源系统拖垮请求线程
     // 持随 AppState 共享的出站网络热替换槽，出站时取当前 client（含运行时 PATCH 后的新代理）
     let client = HttpNexusClient::with_network_state(state.settings.network.clone());
 
-    let repos =
-        migrate::discover_repositories(&client, &req.base_url, req.auth_ref.as_deref()).await?;
+    let repos = migrate::discover_repositories(&client, &base_url, req.auth_ref.as_deref()).await?;
     Ok(Json(repos))
 }
 
@@ -102,10 +106,6 @@ pub async fn preview_nexus_offline(
     if path.is_empty() {
         return Err(ApiError::BadRequest("blob store 路径不能为空".to_string()));
     }
-    // 离线预览同样会全量扫描 blob store，必须与搬运共用迁移单飞门，避免多标签 / 双击并发打爆磁盘 IO。
-    if state.tasks.migration_in_flight() {
-        return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
-    }
     // 廉价同步预校验：路径必须是存在的目录——对明显错误的路径即时 400，无需起后台任务
     //（一次 stat 开销可忽略；真正高开销的 content/ 遍历 + 读上万 .properties 才放后台异步）
     if !std::path::Path::new(&path).is_dir() {
@@ -114,14 +114,11 @@ pub async fn preview_nexus_offline(
         )));
     }
 
-    // 迁移单飞：原子「检查无在途预览 / 搬运 → 登记统一任务」，已有在途即 409。
+    // 离线预览不参与迁移搬运单飞门；对外仍登记为 migration 任务，供任务中心和轮询找回。
     let job_id = Uuid::new_v4().to_string();
-    if !state
+    state
         .tasks
-        .try_begin_migration(job_id.clone(), Some("离线预览".to_string()))
-    {
-        return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
-    }
+        .register_migration_preview_with_id(job_id.clone(), Some("离线预览".to_string()));
     // 登记进度共享态与控制句柄（预览为单次枚举、无逐 asset 边界，控制句柄仅为统一注册表形态、不参与取消），
     // 起后台任务执行枚举，端点立即返回 job_id（202）
     let progress = Arc::new(Mutex::new(OnlinePullProgress::default()));
@@ -143,6 +140,7 @@ pub async fn preview_nexus_offline(
                 Ok(Ok(repos)) => {
                     // total_assets 记枚举到的 blob 总数，供 UI 展示规模
                     p.total_assets = repos.iter().map(|r| r.blob_count).sum();
+                    p.done_assets = p.total_assets;
                     p.offline_preview = Some(repos);
                     p.phase = OnlinePullPhase::Done;
                 }
@@ -166,21 +164,19 @@ pub async fn preview_nexus_offline(
 
 /// proxy 仓库配置 + 缓存制品搬运请求体（FR-38）。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NexusProxyMigrateRequest {
-    /// 源 Nexus 基址：经其 REST API 枚举 proxy 仓库配置（格式 / 上游地址）。
-    pub base_url: String,
-    /// 上游凭据引用（仅引用，真值走 env，不入库）；匿名可访问的源系统可省略。
-    #[serde(default)]
-    pub auth_ref: Option<String>,
     /// 源离线 blob store 根目录路径：提供已缓存 proxy 制品本体（其下应含 `content/` 子目录）。
     pub offline_path: String,
+    /// 可选的源仓库名白名单；未传时按离线 blob store 内全部仓库迁移。
+    #[serde(default)]
+    pub repositories: Option<Vec<String>>,
 }
 
 /// 执行 Nexus proxy 仓库配置创建 + 缓存制品搬运（仅管理员，FR-38）。
 ///
-/// 经在线 REST 枚举源 proxy 仓库配置 → 在本系统建仓 → 从离线 blob store 搬运其缓存制品本体
-/// （blob 先落盘校验再写索引，失败回滚不留孤儿；单制品失败不中断整批、可重入）。
-/// 不搬运 hosted 仓库制品（FR-39 未实现）。
+/// 仅从本地离线 blob store 推断仓库并搬运缓存制品本体，不访问源 Nexus 在线 REST，也不要求 URL / 凭据。
+/// blob 先落盘校验再写索引，失败回滚不留孤儿；单制品失败不中断整批、可重入。
 pub async fn migrate_nexus_proxy(
     State(state): State<AppState>,
     Extension(jobs): Extension<Arc<MigrationJobs>>,
@@ -193,16 +189,12 @@ pub async fn migrate_nexus_proxy(
     if offline_path.is_empty() {
         return Err(ApiError::BadRequest("offline_path 不能为空".to_string()));
     }
-    // 迁移单飞早拒（FR-131）：昂贵同步枚举前先快查在途迁移，已有即 409、不白跑上游
+    // 迁移单飞早拒（FR-131）：昂贵磁盘枚举前先快查在途迁移，已有即 409、不白跑离线扫描
     if state.tasks.migration_in_flight() {
         return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
     }
 
-    // 同步阶段（失败即 400/502、不开任务）：在线枚举源 proxy 仓库配置（格式 / 上游地址）
-    // 持随 AppState 共享的出站网络热替换槽，出站时取当前 client（含运行时 PATCH 后的新代理）
-    let client = HttpNexusClient::with_network_state(state.settings.network.clone());
-    let source_repos =
-        migrate::discover_repositories(&client, &req.base_url, req.auth_ref.as_deref()).await?;
+    let selected_repositories = req.repositories;
 
     // 迁移单飞（FR-131）：原子「检查无在途迁移 → 登记统一任务」，已有在途即 409。
     let job_id = Uuid::new_v4().to_string();
@@ -223,12 +215,12 @@ pub async fn migrate_nexus_proxy(
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
-        let result = migrate::migrate_proxy_repositories_with_progress(
+        let result = migrate::migrate_proxy_repositories_offline_with_progress(
             &meta,
             &artifacts,
             &formats,
-            &source_repos,
             std::path::Path::new(&offline_path),
+            selected_repositories,
             &progress,
             &control,
         )
@@ -259,22 +251,49 @@ pub async fn migrate_nexus_proxy(
 
 /// hosted 仓库配置 + 完整制品搬运请求体（FR-39）。
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NexusHostedMigrateRequest {
-    /// 源 Nexus 基址：经其 REST API 枚举 hosted 仓库配置（格式 / 可见性）。
-    pub base_url: String,
-    /// 上游凭据引用（仅引用，真值走 env，不入库）；匿名可访问的源系统可省略。
-    #[serde(default)]
-    pub auth_ref: Option<String>,
     /// 源离线 blob store 根目录路径：提供 hosted 仓库制品本体（其下应含 `content/` 子目录）。
     pub offline_path: String,
+    /// 可选的源仓库名白名单；未传时按离线 blob store 内全部仓库迁移。
+    #[serde(default)]
+    pub repositories: Option<Vec<String>>,
+}
+
+/// 按前端所选源仓库过滤离线搬运范围；未传选择时保持旧版全量行为。
+#[cfg(test)]
+fn filter_selected_repositories(
+    source_repos: Vec<NexusRepoSummary>,
+    selected: Option<Vec<String>>,
+) -> Result<Vec<NexusRepoSummary>, ApiError> {
+    let Some(selected) = selected else {
+        return Ok(source_repos);
+    };
+    let selected: Vec<String> = selected
+        .into_iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if selected.is_empty() {
+        return Err(ApiError::BadRequest("未选择要迁移的仓库".to_string()));
+    }
+    let mut filtered = Vec::new();
+    for repo in source_repos {
+        if selected.iter().any(|name| name == &repo.name) {
+            filtered.push(repo);
+        }
+    }
+    if filtered.len() != selected.len() {
+        return Err(ApiError::BadRequest("存在未知源仓库".to_string()));
+    }
+    Ok(filtered)
 }
 
 /// 执行 Nexus hosted 仓库配置创建 + 完整制品搬运（仅管理员，FR-39）。
 ///
-/// 经在线 REST 枚举源 hosted 仓库配置 → 在本系统建 hosted 仓库 → 从离线 blob store 搬运其全部
-/// 制品本体（blob 先落盘校验再写 `cached = false` 索引，失败回滚不留孤儿；单制品失败 / 不可覆盖
-/// 不中断整批、可重入）。超过 `limits.max_artifact_size` 的制品按跳过处理（不写半截 blob）。
-/// 不搬运 proxy 仓库制品（proxy 走 FR-38 端点）。
+/// 仅从本地离线 blob store 推断仓库并搬运其全部制品本体，不访问源 Nexus 在线 REST，也不要求 URL / 凭据。
+/// blob 先落盘校验再写 `cached = false` 索引，失败回滚不留孤儿；单制品失败 / 不可覆盖不中断整批、可重入。
+/// 超过 `limits.max_artifact_size` 的制品按跳过处理（不写半截 blob）。
 pub async fn migrate_nexus_hosted(
     State(state): State<AppState>,
     Extension(jobs): Extension<Arc<MigrationJobs>>,
@@ -287,16 +306,12 @@ pub async fn migrate_nexus_hosted(
     if offline_path.is_empty() {
         return Err(ApiError::BadRequest("offline_path 不能为空".to_string()));
     }
-    // 迁移单飞早拒（FR-131）：昂贵同步枚举前先快查在途迁移，已有即 409、不白跑上游
+    // 迁移单飞早拒（FR-131）：昂贵磁盘枚举前先快查在途迁移，已有即 409、不白跑离线扫描
     if state.tasks.migration_in_flight() {
         return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
     }
 
-    // 同步阶段（失败即 400/502、不开任务）：在线枚举源 hosted 仓库配置（格式 / 可见性）
-    // 持随 AppState 共享的出站网络热替换槽，出站时取当前 client（含运行时 PATCH 后的新代理）
-    let client = HttpNexusClient::with_network_state(state.settings.network.clone());
-    let source_repos =
-        migrate::discover_repositories(&client, &req.base_url, req.auth_ref.as_deref()).await?;
+    let selected_repositories = req.repositories;
 
     // 登记任务进度 + 控制句柄，起后台任务执行搬运（大库不阻塞请求、不在反代后 504，FR-125），立即返回 job_id（202）
     // 迁移单飞（FR-131）：原子「检查无在途迁移 → 登记统一任务」，已有在途即 409。
@@ -318,12 +333,12 @@ pub async fn migrate_nexus_hosted(
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
-        let result = migrate::migrate_hosted_repositories_with_progress(
+        let result = migrate::migrate_hosted_repositories_offline_with_progress(
             &meta,
             &artifacts,
             &formats,
-            &source_repos,
             std::path::Path::new(&offline_path),
+            selected_repositories,
             max_size,
             &progress,
             &control,
@@ -427,6 +442,10 @@ pub async fn migrate_nexus_online(
     if req.repositories.is_empty() {
         return Err(ApiError::BadRequest("未选择要迁移的仓库".to_string()));
     }
+    let base_url = req.base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err(ApiError::BadRequest("base_url 不能为空".to_string()));
+    }
     // 迁移单飞早拒（FR-131）：昂贵同步枚举前先快查在途迁移，已有即 409、不白跑上游
     if state.tasks.migration_in_flight() {
         return Err(ApiError::Conflict("已有迁移任务在途".to_string()));
@@ -443,7 +462,7 @@ pub async fn migrate_nexus_online(
 
     // 同步枚举源仓库列表并匹配所选 source（含格式 / 类型）；失败即同步报错，不开任务
     let source_repos =
-        migrate::discover_repositories(&client, &req.base_url, req.auth_ref.as_deref()).await?;
+        migrate::discover_repositories(&client, &base_url, req.auth_ref.as_deref()).await?;
 
     let mut selections = Vec::with_capacity(req.repositories.len());
     for r in &req.repositories {
@@ -481,7 +500,6 @@ pub async fn migrate_nexus_online(
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
     let max_size = state.config.limits.max_artifact_size;
-    let base_url = req.base_url.clone();
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
@@ -608,6 +626,7 @@ pub async fn migrate_nexus_job_cancel(
 /// 置暂停信号，后台循环在下一 asset 边界挂起、不再推进。未知 id 返回 404；
 /// 对已取消 / 已结束任务为幂等空操作、返回 200。
 pub async fn migrate_nexus_job_pause(
+    State(state): State<AppState>,
     Extension(jobs): Extension<Arc<MigrationJobs>>,
     identity: Identity,
     Path(job_id): Path<String>,
@@ -615,6 +634,9 @@ pub async fn migrate_nexus_job_pause(
     identity.require_admin()?;
     let control = job_control(&jobs, &job_id)?;
     control.request_pause();
+    state
+        .tasks
+        .set_controllable_migration_state(&job_id, TaskState::Paused);
     tracing::info!(任务 = %job_id, "已请求暂停在线拉取任务");
     Ok(StatusCode::OK)
 }
@@ -624,6 +646,7 @@ pub async fn migrate_nexus_job_pause(
 /// 清暂停信号并唤醒挂起的后台循环恢复搬运。未知 id 返回 404；
 /// 对未暂停 / 已结束任务为幂等空操作、返回 200。
 pub async fn migrate_nexus_job_resume(
+    State(state): State<AppState>,
     Extension(jobs): Extension<Arc<MigrationJobs>>,
     identity: Identity,
     Path(job_id): Path<String>,
@@ -631,6 +654,9 @@ pub async fn migrate_nexus_job_resume(
     identity.require_admin()?;
     let control = job_control(&jobs, &job_id)?;
     control.request_resume();
+    state
+        .tasks
+        .set_controllable_migration_state(&job_id, TaskState::Running);
     tracing::info!(任务 = %job_id, "已请求继续在线拉取任务");
     Ok(StatusCode::OK)
 }
@@ -747,7 +773,7 @@ mod tests {
             state,
             "/api/v1/migrate/nexus/proxy/migrate",
             &token,
-            serde_json::json!({ "base_url": "http://127.0.0.1:0", "offline_path": "/tmp/x" }),
+            serde_json::json!({ "offline_path": "/tmp/x" }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -774,13 +800,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 离线预览_已有在途迁移时第二个_409() {
-        // 回归 BUG-C1：离线预览本身会扫描大 blob store，也必须占用统一迁移单飞门；
-        // 否则页面刷新 / 双击 / 多标签会并发触发多个离线预览扫描，造成 IO 打爆与 UI 卡死。
+    async fn 离线预览_已有在途搬运时仍返回任务句柄() {
+        // 离线预览只是枚举，不参与迁移搬运单飞门；已有搬运在途时也应允许预览。
         let (state, _dir) = 测试用状态().await;
         state
             .tasks
-            .try_begin_migration("in-flight".to_string(), Some("离线预览占位".to_string()));
+            .try_begin_migration("in-flight".to_string(), Some("离线搬运占位".to_string()));
         let blob_dir = tempfile::tempdir().unwrap();
         let token = 签发令牌(&state, "admin", Role::Admin).await;
         let resp = 请求(
@@ -790,8 +815,45 @@ mod tests {
             serde_json::json!({ "path": blob_dir.path().to_string_lossy() }),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let body = 读_json(resp).await;
-        assert_eq!(body["error"]["message"], "已有迁移任务在途");
+        assert!(body["job_id"].as_str().is_some());
+    }
+
+    fn 仓库(name: &str) -> migrate::NexusRepoSummary {
+        migrate::NexusRepoSummary {
+            name: name.to_string(),
+            format: "maven2".to_string(),
+            r#type: "proxy".to_string(),
+            upstream_url: Some("https://repo.example".to_string()),
+            group_members: vec![],
+        }
+    }
+
+    #[test]
+    fn 离线搬运_未传选择保持全量仓库() {
+        let repos = vec![仓库("a"), 仓库("b")];
+        let filtered = filter_selected_repositories(repos.clone(), None).unwrap();
+        assert_eq!(filtered, repos);
+    }
+
+    #[test]
+    fn 离线搬运_只保留所选仓库() {
+        let filtered = filter_selected_repositories(
+            vec![仓库("a"), 仓库("b"), 仓库("c")],
+            Some(vec!["b".to_string(), "a".to_string()]),
+        )
+        .unwrap();
+        let names: Vec<String> = filtered.into_iter().map(|repo| repo.name).collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn 离线搬运_空选择或未知仓库返回错误() {
+        assert!(filter_selected_repositories(vec![仓库("a")], Some(vec![])).is_err());
+        assert!(
+            filter_selected_repositories(vec![仓库("a")], Some(vec!["missing".to_string()]))
+                .is_err()
+        );
     }
 }

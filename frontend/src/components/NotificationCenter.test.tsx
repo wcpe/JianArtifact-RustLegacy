@@ -6,9 +6,10 @@
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MantineProvider } from '@mantine/core';
 import { Notifications } from '@mantine/notifications';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { NotificationCenter } from './NotificationCenter';
 import * as api from '../api/endpoints';
 import type { TaskRecord } from '../api/types';
@@ -34,6 +35,12 @@ function 任务(overrides: Partial<TaskRecord> = {}): TaskRecord {
   };
 }
 
+/** 展示当前路由，便于断言跳转结果。 */
+function CurrentLocation() {
+  const location = useLocation();
+  return <span data-testid="current-location">{`${location.pathname}${location.search}`}</span>;
+}
+
 /** 在 Provider 下渲染通知中心组件。 */
 function renderComponent(isAdmin = true) {
   return render(
@@ -41,6 +48,7 @@ function renderComponent(isAdmin = true) {
       <MantineProvider>
         <Notifications />
         <NotificationCenter isAdmin={isAdmin} />
+        <CurrentLocation />
       </MantineProvider>
     </MemoryRouter>,
   );
@@ -61,6 +69,19 @@ describe('NotificationCenter', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /任务通知中心/i })).toBeInTheDocument(),
     );
+  });
+
+  it('点击 migration 任务跳转到携带 job_id 的迁移页', async () => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([
+      任务({ id: 'mig-42', kind: 'migration', state: 'succeeded', label: '离线搬运完成' }),
+    ]);
+    const user = userEvent.setup();
+    renderComponent(true);
+
+    await user.click(screen.getByRole('button', { name: /任务通知中心/i }));
+    await user.click(await screen.findByText('离线搬运完成'));
+
+    expect(screen.getByTestId('current-location')).toHaveTextContent('/migration?job_id=mig-42');
   });
 
   it('非 Admin 时不渲染', () => {

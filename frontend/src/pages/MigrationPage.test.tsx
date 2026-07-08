@@ -1,23 +1,32 @@
 // Nexus 迁移管理页面组件测试（FR-81）：
 // 在线 / 离线两形态预览 → 勾选 → 执行搬运 → 展示报告；凭据引用不回显明文；错误展示文案。
 
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MantineProvider } from '@mantine/core';
 import { Notifications } from '@mantine/notifications';
+import { MemoryRouter } from 'react-router-dom';
 import { MigrationPage } from './MigrationPage';
 import * as api from '../api/endpoints';
 import { ApiError } from '../api/client';
-import type { NexusRepoSummary, OfflineRepoSummary, OnlinePullJob } from '../api/types';
+import type {
+  NexusRepoSummary,
+  OfflineRepoSummary,
+  OnlinePullJob,
+  TaskDetailDto,
+  TaskRecord,
+} from '../api/types';
 
 /** 在 Provider 下渲染迁移页（含通知容器）。 */
-function renderPage() {
+function renderPage(initialEntry = '/migration') {
   return render(
-    <MantineProvider>
-      <Notifications />
-      <MigrationPage />
-    </MantineProvider>,
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <MantineProvider>
+        <Notifications />
+        <MigrationPage />
+      </MantineProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -97,7 +106,71 @@ const 离线仓库: OfflineRepoSummary[] = [
   },
 ];
 
+const 活跃迁移任务: TaskRecord = {
+  id: 'job-active',
+  kind: 'migration',
+  state: 'running',
+  label: '在线拉取迁移',
+  started_at: 1,
+  updated_at: 2,
+};
+
+const 离线当前文件 = 'pool/vol-01/chap-01/com/example/demo/1.0/demo-1.0.jar';
+
+const 离线搬运进行中: OnlinePullJob = {
+  job_id: 'off-live',
+  phase: 'downloading',
+  total_assets: 2,
+  done_assets: 1,
+  migrated: 1,
+  skipped: 0,
+  current_repo: 'raw-hosted',
+  current_path: 离线当前文件,
+  paused: false,
+  repos: [],
+  skipped_repos: [],
+  error: null,
+};
+
+const 离线搬运完成: OnlinePullJob = {
+  ...离线搬运进行中,
+  phase: 'done',
+  done_assets: 2,
+  migrated: 2,
+  current_repo: null,
+  current_path: null,
+  repos: [
+    {
+      source_repo: 'raw-hosted',
+      target_repo: 'raw-hosted',
+      format: 'raw',
+      created: false,
+      migrated_artifacts: 2,
+      skipped_artifacts: 0,
+      skipped_existing_artifacts: 0,
+    },
+  ],
+};
+
+function 任务详情(job: OnlinePullJob, label: string): TaskDetailDto {
+  return {
+    id: job.job_id,
+    kind: 'migration',
+    state: job.phase === 'done' ? 'succeeded' : 'running',
+    label,
+    started_at: 1,
+    updated_at: 2,
+    finished_at: job.phase === 'done' ? 3 : undefined,
+    migration: job,
+  };
+}
+
 describe('MigrationPage', () => {
+  beforeEach(() => {
+    vi.spyOn(api, 'listTasks').mockResolvedValue([]);
+    vi.spyOn(api, 'getTask').mockRejectedValue(new ApiError(404, 'not_found', '任务不存在'));
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
@@ -125,65 +198,351 @@ describe('MigrationPage', () => {
     expect(input).toHaveAttribute('type', 'password');
   });
 
-  it('离线预览：异步任务——发起后轮询拿 offline_preview 枚举结果（FR-124）', async () => {
-    // FR-124：离线预览改异步，先返 job_id，再经 getMigrationJob 轮询拿 offline_preview
+  it('离线预览：异步任务通过任务详情摘要回填可勾选列表（FR-124）', async () => {
+    // FR-124：离线预览改异步，前端只需要仓库名与 blob 数，应走轻量任务详情摘要避免拉取巨大 blob 明细。
     const spy = vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-1' });
+    const taskSpy = vi.spyOn(api, 'getTask').mockResolvedValue({
+      id: 'prev-1',
+      kind: 'migration',
+      state: 'succeeded',
+      label: '离线预览',
+      started_at: 1,
+      updated_at: 2,
+      migration: {
+        ...任务完成,
+        job_id: 'prev-1',
+        phase: 'done',
+        total_assets: 2,
+        done_assets: 2,
+        migrated: 0,
+        skipped: 0,
+        repos: [],
+        skipped_repos: [],
+        offline_preview: 离线仓库.map((repo) => ({ ...repo, blobs: [] })),
+      },
+    });
+    const jobSpy = vi
+      .spyOn(api, 'getMigrationJob')
+      .mockRejectedValue(new Error('不应直接拉取离线预览大明细'));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    expect(screen.queryByPlaceholderText('https://nexus.example')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('例如 NEXUS_SRC')).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
+
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+
+    await waitFor(() => expect(screen.getByText('raw-hosted')).toBeInTheDocument());
+    expect(screen.getByText('2 个 blob')).toBeInTheDocument();
+    expect(screen.queryByText('无仓库被搬运。')).not.toBeInTheDocument();
+    // 提交预览只带路径；枚举结果经任务详情摘要轮询取回，不走会返回大明细的专用进度端点。
+    expect(spy).toHaveBeenCalledWith({ path: '/data/blobs' });
+    expect(taskSpy).toHaveBeenCalledWith('prev-1');
+    expect(jobSpy).not.toHaveBeenCalledWith('prev-1');
+
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+    expect(screen.getByRole('checkbox', { name: /raw-hosted/ })).toBeInTheDocument();
+  });
+
+  it('离线预览：任务详情不可用时兜底迁移进度端点，避免预览结果丢失', async () => {
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-fallback' });
+    const taskSpy = vi
+      .spyOn(api, 'getTask')
+      .mockRejectedValue(new ApiError(404, 'not_found', '任务不存在'));
     const jobSpy = vi.spyOn(api, 'getMigrationJob').mockResolvedValue({
       ...任务完成,
-      job_id: 'prev-1',
-      phase: 'done',
+      job_id: 'prev-fallback',
+      total_assets: 2,
+      done_assets: 2,
+      migrated: 0,
+      skipped: 0,
+      repos: [],
+      skipped_repos: [],
       offline_preview: 离线仓库,
     });
     const user = userEvent.setup();
     renderPage();
 
-    // 切到离线形态
     await user.click(screen.getByRole('radio', { name: /离线/ }));
     await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
     await user.click(screen.getByRole('button', { name: '预览仓库' }));
 
     await waitFor(() => expect(screen.getByText('raw-hosted')).toBeInTheDocument());
-    expect(screen.getByText('2')).toBeInTheDocument();
-    // 提交预览只带路径；枚举结果经任务轮询取回
-    expect(spy).toHaveBeenCalledWith({ path: '/data/blobs' });
-    expect(jobSpy).toHaveBeenCalledWith('prev-1');
+    expect(taskSpy).toHaveBeenCalledWith('prev-fallback');
+    expect(jobSpy).toHaveBeenCalledWith('prev-fallback');
   });
 
-  it('执行 proxy 离线搬运（异步）：发起任务后轮询至 done 展示报告（FR-125）', async () => {
-    vi.spyOn(api, 'previewNexusRepositories').mockResolvedValue(在线仓库);
-    // FR-125：离线搬运改异步，先返 job_id，再经 getMigrationJob 轮询至终态
-    const migrateSpy = vi.spyOn(api, 'migrateNexusProxy').mockResolvedValue({ job_id: 'off-1' });
+  it('离线预览：后端缺失 job_id 时不请求 undefined 任务并展示明确错误', async () => {
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({} as never);
+    const taskSpy = vi.spyOn(api, 'getTask').mockResolvedValue({} as never);
     const jobSpy = vi.spyOn(api, 'getMigrationJob').mockResolvedValue(任务完成);
     const user = userEvent.setup();
     renderPage();
 
-    await user.type(screen.getByPlaceholderText('https://nexus.example'), 'https://nexus.example');
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+
+    await waitFor(() =>
+      expect(screen.getByText('后端未返回任务 ID，请稍后重试')).toBeInTheDocument(),
+    );
+    expect(taskSpy).not.toHaveBeenCalled();
+    expect(jobSpy).not.toHaveBeenCalled();
+  });
+
+  it('客户端重连：通过 job_id 恢复离线预览时展示 offline_preview 结果', async () => {
+    const jobSpy = vi.spyOn(api, 'getMigrationJob').mockResolvedValue({
+      ...任务完成,
+      job_id: 'prev-restore',
+      total_assets: 2,
+      done_assets: 2,
+      migrated: 0,
+      skipped: 0,
+      repos: [],
+      skipped_repos: [],
+      offline_preview: 离线仓库,
+    });
+    vi.spyOn(api, 'getTask').mockRejectedValue(new Error('任务登记表暂不可用'));
+
+    renderPage('/migration?job_id=prev-restore');
+
+    await waitFor(() => expect(jobSpy).toHaveBeenCalledWith('prev-restore'));
+    await waitFor(() => expect(screen.getByText('raw-hosted')).toBeInTheDocument());
+    expect(screen.getByText('离线预览已完成：共 1 个仓库、2 个 blob。')).toBeInTheDocument();
+  });
+
+  it('执行 proxy 离线搬运（异步）：离线入口不经过在线拉取，发起任务后轮询至 done 展示报告（FR-125）', async () => {
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-offline' });
+    vi.spyOn(api, 'getTask').mockImplementation(async (id: string) => {
+      if (id !== 'prev-offline') {
+        throw new ApiError(404, 'not_found', '任务不存在');
+      }
+      return {
+        id: 'prev-offline',
+        kind: 'migration',
+        state: 'succeeded',
+        label: '离线预览',
+        started_at: 1,
+        updated_at: 2,
+        migration: {
+          ...任务完成,
+          job_id: 'prev-offline',
+          phase: 'done',
+          total_assets: 2,
+          done_assets: 2,
+          migrated: 0,
+          skipped: 0,
+          repos: [],
+          skipped_repos: [],
+          offline_preview: [{ repo_name: 'maven-proxy', blob_count: 2, blobs: [] }],
+        },
+      };
+    });
+    const migrateSpy = vi.spyOn(api, 'migrateNexusProxy').mockResolvedValue({ job_id: 'off-1' });
+    const onlineSpy = vi
+      .spyOn(api, 'migrateNexusOnline')
+      .mockResolvedValue({ job_id: 'online-wrong' });
+    const jobSpy = vi.spyOn(api, 'getMigrationJob').mockResolvedValue({
+      ...任务完成,
+      total_assets: 10,
+      done_assets: 10,
+      migrated: 7,
+      skipped_existing: 2,
+      skipped: 1,
+      repos: [
+        {
+          ...任务完成.repos[0],
+          migrated_artifacts: 7,
+          skipped_existing_artifacts: 2,
+          skipped_artifacts: 1,
+        },
+      ],
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    expect(screen.queryByPlaceholderText('https://nexus.example')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('例如 NEXUS_SRC')).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
     await user.click(screen.getByRole('button', { name: '预览仓库' }));
     await waitFor(() => expect(screen.getByText('maven-proxy')).toBeInTheDocument());
 
-    // 进入勾选步骤
     await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
-    // 切到「离线目录」迁移方式（默认是在线拉取）
-    await user.click(screen.getByRole('radio', { name: /离线目录/ }));
-    // 勾选第一个仓库
+    expect(screen.queryByRole('button', { name: '执行在线拉取' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('checkbox', { name: /maven-proxy/ }));
-    // 填离线路径（搬运需要 blob 本体来源）
-    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
-    // 执行 proxy 搬运（异步，立即返回 job_id）
+    expect(screen.getByPlaceholderText('/data/nexus/blobs/default')).toHaveValue('/data/blobs');
+    expect(screen.getByRole('button', { name: '执行 proxy 搬运' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '执行 hosted 搬运' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: '执行 proxy 搬运' }));
 
     await waitFor(() => expect(migrateSpy).toHaveBeenCalled());
+    expect(onlineSpy).not.toHaveBeenCalled();
     expect(migrateSpy).toHaveBeenCalledWith({
-      base_url: 'https://nexus.example',
-      auth_ref: undefined,
       offline_path: '/data/blobs',
+      repositories: ['maven-proxy'],
     });
-    // 异步：以返回的 job_id 开启轮询
     await waitFor(() => expect(jobSpy).toHaveBeenCalledWith('off-1'));
-    // 轮询至终态 done，展示最终报告（仓库行 + 已迁制品数）
     await waitFor(() => expect(screen.getByText('已完成')).toBeInTheDocument(), { timeout: 3000 });
+    expect(screen.getByText('总数 10')).toBeInTheDocument();
+    expect(screen.getAllByText('新搬 7').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('已存在跳过 2').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('失败跳过 1').length).toBeGreaterThan(0);
     const reportTable = screen.getByText('maven-releases', { selector: 'td' }).closest('table')!;
     expect(within(reportTable).getByText('7')).toBeInTheDocument();
+    expect(within(reportTable).getByText('2')).toBeInTheDocument();
+    expect(within(reportTable).getByText('1')).toBeInTheDocument();
+  });
+
+  it('离线完整流程：预览后勾选仓库，开始搬运会自动进入进度页并显示当前文件', async () => {
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-live' });
+    let 搬运读取次数 = 0;
+    vi.spyOn(api, 'getTask').mockImplementation(async (id: string) => {
+      if (id === 'prev-live') {
+        return 任务详情(
+          {
+            ...任务完成,
+            job_id: 'prev-live',
+            phase: 'done',
+            total_assets: 2,
+            done_assets: 2,
+            migrated: 0,
+            skipped: 0,
+            repos: [],
+            skipped_repos: [],
+            offline_preview: 离线仓库.map((repo) => ({ ...repo, blobs: [] })),
+          },
+          '离线预览',
+        );
+      }
+      if (id === 'off-live') {
+        搬运读取次数 += 1;
+        return 任务详情(搬运读取次数 === 1 ? 离线搬运进行中 : 离线搬运完成, '离线 proxy 搬运');
+      }
+      throw new ApiError(404, 'not_found', '任务不存在');
+    });
+    const migrateSpy = vi.spyOn(api, 'migrateNexusProxy').mockResolvedValue({ job_id: 'off-live' });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+    await waitFor(() => expect(screen.getByText('raw-hosted')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+
+    const proxyButton = screen.getByRole('button', { name: '执行 proxy 搬运' });
+    expect(proxyButton).toBeDisabled();
+    await user.click(screen.getByRole('checkbox', { name: /raw-hosted/ }));
+    expect(proxyButton).toBeEnabled();
+    await user.click(proxyButton);
+
+    await waitFor(() =>
+      expect(migrateSpy).toHaveBeenCalledWith({
+        offline_path: '/data/blobs',
+        repositories: ['raw-hosted'],
+      }),
+    );
+    await waitFor(() => expect(screen.getByText('离线 proxy 搬运')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: '返回勾选' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '执行 proxy 搬运' })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('下载搬运中')).toBeInTheDocument());
+    expect(screen.getByText(/进度 1 \/ 2/)).toBeInTheDocument();
+    expect(screen.getByText(/当前仓库：/)).toHaveTextContent('raw-hosted');
+    expect(
+      screen.getByText(new RegExp(离线当前文件.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))),
+    ).toBeInTheDocument();
+
+    await waitFor(() => expect(screen.getByText('已完成')).toBeInTheDocument(), { timeout: 3000 });
+    expect(screen.getByText('总数 2')).toBeInTheDocument();
+    const repoCells = screen.getAllByText('raw-hosted', { selector: 'td' });
+    expect(repoCells.length).toBeGreaterThanOrEqual(2);
+    const reportTable = repoCells[0].closest('table')!;
+    expect(within(reportTable).getAllByText('2').length).toBeGreaterThan(0);
+  });
+
+  it('客户端重连：离线搬运 job_id 重新进入时展示同一任务详情与当前文件', async () => {
+    const taskSpy = vi
+      .spyOn(api, 'getTask')
+      .mockResolvedValue(任务详情(离线搬运进行中, '离线 proxy 搬运'));
+
+    const firstRender = renderPage('/migration?job_id=off-live');
+
+    await waitFor(() => expect(taskSpy).toHaveBeenCalledWith('off-live'));
+    await waitFor(() => expect(screen.getByText('离线 proxy 搬运')).toBeInTheDocument());
+    expect(screen.getByText('下载搬运中')).toBeInTheDocument();
+    expect(screen.getByText(/当前仓库：/)).toHaveTextContent('raw-hosted');
+    expect(
+      screen.getByText(new RegExp(离线当前文件.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))),
+    ).toBeInTheDocument();
+
+    taskSpy.mockClear();
+    firstRender.unmount();
+    renderPage('/migration?job_id=off-live');
+
+    await waitFor(() => expect(taskSpy).toHaveBeenCalledWith('off-live'));
+    await waitFor(() => expect(screen.getByText('离线 proxy 搬运')).toBeInTheDocument());
+    expect(screen.getByText('下载搬运中')).toBeInTheDocument();
+    expect(screen.getByText(/当前仓库：/)).toHaveTextContent('raw-hosted');
+    expect(
+      screen.getByText(new RegExp(离线当前文件.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))),
+    ).toBeInTheDocument();
+  });
+
+  it('离线入口：不显示源地址或凭据，未填源地址也能直接发起 proxy 搬运', async () => {
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-no-base' });
+    vi.spyOn(api, 'getTask').mockResolvedValue({
+      id: 'prev-no-base',
+      kind: 'migration',
+      state: 'succeeded',
+      label: '离线预览',
+      started_at: 1,
+      updated_at: 2,
+      migration: {
+        ...任务完成,
+        job_id: 'prev-no-base',
+        phase: 'done',
+        total_assets: 1,
+        done_assets: 1,
+        migrated: 0,
+        skipped: 0,
+        repos: [],
+        skipped_repos: [],
+        offline_preview: [{ repo_name: 'raw-hosted', blob_count: 1, blobs: [] }],
+      },
+    });
+    const migrateSpy = vi
+      .spyOn(api, 'migrateNexusProxy')
+      .mockResolvedValue({ job_id: 'off-no-base' });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    expect(screen.queryByPlaceholderText('https://nexus.example')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('例如 NEXUS_SRC')).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+    await waitFor(() => expect(screen.getByText('raw-hosted')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+    await user.click(screen.getByRole('checkbox', { name: /raw-hosted/ }));
+    expect(screen.getByPlaceholderText('/data/nexus/blobs/default')).toHaveValue('/data/blobs');
+
+    const proxyButton = screen.getByRole('button', { name: '执行 proxy 搬运' });
+    const hostedButton = screen.getByRole('button', { name: '执行 hosted 搬运' });
+    expect(proxyButton).toBeEnabled();
+    expect(hostedButton).toBeEnabled();
+    expect(screen.queryByRole('button', { name: '执行在线拉取' })).not.toBeInTheDocument();
+
+    await user.click(proxyButton);
+
+    await waitFor(() => expect(migrateSpy).toHaveBeenCalled());
+    expect(migrateSpy).toHaveBeenCalledWith({
+      offline_path: '/data/blobs',
+      repositories: ['raw-hosted'],
+    });
+    expect(screen.queryByText(/离线搬运需要源 Nexus 地址/)).not.toBeInTheDocument();
   });
 
   it('在线拉取：发起异步任务后轮询进度，downloading→done 渲染队列进度与最终报告', async () => {
@@ -239,6 +598,105 @@ describe('MigrationPage', () => {
     expect(localStorage.getItem('jian.migrate.online.jobId')).toBeNull();
   });
 
+  it('在线拉取：启动后首次进度快照返回前展示占位进度', async () => {
+    vi.spyOn(api, 'previewNexusRepositories').mockResolvedValue(在线仓库含maven);
+    const onlineSpy = vi
+      .spyOn(api, 'migrateNexusOnline')
+      .mockResolvedValue({ job_id: 'job-pending' });
+    vi.spyOn(api, 'getMigrationJob').mockReturnValue(new Promise(() => {}));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(screen.getByPlaceholderText('https://nexus.example'), 'https://nexus.example');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+    await waitFor(() => expect(screen.getByText('maven-releases')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+    await user.click(screen.getByRole('checkbox', { name: /maven-releases/ }));
+    await user.click(screen.getByRole('button', { name: '执行在线拉取' }));
+
+    await waitFor(() => expect(onlineSpy).toHaveBeenCalled());
+    expect(screen.getByText('任务已启动，正在加载首次进度快照')).toBeInTheDocument();
+    expect(screen.queryByText('尚无迁移报告。')).toBeNull();
+  });
+
+  it('在线拉取：已有活跃迁移时前置拦截，不再发起新迁移', async () => {
+    vi.mocked(api.listTasks).mockResolvedValueOnce([]).mockResolvedValueOnce([活跃迁移任务]);
+    vi.spyOn(api, 'previewNexusRepositories').mockResolvedValue(在线仓库含maven);
+    const onlineSpy = vi
+      .spyOn(api, 'migrateNexusOnline')
+      .mockResolvedValue({ job_id: 'job-blocked' });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.type(screen.getByPlaceholderText('https://nexus.example'), 'https://nexus.example');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+    await waitFor(() => expect(screen.getByText('maven-releases')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+    await user.click(screen.getByRole('checkbox', { name: /maven-releases/ }));
+    await user.click(screen.getByRole('button', { name: '执行在线拉取' }));
+
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalledTimes(2));
+    expect(onlineSpy).not.toHaveBeenCalled();
+    expect(screen.getByText('已有迁移任务在途，请在任务中心或本页续看')).toBeInTheDocument();
+  });
+
+  it('离线搬运：活跃离线预览任务不拦截真正搬运', async () => {
+    const 活跃离线预览任务: TaskRecord = {
+      id: 'preview-active',
+      kind: 'migration',
+      state: 'running',
+      label: '离线预览',
+      started_at: 1,
+      updated_at: 2,
+    };
+    vi.mocked(api.listTasks).mockResolvedValueOnce([]).mockResolvedValueOnce([活跃离线预览任务]);
+    vi.spyOn(api, 'previewNexusOffline').mockResolvedValue({ job_id: 'prev-active-ok' });
+    vi.spyOn(api, 'getTask').mockResolvedValue({
+      id: 'prev-active-ok',
+      kind: 'migration',
+      state: 'succeeded',
+      label: '离线预览',
+      started_at: 1,
+      updated_at: 2,
+      migration: {
+        ...任务完成,
+        job_id: 'prev-active-ok',
+        phase: 'done',
+        total_assets: 1,
+        done_assets: 1,
+        migrated: 0,
+        skipped: 0,
+        repos: [],
+        skipped_repos: [],
+        offline_preview: [{ repo_name: 'maven-proxy', blob_count: 1, blobs: [] }],
+      },
+    });
+    const migrateSpy = vi
+      .spyOn(api, 'migrateNexusProxy')
+      .mockResolvedValue({ job_id: 'off-preview-ok' });
+    vi.spyOn(api, 'getMigrationJob').mockResolvedValue({ ...任务完成, job_id: 'off-preview-ok' });
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole('radio', { name: /离线/ }));
+    expect(screen.queryByPlaceholderText('https://nexus.example')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('例如 NEXUS_SRC')).not.toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText('/data/nexus/blobs/default'), '/data/blobs');
+    await user.click(screen.getByRole('button', { name: '预览仓库' }));
+    await waitFor(() => expect(screen.getByText('maven-proxy')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '下一步：勾选执行' }));
+    await user.click(screen.getByRole('checkbox', { name: /maven-proxy/ }));
+    expect(screen.getByPlaceholderText('/data/nexus/blobs/default')).toHaveValue('/data/blobs');
+    await user.click(screen.getByRole('button', { name: '执行 proxy 搬运' }));
+
+    await waitFor(() => expect(migrateSpy).toHaveBeenCalled());
+    expect(migrateSpy).toHaveBeenCalledWith({
+      offline_path: '/data/blobs',
+      repositories: ['maven-proxy'],
+    });
+    expect(screen.queryByText('已有迁移任务在途，请在任务中心或本页续看')).not.toBeInTheDocument();
+  });
+
   it('在线拉取：未填目标改名时省略 target（与源同名）', async () => {
     vi.spyOn(api, 'previewNexusRepositories').mockResolvedValue(在线仓库含maven);
     const onlineSpy = vi.spyOn(api, 'migrateNexusOnline').mockResolvedValue({ job_id: 'job-2' });
@@ -261,6 +719,46 @@ describe('MigrationPage', () => {
       auth_ref: undefined,
       repositories: [{ source: 'maven-releases' }],
     });
+  });
+
+  it('客户端重连：URL job_id 优先于服务端活跃任务和本地存档', async () => {
+    localStorage.setItem('jian.migrate.online.jobId', 'job-archived');
+    vi.mocked(api.listTasks).mockResolvedValue([活跃迁移任务]);
+    const taskSpy = vi.spyOn(api, 'getTask').mockResolvedValue({
+      id: 'job-url',
+      kind: 'migration',
+      state: 'succeeded',
+      label: '在线拉取迁移',
+      started_at: 1,
+      updated_at: 2,
+      migration: { ...任务完成, job_id: 'job-url' },
+    });
+    const jobSpy = vi.spyOn(api, 'getMigrationJob').mockResolvedValue({
+      ...任务进行中,
+      job_id: 'job-active',
+    });
+
+    renderPage('/migration?job_id=job-url');
+
+    await waitFor(() => expect(taskSpy).toHaveBeenCalledWith('job-url'));
+    await waitFor(() => expect(screen.getByText('已完成')).toBeInTheDocument());
+    expect(api.listTasks).not.toHaveBeenCalled();
+    expect(jobSpy).not.toHaveBeenCalled();
+  });
+
+  it('客户端重连：页面加载时从 listTasks 恢复服务端活跃迁移，优先于本地存档', async () => {
+    localStorage.setItem('jian.migrate.online.jobId', 'job-archived');
+    vi.mocked(api.listTasks).mockResolvedValue([活跃迁移任务]);
+    const jobSpy = vi
+      .spyOn(api, 'getMigrationJob')
+      .mockResolvedValue({ ...任务进行中, job_id: 'job-active' });
+
+    renderPage();
+
+    await waitFor(() => expect(jobSpy).toHaveBeenCalledWith('job-active'));
+    expect(jobSpy).not.toHaveBeenCalledWith('job-archived');
+    await waitFor(() => expect(screen.getByText('下载搬运中')).toBeInTheDocument());
+    expect(localStorage.getItem('jian.migrate.online.jobId')).toBe('job-active');
   });
 
   it('客户端重连：页面加载时存档 job_id 仍进行中则恢复轮询续看', async () => {
