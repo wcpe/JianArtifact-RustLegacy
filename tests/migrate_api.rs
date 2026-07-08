@@ -109,6 +109,11 @@ fn offline_req(auth: Option<&str>, body: Value) -> Request<Body> {
     json_post("/api/v1/migrate/nexus/offline/preview", auth, body)
 }
 
+/// 构造带 JSON 体的离线仓库索引双通道请求（FR-141）。
+fn offline_index_req(auth: Option<&str>, body: Value) -> Request<Body> {
+    json_post("/api/v1/migrate/nexus/offline/index", auth, body)
+}
+
 /// 构造带 JSON 体的 proxy 仓库搬运请求。
 fn proxy_migrate_req(auth: Option<&str>, body: Value) -> Request<Body> {
     json_post("/api/v1/migrate/nexus/proxy/migrate", auth, body)
@@ -337,6 +342,116 @@ async fn 离线预览空路径返回_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+// ---------- 离线仓库索引双通道端点（FR-141）鉴权与推断通道 ----------
+
+#[tokio::test]
+async fn 离线索引匿名返回_401() {
+    let (state, _dir) = 测试用状态().await;
+    let (status, _) = send(
+        build_router(state),
+        offline_index_req(None, json!({ "path": "/whatever" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn 离线索引普通用户返回_403() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "user", "pw", Role::User).await;
+    let (status, _) = send(
+        build_router(state),
+        offline_index_req(
+            Some(&format!("Bearer {token}")),
+            json!({ "path": "/whatever" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn 离线索引空路径返回_400() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let (status, body) = send(
+        build_router(state),
+        offline_index_req(Some(&format!("Bearer {token}")), json!({ "path": "   " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn 离线索引路径不存在返回_400() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let (status, body) = send(
+        build_router(state),
+        offline_index_req(
+            Some(&format!("Bearer {token}")),
+            json!({ "path": "D:/__此路径必定不存在的_blob_store__/x" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+}
+
+#[tokio::test]
+async fn 离线索引_管理员纯推断通道产出统一索引() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let store = build_offline_store();
+    // 复用同一 router（克隆共享进程内 MigrationJobs 注册表），使提交与轮询命中同一 job
+    let app = build_router(state);
+
+    // 未提供 base_url → 走纯离线推断通道；立即返回 202 + job_id
+    let (status, body) = send(
+        app.clone(),
+        offline_index_req(
+            Some(&format!("Bearer {token}")),
+            json!({ "path": store.path().to_str().unwrap() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    let job_id = body["job_id"].as_str().expect("应返回 job_id").to_string();
+
+    // 轮询任务进度直到完成
+    let mut done = Value::Null;
+    for _ in 0..100 {
+        let (s, b) = send(
+            app.clone(),
+            get_req(
+                &format!("/api/v1/migrate/jobs/{job_id}"),
+                Some(&format!("Bearer {token}")),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "poll: {b}");
+        match b["phase"].as_str().unwrap_or("") {
+            "done" | "failed" => {
+                done = b;
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    assert_eq!(done["phase"], "done", "job: {done}");
+    // 统一索引经 repo_index 字段随进度返回：maven-releases 仓库、格式推断 maven、来源推断、类型 / 上游留空
+    let index = &done["repo_index"];
+    assert_eq!(index[0]["name"], "maven-releases");
+    assert_eq!(index[0]["format"], "maven");
+    assert_eq!(index[0]["format_source"], "inferred");
+    assert!(index[0]["type"].is_null(), "推断通道类型应留空: {done}");
+    assert!(
+        index[0]["upstream_url"].is_null(),
+        "推断通道上游应留空: {done}"
+    );
+    assert_eq!(index[0]["blob_count"], 1);
+    assert_eq!(index[0]["total_size"], 1024);
 }
 
 // ---------- hosted 仓库搬运端点（FR-39）鉴权与校验边界 ----------

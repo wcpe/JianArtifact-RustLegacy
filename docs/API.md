@@ -326,6 +326,14 @@
 - **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`；任务完成（`phase == "done"`）时其进度的 **`offline_preview`** 字段为按仓库分组的数组，每项含 `repo_name`（仓库名，取自 `@Bucket.repo-name`，回退 `@Repo.repo-name`）、`blob_count`（该仓库枚举到的 blob 数）、`blobs`（blob 预览项数组，每项含 `blob_name`（坐标 / 路径，取自 `@BlobStore.blob-name`）、`sha1`（缺失为 `null`）、`size`（字节数，缺失或非法为 `null`））。结果按仓库名、仓库内按 blob 名字典序稳定排序。枚举失败（如目录下缺 `content/`）反映为任务 `phase == "failed"` + `error`。
 - **错误**：`400` 路径为空、不存在 / 非目录（同步即时返回）；`401` 未认证；`403` 非管理员。（其下缺 `content/` 等遍历期错误经任务 `failed` 阶段反映，不再是同步 400。）
 
+### 离线仓库索引双通道（FR-141，ADR-0041）
+
+- **方法 / 路径**：`POST /api/v1/migrate/nexus/offline/index`
+- **请求**：JSON 体 `{ "path", "base_url"?, "auth_ref"? }`。`path` 为本地 Nexus 文件型 blob store 根目录路径（服务进程可访问，其下应含 `content/` 子目录，必填）；`base_url` 为可选的源 Nexus REST 基址——给定且可达时走**权威通道**取权威仓库配置（格式 / 类型 / 上游）；`auth_ref` 为可选凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `PASSWORD`，不入库、不回显），匿名源可省略。仅管理员可调用。
+- **行为**：离线迁移在搬运前获取**仓库索引**（仓库列表及格式 / 类型 / 上游），供向导选择。**双通道选路（ADR-0041）**：先离线扫描本地 blob store 枚举仓库（blob 数 / 总大小）；① 若给定 `base_url` 且源 Nexus REST **可达**——走**权威通道**：经 `service/rest/v1/repositories` 取权威配置，与扫描结果**按仓库名合并**（格式 / 类型 / 上游取 REST，格式经归一化未实现时回退推断；blob 数 / 总大小取扫描），`format_source` 标 `authoritative`；② 若未填 `base_url` 或探测**不可达 / 鉴权失败 / 解析失败**——走**推断通道**：按内容路径**启发式推断格式**（Maven 坐标布局 / `maven-metadata.xml` → maven；npm tarball `/-/*.tgz` 或 `package.json` → npm；docker v2 内容寻址 `blobs/sha256` / `manifests/` / `_uploads/` → docker；其余 → raw 兜底），`format_source` 标 `inferred`、类型与上游留空（由管理员在向导补填）。REST 探测失败仅回退、不使整次索引失败。与 `/offline/preview`（blob 明细预览）**并存互补**——本端点产出仓库级索引。**不解析源 Nexus 的 OrientDB / H2 数据库文件**（ADR-0041 排除）。凭据经 `auth_ref` → 环境变量解析，绝不入库 / 进日志。**异步化**：复用 FR-83 任务注册表——同步阶段只做廉价校验（`path` 非空、是存在目录）即**立即返回 `202 + job_id`**，扫描 + 双通道在后台执行，结果经 `GET /api/v1/migrate/jobs/{id}` 进度的 **`repo_index`** 字段轮询取回。不参与迁移搬运单飞门（纯枚举）。
+- **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`；任务完成（`phase == "done"`）时其进度的 **`repo_index`** 字段为统一索引数组，每项含 `name`（仓库名）、`format`（本系统格式名 `maven` / `npm` / `docker` / `raw` 等）、`format_source`（格式来源 `authoritative` / `inferred`）、`type`（`hosted` / `proxy`，仅权威通道有值，推断通道为 `null`）、`blob_count`（离线扫描 blob 数）、`total_size`（该仓库 blob 逻辑大小之和）、`upstream_url`（proxy 上游，仅权威通道的 proxy 有值，其余 `null`）。扫描失败（如缺 `content/`）反映为任务 `phase == "failed"` + `error`。
+- **错误**：`400` 路径为空、不存在 / 非目录（同步即时返回）；`401` 未认证；`403` 非管理员。（扫描期错误经任务 `failed` 阶段反映。）
+
 ### 迁移 Nexus proxy 仓库（配置 + 缓存制品搬运）
 
 - **方法 / 路径**：`POST /api/v1/migrate/nexus/proxy/migrate`

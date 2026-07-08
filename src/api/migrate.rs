@@ -163,6 +163,114 @@ pub async fn preview_nexus_offline(
     Ok((StatusCode::ACCEPTED, Json(JobCreatedDto { job_id })))
 }
 
+/// 离线仓库索引双通道请求体（FR-141）。
+#[derive(Debug, Deserialize)]
+pub struct NexusOfflineIndexRequest {
+    /// 本地 Nexus 文件型 blob store 根目录路径（服务进程可访问的本地文件系统路径）。
+    pub path: String,
+    /// 可选：源 Nexus REST 基址。给定且可达时走权威通道取仓库配置（格式 / 类型 / 上游）；
+    /// 未填或不可达时回退纯离线推断。
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 可选：上游凭据引用（仅引用，真值走 env `JIANARTIFACT_MIGRATE_<NAME>_USERNAME/PASSWORD`，不入库）。
+    /// 匿名可访问的源系统可省略。
+    #[serde(default)]
+    pub auth_ref: Option<String>,
+}
+
+/// 离线仓库索引双通道枚举（仅管理员，FR-141，ADR-0041）。
+///
+/// 先离线扫描本地 blob store 枚举仓库（blob 数 / 总大小），再按可达性选路：给定 `base_url` 且源 Nexus REST
+/// 可达时走**权威通道**（取权威格式 / 类型 / 上游，按仓库名合并）；未填或探测不可达时走**推断通道**
+/// （按内容路径启发式推断格式、标「推断」来源、类型 / 上游留空）。两通道输出统一仓库索引。
+///
+/// 与 `/offline/preview`（blob 明细预览）并存、互不替代——本端点产出仓库级索引供向导选择。
+/// 复用 FR-83 异步 job 基建：立即返回 `202 + job_id`，结果经 `GET /migrate/jobs/{id}` 进度的
+/// `repo_index` 字段轮询取回。不参与迁移搬运单飞门（纯枚举）。凭据经 `auth_ref` → env，不入库 / 不进日志。
+pub async fn index_nexus_offline(
+    State(state): State<AppState>,
+    Extension(jobs): Extension<Arc<MigrationJobs>>,
+    identity: Identity,
+    Json(req): Json<NexusOfflineIndexRequest>,
+) -> Result<(StatusCode, Json<JobCreatedDto>), ApiError> {
+    identity.require_admin()?;
+
+    let path = req.path.trim().to_string();
+    if path.is_empty() {
+        return Err(ApiError::BadRequest("blob store 路径不能为空".to_string()));
+    }
+    // 廉价同步预校验：路径必须是存在的目录——明显错误的路径即时 400，无需起后台任务
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(ApiError::BadRequest(format!(
+            "blob store 路径不存在或不是目录: {path}"
+        )));
+    }
+
+    // 规整可选 REST 参数：空白 base_url 视为未提供（回退纯离线推断）
+    let base_url = req
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let auth_ref = req.auth_ref;
+
+    // 离线索引只是枚举，不参与迁移搬运单飞门；对外仍登记为 migration 任务，供任务中心和轮询找回。
+    let job_id = Uuid::new_v4().to_string();
+    state
+        .tasks
+        .register_migration_preview_with_id(job_id.clone(), Some("离线索引".to_string()));
+    let progress = Arc::new(Mutex::new(OnlinePullProgress::default()));
+    let control = Arc::new(JobControl::default());
+    jobs.register(job_id.clone(), progress.clone(), control);
+
+    // 权威通道所需出站客户端：持随 AppState 共享的网络热替换槽（含运行时 PATCH 后的新代理）
+    let client = HttpNexusClient::with_network_state(state.settings.network.clone());
+    let tasks = state.tasks.clone();
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        // 离线枚举是同步阻塞文件 IO（遍历目录 + 读 .properties），放阻塞线程池，不占异步工作线程
+        let scan_path = path.clone();
+        let scan = tokio::task::spawn_blocking(move || {
+            migrate::enumerate_blob_store(std::path::Path::new(&scan_path))
+        })
+        .await;
+
+        let final_phase = match scan {
+            Ok(Ok(offline)) => {
+                // 双通道选路：给定 base_url 时尝试权威通道（不可达自动回退推断），否则纯推断
+                let rest = base_url
+                    .as_deref()
+                    .map(|url| (&client, url, auth_ref.as_deref()));
+                let index = migrate::discover_repo_index(&offline, rest).await;
+                let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+                // total_assets 记枚举到的 blob 总数，供 UI 展示规模
+                p.total_assets = offline.iter().map(|r| r.blob_count).sum();
+                p.done_assets = p.total_assets;
+                p.repo_index = Some(index);
+                p.phase = OnlinePullPhase::Done;
+                p.phase
+            }
+            Ok(Err(e)) => {
+                let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+                p.phase = OnlinePullPhase::Failed;
+                p.error = Some(e.to_string());
+                p.phase
+            }
+            Err(e) => {
+                let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
+                p.phase = OnlinePullPhase::Failed;
+                p.error = Some(format!("离线索引任务异常: {e}"));
+                p.phase
+            }
+        };
+        sync_migration_task_state(&tasks, &task_job_id, final_phase);
+        tracing::info!(任务 = %task_job_id, "离线仓库索引双通道枚举任务结束");
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(JobCreatedDto { job_id })))
+}
+
 /// proxy 仓库配置 + 缓存制品搬运请求体（FR-38）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

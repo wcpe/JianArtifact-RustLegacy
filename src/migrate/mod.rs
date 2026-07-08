@@ -22,6 +22,7 @@
 mod group;
 mod hosted;
 mod http;
+mod index;
 mod offline;
 mod online;
 mod proxy;
@@ -32,6 +33,7 @@ pub use hosted::{
     migrate_hosted_repositories_with_progress, HostedMigrationReport, HostedRepoMigrationOutcome,
 };
 pub use http::HttpNexusClient;
+pub use index::{discover_repo_index, FormatSource, RepoIndexEntry};
 pub(crate) use offline::infer_source_repos_from_offline_entries;
 pub use offline::{
     enumerate_blob_entries, enumerate_blob_store, OfflineBlobEntry, OfflineBlobSummary,

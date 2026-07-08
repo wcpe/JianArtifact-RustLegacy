@@ -240,6 +240,7 @@ mod tests {
                 blob_count,
                 blobs,
             }]),
+            repo_index: None,
         }));
         jobs.register(
             id.clone(),

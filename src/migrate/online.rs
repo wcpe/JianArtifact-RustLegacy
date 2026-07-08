@@ -191,6 +191,10 @@ pub struct OnlinePullProgress {
     /// 在线拉取等其余任务为 `None`、不序列化（不污染在线进度结构）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offline_preview: Option<Vec<super::OfflineRepoSummary>>,
+    /// 离线仓库索引双通道结果（FR-141）：仅离线索引任务在 `phase == done` 时填充；
+    /// 其余任务为 `None`、不序列化（不污染其他进度结构）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_index: Option<Vec<super::RepoIndexEntry>>,
 }
 
 /// 取进度锁（容忍中毒：恢复内部数据继续，不让一次 panic 永久毒死进度查询）。
