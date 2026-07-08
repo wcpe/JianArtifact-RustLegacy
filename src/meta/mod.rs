@@ -428,6 +428,25 @@ mod tests {
         assert_eq!(store.count_users().await.unwrap(), 0);
     }
 
+    #[test]
+    fn 迁移脚本以_lf_行尾嵌入二进制() {
+        for (name, bytes) in [
+            (
+                "0001_init.sql",
+                include_bytes!("../../migrations/0001_init.sql").as_slice(),
+            ),
+            (
+                "0002_repo_acl_unique.sql",
+                include_bytes!("../../migrations/0002_repo_acl_unique.sql").as_slice(),
+            ),
+        ] {
+            assert!(
+                !bytes.windows(2).any(|pair| pair == b"\r\n"),
+                "迁移脚本 {name} 含 CRLF，会改变 SQLx 迁移 checksum 并导致旧库无法启动"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn 回滚到旧二进制_db有更高已应用迁移_仍能打开() {
         // 复现自更新回滚跨迁移把 DB 锁死：回滚到旧二进制后，DB 里有新版应用、旧二进制内嵌集没有的
