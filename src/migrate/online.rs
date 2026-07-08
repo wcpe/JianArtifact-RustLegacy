@@ -11,25 +11,28 @@
 //!
 //! 关键约束：凭据不入库、不进日志；锁外做 IO；下载流式经 `ingest_hosted`，不整体载入内存。
 
-use crate::format::{ArtifactCoordinates, ArtifactService, Format, FormatRegistry, ServiceError};
+use crate::format::{
+    ArtifactCoordinates, ArtifactService, DockerRegistry, Format, FormatRegistry, ServiceError,
+};
 use crate::meta::{MetaStore, RepositoryRecord};
 use crate::proxy::Upstream;
 use crate::storage::BlobStore;
 
 use super::hosted::ensure_hosted_repo;
+use super::online_docker::migrate_online_docker_repo;
 use super::{
-    map_nexus_format, parse_components, MigrateError, NexusAsset, NexusClient, NexusCredential,
-    NexusRepoSummary,
+    map_nexus_format, parse_components, DockerRegistryClient, MigrateError, NexusAsset,
+    NexusClient, NexusCredential, NexusRepoSummary,
 };
 
 /// 单个 asset 下载 / 写入的最大尝试次数（含首次）：网络中断 / 流式解码失败等瞬时错误自动重试。
 const MAX_ASSET_ATTEMPTS: u32 = 3;
 
-/// 在线拉取当前支持搬运的 hosted 格式集合（FR-82 Maven + FR-143 Raw / npm）。
+/// 在线拉取当前支持搬运的 hosted 格式集合（FR-82 Maven + FR-143 Raw / npm + FR-144 Docker）。
 ///
-/// Docker/OCI（FR-144）与其余未实现格式不在此列——按 registry v2 协议搬运，另行实现。
-/// 集合即白名单，避免用 if-else 按格式名堆逻辑。
-const SUPPORTED_ONLINE_FORMATS: &[&str] = &["maven", "raw", "npm"];
+/// 集合即白名单，避免用 if-else 按格式名堆逻辑。`docker` 走 registry v2 manifest + layer 图搬运
+/// （[`super::online_docker`]，需装配 [`DockerRegistry`]），其余格式走普通文件路径。
+const SUPPORTED_ONLINE_FORMATS: &[&str] = &["maven", "raw", "npm", "docker"];
 
 /// 把 Nexus 原样格式名映射为在线拉取当前支持搬运的本系统格式名；不支持则返回 None。
 ///
@@ -225,7 +228,10 @@ fn lock_progress(
 
 /// （无进度上报的便捷入口）执行在线拉取迁移——内部用一次性进度委托
 /// [`migrate_online_with_progress`]；同步调用 / 测试用。仅 hosted 且格式在白名单
-/// （`maven` / `raw` / `npm`）内的仓库参与。
+/// （`maven` / `raw` / `npm` / `docker`）内的仓库参与。
+///
+/// 便捷入口不装配 docker registry（`docker = None`）：docker 仓库整体跳过、计入 `skipped_repos`。
+/// 需搬运 docker 的调用点走 [`migrate_online_with_progress`] 并传入 [`DockerRegistry`]。
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_online_repositories<C, S, U>(
     client: &C,
@@ -238,31 +244,35 @@ pub async fn migrate_online_repositories<C, S, U>(
     max_size: Option<u64>,
 ) -> Result<OnlineMigrationReport, MigrateError>
 where
-    C: NexusClient,
+    C: NexusClient + DockerRegistryClient,
     S: BlobStore,
     U: Upstream,
 {
     let progress = std::sync::Mutex::new(OnlinePullProgress::default());
     // 便捷入口无控制需求：用一次性默认控制（从不取消 / 暂停）委托
     let control = JobControl::default();
+    // 便捷入口不装配 docker registry：docker 仓库整体跳过
+    let docker: Option<&DockerRegistry<S>> = None;
     migrate_online_with_progress(
-        client, meta, artifacts, formats, base_url, credential, selections, max_size, &progress,
-        &control,
+        client, meta, artifacts, formats, docker, base_url, credential, selections, max_size,
+        &progress, &control,
     )
     .await
 }
 
 /// 执行 Nexus 在线拉取迁移并持续上报进度（FR-83，异步任务用）。
 ///
-/// 形参同上，另加 `progress` 进度共享态（任务执行期间持续更新，供查询端点读取）。仅 hosted 且格式在
-/// 白名单（`maven` / `raw` / `npm`）内参与，其余计入 `skipped_repos`。进度锁临界区只更新内存态、
-/// 不持锁做 IO（锁外做 IO）。
+/// 形参同上，另加 `docker` 可选 docker registry（装配时 docker hosted 仓库走 registry v2 manifest +
+/// layer 图搬运 FR-144，`None` 时 docker 仓库整体跳过）与 `progress` 进度共享态。仅 hosted 且格式在
+/// 白名单（`maven` / `raw` / `npm` / `docker`）内参与，其余计入 `skipped_repos`。进度锁临界区只更新
+/// 内存态、不持锁做 IO（锁外做 IO）。
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_online_with_progress<C, S, U>(
     client: &C,
     meta: &MetaStore,
     artifacts: &ArtifactService<S, U>,
     formats: &FormatRegistry,
+    docker: Option<&DockerRegistry<S>>,
     base_url: &str,
     credential: Option<&NexusCredential>,
     selections: &[OnlinePullSelection],
@@ -271,7 +281,7 @@ pub async fn migrate_online_with_progress<C, S, U>(
     control: &JobControl,
 ) -> Result<OnlineMigrationReport, MigrateError>
 where
-    C: NexusClient,
+    C: NexusClient + DockerRegistryClient,
     S: BlobStore,
     U: Upstream,
 {
@@ -291,8 +301,8 @@ where
         }
 
         let src = &sel.source;
-        // 范围：仅 hosted 且格式在在线搬运白名单（Maven / Raw / npm）内；其余格式 / 类型整体跳过，
-        // 不越界建仓（proxy 在线只迁配置不搬缓存，未支持格式含 Docker/OCI 走 FR-144）
+        // 范围：仅 hosted 且格式在在线搬运白名单（Maven / Raw / npm / Docker）内；其余格式 / 类型整体
+        // 跳过，不越界建仓（proxy 在线只迁配置不搬缓存）
         let Some(target_format) = (if src.r#type == "hosted" {
             online_hosted_format(&src.format)
         } else {
@@ -307,6 +317,18 @@ where
             continue;
         };
 
+        // docker 需装配 registry v2 存储服务；未装配（如便捷入口 / 无 docker 后端）则整体跳过，
+        // 计入 skipped_repos（不越界建 docker 仓库却无法落库）
+        if target_format == "docker" && docker.is_none() {
+            tracing::info!(
+                仓库 = %src.name,
+                "未装配 docker registry，跳过 docker 仓库在线拉取迁移"
+            );
+            report.skipped_repos.push(src.name.clone());
+            lock_progress(progress).skipped_repos.push(src.name.clone());
+            continue;
+        }
+
         {
             let mut p = lock_progress(progress);
             p.phase = OnlinePullPhase::Enumerating;
@@ -317,11 +339,28 @@ where
         // 建 / 复用目标 hosted 仓库（名取 target_repo，允许与源不同名；格式取映射后的白名单格式）
         let (repo, created) = ensure_hosted_repo(meta, &sel.target_repo, target_format).await?;
 
-        let pulled = pull_repo_assets(
-            client, artifacts, formats, base, &src.name, &repo, credential, max_size, progress,
-            control,
-        )
-        .await?;
+        // 分派：docker 走 registry v2 manifest + layer 图搬运（FR-144），其余走普通文件路径。
+        // docker 特有逻辑单独封装于 online_docker，不塞进普通文件路径。
+        let pulled = if target_format == "docker" {
+            // 前置守卫已保证 docker.is_some()
+            let registry = docker.expect("docker registry 已在前置守卫确认装配");
+            let docker_pulled = migrate_online_docker_repo(
+                client, registry, base, &src.name, &repo, credential, progress, control,
+            )
+            .await?;
+            RepoPullResult {
+                migrated: docker_pulled.migrated,
+                skipped_existing: docker_pulled.skipped_existing,
+                skipped: docker_pulled.skipped,
+                cancelled: docker_pulled.cancelled,
+            }
+        } else {
+            pull_repo_assets(
+                client, artifacts, formats, base, &src.name, &repo, credential, max_size, progress,
+                control,
+            )
+            .await?
+        };
 
         tracing::info!(
             源仓库 = %src.name, 目标仓库 = %sel.target_repo, 格式 = %target_format,
@@ -640,6 +679,53 @@ mod tests {
         }
     }
 
+    /// 为普通文件路径的 mock 客户端补一份「永不触达」的 [`DockerRegistryClient`] 实现——
+    /// 这些用例只覆盖 maven/raw/npm 普通文件路径，不迁移 docker（docker 图搬运的正确性在
+    /// [`super::super::online_docker`] 单独覆盖），故 docker 方法为 unreachable 占位。
+    macro_rules! never_docker_client {
+        ($t:ty) => {
+            impl DockerRegistryClient for $t {
+                async fn list_images(
+                    &self,
+                    _b: &str,
+                    _r: &str,
+                    _c: Option<&NexusCredential>,
+                ) -> Result<Vec<String>, MigrateError> {
+                    unimplemented!("普通文件路径用例不迁移 docker")
+                }
+                async fn list_tags(
+                    &self,
+                    _b: &str,
+                    _r: &str,
+                    _i: &str,
+                    _c: Option<&NexusCredential>,
+                ) -> Result<Vec<String>, MigrateError> {
+                    unimplemented!("普通文件路径用例不迁移 docker")
+                }
+                async fn fetch_manifest(
+                    &self,
+                    _b: &str,
+                    _r: &str,
+                    _i: &str,
+                    _rf: &str,
+                    _c: Option<&NexusCredential>,
+                ) -> Result<crate::migrate::FetchedManifest, MigrateError> {
+                    unimplemented!("普通文件路径用例不迁移 docker")
+                }
+                async fn download_blob(
+                    &self,
+                    _b: &str,
+                    _r: &str,
+                    _i: &str,
+                    _d: &str,
+                    _c: Option<&NexusCredential>,
+                ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, MigrateError> {
+                    unimplemented!("普通文件路径用例不迁移 docker")
+                }
+            }
+        };
+    }
+
     /// mock Nexus 客户端：按 token 序返回预置 components 页，按 downloadUrl 返回预置字节。
     struct MockOnline {
         /// components 页（JSON 文本）按页序排列；token 即页下标字符串。
@@ -682,6 +768,7 @@ mod tests {
             }
         }
     }
+    never_docker_client!(MockOnline);
 
     async fn 新建() -> (
         MetaStore,
@@ -801,6 +888,7 @@ mod tests {
             &meta,
             &svc,
             &formats,
+            None,
             "https://nx",
             None,
             &selection,
@@ -820,6 +908,7 @@ mod tests {
             &meta,
             &svc,
             &formats,
+            None,
             "https://nx",
             None,
             &selection,
@@ -953,6 +1042,41 @@ mod tests {
             .is_none());
         assert!(meta
             .get_repository_by_name("cargo-hosted")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// docker hosted 在未装配 docker registry（便捷入口 `docker = None`）时整体跳过、不建仓（FR-144）。
+    #[tokio::test]
+    async fn docker_未装配_registry_时整体跳过不建仓() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let client = MockOnline {
+            pages: vec![],
+            assets: HashMap::new(),
+        };
+        // 便捷入口 migrate_online_repositories 不装配 docker registry
+        let report = migrate_online_repositories(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &[sel(
+                src("docker-hosted", "docker", "hosted"),
+                "docker-hosted",
+            )],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.repos.is_empty());
+        assert!(report.skipped_repos.contains(&"docker-hosted".to_string()));
+        // 不越界建 docker 仓库（无法落库时不建仓）
+        assert!(meta
+            .get_repository_by_name("docker-hosted")
             .await
             .unwrap()
             .is_none());
@@ -1237,6 +1361,7 @@ mod tests {
             }
         }
     }
+    never_docker_client!(FlakyClient);
 
     #[tokio::test]
     async fn 下载瞬时失败重试后成功() {
@@ -1298,6 +1423,7 @@ mod tests {
             &meta,
             &svc,
             &formats,
+            None,
             "https://nx",
             None,
             &[sel(src("r3d", "maven2", "hosted"), "r3d")],
@@ -1336,6 +1462,7 @@ mod tests {
             &meta,
             &svc,
             &formats,
+            None,
             "https://nx",
             None,
             &[sel(src("cargo-hosted", "cargo", "hosted"), "cargo-hosted")],
@@ -1401,6 +1528,7 @@ mod tests {
             }
         }
     }
+    never_docker_client!(GatedClient);
 
     /// 构造 N 个 asset 的单仓库 components 页 + 受控客户端句柄。
     fn gated_client(
@@ -1456,6 +1584,7 @@ mod tests {
                 &meta2,
                 &svc2,
                 &formats2,
+                None,
                 "https://nx",
                 None,
                 &[sel(src("r3d", "maven2", "hosted"), "r3d")],
@@ -1507,6 +1636,7 @@ mod tests {
                 &meta2,
                 &svc2,
                 &formats2,
+                None,
                 "https://nx",
                 None,
                 &[sel(src("r3d", "maven2", "hosted"), "r3d")],

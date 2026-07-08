@@ -258,6 +258,94 @@ impl<S: BlobStore> DockerRegistry<S> {
         }
     }
 
+    // ---------------- 迁移搬运（FR-144）----------------
+
+    /// 迁移搬运：把源 registry 的一个 blob（config / layer / manifest 均可作 blob）按内容寻址落定
+    /// 并写 docker blob 索引（`{image}/blobs/sha256:{hex}`），供在线 Docker/OCI 迁移逐 blob 搬运。
+    ///
+    /// 与 [`Self::finish_upload`] 共用同一不变量——**blob 先落盘并校验 sha256，再写元数据索引**；
+    /// 校验失败 / 写索引失败均回滚 blob，不留孤儿。区别在于字节来自迁移下载流（而非上传会话临时文件）、
+    /// 且**幂等可重入**：同 `{image}/blobs/{digest}` 索引已存在且 sha256 一致时跳过写索引、直接复用
+    /// （FR-134 增量跳过）。`expected_digest` 为源报告的 `sha256:{hex}`，落定内容须与之一致。
+    ///
+    /// 返回 `true` 表示本次为新写入，`false` 表示幂等命中既有一致索引（增量跳过）。
+    pub async fn ingest_blob<R>(
+        &self,
+        repo: &RepositoryRecord,
+        image: &str,
+        expected_digest: &str,
+        reader: R,
+    ) -> Result<bool, DockerError>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let expected_hex =
+            docker::parse_digest(expected_digest).ok_or(DockerError::InvalidDigest)?;
+        let key = docker::blob_key(image, expected_digest);
+
+        // 幂等：同坐标索引已存在且 sha256 一致 → 增量跳过（无需再下载落盘；调用方已流式喂入前应先查，
+        // 但此处再兜一次，保证即便重复流入也不重复写索引）。
+        if let Some(existing) = self.meta.get_artifact(&repo.id, &key).await? {
+            if existing.sha256 == expected_hex {
+                // 消费掉 reader 以免调用方误判（迁移侧应在调用前用 blob_exists 短路，避免无谓下载）
+                return Ok(false);
+            }
+        }
+
+        // ① 流式落定为内容寻址 blob（BlobStore 边写边算 sha256，落定即校验）
+        let limited = super::LimitedReader::new(reader, self.max_size);
+        let digests = match self.store.put(limited).await {
+            Ok(d) => d,
+            Err(StorageError::Io(e)) if super::is_too_large(&e) => {
+                return Err(DockerError::TooLarge)
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // ② 校验落定 sha256 与源报告 digest 一致；不一致即回滚（内容损坏 / 源报告错配）
+        if digests.sha256 != expected_hex {
+            self.rollback_blob(&digests.sha256).await;
+            return Err(DockerError::DigestMismatch);
+        }
+
+        // ③ 写 blob 索引；失败回滚，不留孤儿
+        let write = self
+            .meta
+            .upsert_artifact(NewArtifact {
+                repo_id: &repo.id,
+                path: &key,
+                size: digests.size as i64,
+                sha256: &digests.sha256,
+                sha1: &digests.sha1,
+                md5: &digests.md5,
+                sha512: &digests.sha512,
+                content_type: Some("application/octet-stream"),
+                cached: false,
+            })
+            .await;
+        if let Err(e) = write {
+            self.rollback_blob(&digests.sha256).await;
+            return Err(e.into());
+        }
+        tracing::info!(仓库 = %repo.name, 镜像 = %image, digest = %expected_digest, "已搬运 docker blob");
+        Ok(true)
+    }
+
+    /// 查某 blob 是否已按 docker 布局落库且 sha256 与声明 digest 一致（供迁移幂等短路，避免无谓下载）。
+    ///
+    /// `digest` 为 `sha256:{hex}`；索引存在且其 sha256 与 digest 的 hex 部分一致返回 `true`。
+    pub async fn blob_exists(
+        &self,
+        repo: &RepositoryRecord,
+        image: &str,
+        digest: &str,
+    ) -> Result<bool, DockerError> {
+        let hex = docker::parse_digest(digest).ok_or(DockerError::InvalidDigest)?;
+        let key = docker::blob_key(image, digest);
+        let record = self.meta.get_artifact(&repo.id, &key).await?;
+        Ok(record.is_some_and(|r| r.sha256 == hex))
+    }
+
     // ---------------- blob 读取 ----------------
 
     /// 查 blob 是否存在（HEAD），返回其大小（不存在返回 None）。
@@ -755,6 +843,115 @@ mod tests {
         assert!(matches!(err, DockerError::TooLarge));
         // 取消会话清理临时文件
         reg.cancel_upload(&started.upload_id).await;
+    }
+
+    // ---------------- 迁移搬运 ingest_blob（FR-144）----------------
+
+    #[tokio::test]
+    async fn 迁移搬运_blob_落定并可读回() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"migrated-layer-bytes";
+        let digest = docker::make_digest(&sha256_hex(content));
+
+        // 首次搬运：新写入
+        let written = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        assert!(written, "首次搬运应为新写入");
+
+        // 按 docker 布局落库，可经 get_blob 读回、内容一致
+        let mut h = reg.get_blob(&repo, "app", &digest).await.unwrap();
+        let mut buf = Vec::new();
+        h.blob.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, content);
+        assert!(reg.blob_exists(&repo, "app", &digest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 迁移搬运_blob_幂等重入增量跳过() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"dup-layer";
+        let digest = docker::make_digest(&sha256_hex(content));
+
+        let first = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        assert!(first, "首次为新写入");
+        // 二次同 digest：幂等命中、增量跳过（不新写）
+        let second = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        assert!(!second, "二次搬运应增量跳过");
+        // 索引仍只一条
+        let key = docker::blob_key("app", &digest);
+        assert!(meta.get_artifact(&repo.id, &key).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn 迁移搬运_digest_不符回滚不留_blob() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"actual-bytes";
+        // 声明一个与内容不符的 digest
+        let wrong = docker::make_digest(&"0".repeat(64));
+
+        let err = reg
+            .ingest_blob(&repo, "app", &wrong, &content[..])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::DigestMismatch));
+        // 不符不应留下任何索引
+        let key = docker::blob_key("app", &wrong);
+        assert!(meta.get_artifact(&repo.id, &key).await.unwrap().is_none());
+        // 实际内容的 blob 也应被回滚（无索引引用）
+        assert!(!reg.store.exists(&sha256_hex(content)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 迁移搬运_非法_digest_被拒() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let err = reg
+            .ingest_blob(&repo, "app", "not-a-digest", &b"x"[..])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::InvalidDigest));
+    }
+
+    #[tokio::test]
+    async fn 迁移搬运_超限返回_too_large() {
+        let (reg, meta, _d) = 新建(Some(4)).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"0123456789";
+        let digest = docker::make_digest(&sha256_hex(content));
+        let err = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::TooLarge));
+        // 超限不留半截索引
+        let key = docker::blob_key("app", &digest);
+        assert!(meta.get_artifact(&repo.id, &key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn blob_exists_命中与未命中() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"exists-check";
+        let digest = docker::make_digest(&sha256_hex(content));
+        // 未搬运前不存在
+        assert!(!reg.blob_exists(&repo, "app", &digest).await.unwrap());
+        reg.ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        // 搬运后存在
+        assert!(reg.blob_exists(&repo, "app", &digest).await.unwrap());
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ mod http;
 mod index;
 mod offline;
 mod online;
+mod online_docker;
 mod proxy;
 
 pub use group::{migrate_group_repositories, GroupMigrationReport, GroupRepoOutcome};
@@ -185,6 +186,141 @@ pub trait NexusClient: Send + Sync {
         download_url: &str,
         credential: Option<&NexusCredential>,
     ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, MigrateError>;
+}
+
+/// Docker Registry v2 **源侧读**抽象（FR-144）：从源 Nexus 的 registry v2 端点枚举镜像 / tag、
+/// 拉 manifest、流式下载 blob。与 [`NexusClient`]（REST components 枚举）并列、互不干扰——docker
+/// 迁移按 registry v2 协议搬运 manifest + layer 图，不套「downloadUrl → 普通文件」路径。
+///
+/// 生产实现 [`HttpNexusClient`] 按 `{base}/repository/{repo}/v2/{image}/...` 拼 URL、Basic Auth 注入；
+/// 测试可注入 mock 覆盖 manifest 图遍历、digest 校验与错误分支。
+#[allow(async_fn_in_trait)]
+pub trait DockerRegistryClient: Send + Sync {
+    /// 枚举某源 docker 仓库下的全部镜像名（registry v2 `_catalog`）。
+    ///
+    /// `base_url` 为源 Nexus 基址，`repository` 为源 docker 仓库名。返回镜像名列表（可多段，如
+    /// `library/alpine`）。非 2xx / 传输失败返回对应 [`MigrateError`]。
+    async fn list_images(
+        &self,
+        base_url: &str,
+        repository: &str,
+        credential: Option<&NexusCredential>,
+    ) -> Result<Vec<String>, MigrateError>;
+
+    /// 枚举某镜像的全部 tag（registry v2 `/v2/{image}/tags/list`）。
+    async fn list_tags(
+        &self,
+        base_url: &str,
+        repository: &str,
+        image: &str,
+        credential: Option<&NexusCredential>,
+    ) -> Result<Vec<String>, MigrateError>;
+
+    /// 拉取某 manifest（registry v2 `/v2/{image}/manifests/{reference}`，reference 为 tag 或 digest）。
+    ///
+    /// 返回 manifest 原始字节与其媒体类型（Content-Type）。manifest 图遍历时按 digest 递归拉取子
+    /// manifest 亦经此方法。非 2xx / 传输失败返回对应 [`MigrateError`]。
+    async fn fetch_manifest(
+        &self,
+        base_url: &str,
+        repository: &str,
+        image: &str,
+        reference: &str,
+        credential: Option<&NexusCredential>,
+    ) -> Result<FetchedManifest, MigrateError>;
+
+    /// 流式下载某 blob（registry v2 `/v2/{image}/blobs/{digest}`），返回装箱异步读句柄（不整体载入内存）。
+    async fn download_blob(
+        &self,
+        base_url: &str,
+        repository: &str,
+        image: &str,
+        digest: &str,
+        credential: Option<&NexusCredential>,
+    ) -> Result<Box<dyn tokio::io::AsyncRead + Send + Unpin>, MigrateError>;
+}
+
+/// 从源 registry 拉到的 manifest：原始字节 + 媒体类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedManifest {
+    /// manifest 原始字节。
+    pub bytes: Vec<u8>,
+    /// manifest 媒体类型（Content-Type）。
+    pub media_type: String,
+}
+
+/// manifest 图的引用集合（FR-144）：一个 manifest 引用的所有需搬运的 blob / 子 manifest digest。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManifestRefs {
+    /// 单架构镜像 manifest 引用的 config + layer blob digest（`sha256:...`）；manifest list 时为空。
+    pub blob_digests: Vec<String>,
+    /// manifest list / OCI index 引用的子 manifest digest（`sha256:...`）；单架构 manifest 时为空。
+    pub sub_manifests: Vec<String>,
+}
+
+/// 解析 manifest 字节，取出其引用的 config + layer blob digest（单架构）或子 manifest digest（list）。
+///
+/// 纯函数，便于穷举测试。支持 Docker schema2、OCI image manifest（含 `config` + `layers[]`）与
+/// manifest list / OCI image index（含 `manifests[]`）。字段缺失 / 非法 JSON 返回
+/// [`MigrateError::Parse`]。仅收集形如 `sha256:...` 的合法 digest，忽略无 digest 的条目。
+pub fn parse_manifest_refs(bytes: &[u8]) -> Result<ManifestRefs, MigrateError> {
+    #[derive(serde::Deserialize)]
+    struct RawManifest {
+        #[serde(default)]
+        config: Option<RawDescriptor>,
+        #[serde(default)]
+        layers: Vec<RawDescriptor>,
+        #[serde(default)]
+        manifests: Vec<RawDescriptor>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawDescriptor {
+        #[serde(default)]
+        digest: Option<String>,
+    }
+
+    let text = std::str::from_utf8(bytes).map_err(|e| MigrateError::Parse(e.to_string()))?;
+    let raw: RawManifest =
+        serde_json::from_str(text).map_err(|e| MigrateError::Parse(e.to_string()))?;
+
+    // 仅接受 `sha256:{64hex}` 形态的 digest，杜绝非法引用
+    let is_valid = |d: &str| crate::format::docker::parse_digest(d).is_some();
+
+    // manifest list / index：收集子 manifest digest
+    let sub_manifests: Vec<String> = raw
+        .manifests
+        .iter()
+        .filter_map(|d| d.digest.as_deref())
+        .filter(|d| is_valid(d))
+        .map(str::to_string)
+        .collect();
+
+    // 单架构 manifest：config + layers 的 blob digest
+    let mut blob_digests = Vec::new();
+    if let Some(cfg) = raw.config.as_ref().and_then(|c| c.digest.as_deref()) {
+        if is_valid(cfg) {
+            blob_digests.push(cfg.to_string());
+        }
+    }
+    for layer in &raw.layers {
+        if let Some(d) = layer.digest.as_deref() {
+            if is_valid(d) {
+                blob_digests.push(d.to_string());
+            }
+        }
+    }
+
+    // manifest 既无 config/layers 也无 manifests：视为无法识别的空 manifest
+    if blob_digests.is_empty() && sub_manifests.is_empty() {
+        return Err(MigrateError::Parse(
+            "manifest 既非单架构镜像也非 manifest list（无 config/layers/manifests）".to_string(),
+        ));
+    }
+
+    Ok(ManifestRefs {
+        blob_digests,
+        sub_manifests,
+    })
 }
 
 /// 据 `auth_ref` 从环境变量解析 Nexus 访问凭据。
@@ -650,6 +786,73 @@ mod tests {
         // asset 缺 path 字段
         assert!(matches!(
             parse_components(r#"{"items":[{"assets":[{"downloadUrl":"u"}]}]}"#),
+            Err(MigrateError::Parse(_))
+        ));
+    }
+
+    // ---------- FR-144：manifest 图解析 ----------
+
+    #[test]
+    fn 解析单架构_manifest_取_config_与_layers() {
+        let cfg = format!("sha256:{}", "a".repeat(64));
+        let l1 = format!("sha256:{}", "b".repeat(64));
+        let l2 = format!("sha256:{}", "c".repeat(64));
+        let m = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {{ "mediaType": "application/vnd.docker.container.image.v1+json", "digest": "{cfg}" }},
+                "layers": [
+                    {{ "digest": "{l1}" }},
+                    {{ "digest": "{l2}" }}
+                ]
+            }}"#
+        );
+        let refs = parse_manifest_refs(m.as_bytes()).unwrap();
+        // config 在前，随后各 layer
+        assert_eq!(refs.blob_digests, vec![cfg, l1, l2]);
+        assert!(refs.sub_manifests.is_empty());
+    }
+
+    #[test]
+    fn 解析_manifest_list_取子_manifest() {
+        let s1 = format!("sha256:{}", "1".repeat(64));
+        let s2 = format!("sha256:{}", "2".repeat(64));
+        let m = format!(
+            r#"{{
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+                "manifests": [
+                    {{ "digest": "{s1}", "platform": {{ "architecture": "amd64", "os": "linux" }} }},
+                    {{ "digest": "{s2}", "platform": {{ "architecture": "arm64", "os": "linux" }} }}
+                ]
+            }}"#
+        );
+        let refs = parse_manifest_refs(m.as_bytes()).unwrap();
+        assert!(refs.blob_digests.is_empty());
+        assert_eq!(refs.sub_manifests, vec![s1, s2]);
+    }
+
+    #[test]
+    fn 解析_manifest_忽略非法_digest() {
+        let cfg = format!("sha256:{}", "a".repeat(64));
+        // 一个合法 config + 一个非法 digest 的 layer（应被忽略）
+        let m = format!(
+            r#"{{ "config": {{ "digest": "{cfg}" }}, "layers": [ {{ "digest": "not-a-digest" }} ] }}"#
+        );
+        let refs = parse_manifest_refs(m.as_bytes()).unwrap();
+        assert_eq!(refs.blob_digests, vec![cfg]);
+    }
+
+    #[test]
+    fn 解析_manifest_非法_json_或空_manifest_报错() {
+        assert!(matches!(
+            parse_manifest_refs(b"not json"),
+            Err(MigrateError::Parse(_))
+        ));
+        // 既无 config/layers 也无 manifests → 视为无法识别
+        assert!(matches!(
+            parse_manifest_refs(br#"{"schemaVersion":2}"#),
             Err(MigrateError::Parse(_))
         ));
     }

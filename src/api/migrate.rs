@@ -666,6 +666,8 @@ pub async fn migrate_nexus_online(
     let meta = state.meta.clone();
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
+    // docker registry（FR-144）：装配时 docker hosted 仓库走 registry v2 manifest + layer 图搬运
+    let docker = state.docker.clone();
     let max_size = state.config.limits.max_artifact_size;
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
@@ -676,6 +678,7 @@ pub async fn migrate_nexus_online(
             &meta,
             &artifacts,
             &formats,
+            docker.as_deref(),
             &base_url,
             credential.as_ref(),
             &selections,
