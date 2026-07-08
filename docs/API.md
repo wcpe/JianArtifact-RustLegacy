@@ -374,6 +374,14 @@
 - **响应**：`200 OK`，无响应体。对**已结束**任务（`done` / `failed` / `cancelled`）的控制为**幂等空操作**（不报错、不改终态）；`pause` 对已取消任务亦为空操作。
 - **错误**：`401` 未认证；`403` 非管理员；`404` 未知 `job_id`（含已被淘汰的旧任务）。
 
+### Nexus 迁移历史与报告持久化（FR-140，ADR-0040）
+
+迁移任务的**记录、节流进度快照与分仓库明细报告**经 `meta` 层落 SQLite，使进程重启后历史 / 进度 / 报告仍可查、残留在途任务标「已中断」、可一键幂等重跑续传。运行态真源仍是进程内 `MigrationJobs`（`GET /migrate/jobs` 系列，契约不变）；本组端点是**跨重启的历史与恢复视图**。凭据仍只存 `auth_ref` 引用、真值走 env，绝不入库。
+
+- **列迁移历史**：`GET /api/v1/migrate/tasks`。仅管理员。返回库中近期迁移任务（按起始时刻倒序，默认上限 100），含重启后被标 `interrupted` 的任务。响应：`[{ "id", "kind", "state", "label", "phase", "total_assets", "done_assets", "migrated", "skipped_existing", "skipped", "total_bytes", "done_bytes", "migrated_bytes", "skipped_bytes", "error", "started_at", "updated_at", "finished_at" }]`。`kind` ∈ `online` / `offline_proxy` / `offline_hosted`；`state` ∈ `running` / `paused` / `succeeded` / `failed` / `cancelled` / `interrupted`（`interrupted` = 进程重启时残留的在途任务被归一）；任务耗时由 `finished_at` − `started_at` 推导。
+- **查历史详情 + 报告**：`GET /api/v1/migrate/tasks/{id}`。仅管理员。响应为任务记录（同上字段展平）+ `repos`：分仓库明细报告数组，每项 `{ "source_repo", "target_repo", "format", "created", "migrated_artifacts", "skipped_existing_artifacts", "skipped_artifacts" }`。错误：`404` 未知 `id`。
+- **一键幂等重跑**：`POST /api/v1/migrate/tasks/{id}/rerun`。无请求体。仅管理员。据任务库中**脱敏参数快照**重建原请求并重新触发一次幂等搬运——复用既有引擎的 sha256 跳过（目标已存在且一致即跳过，进度区分「跳过 vs 新搬」），等效断点续传；凭据仍从 env 现解析（快照只存 `auth_ref` 引用）。生成**新 `job_id`**（不覆盖原历史记录）。响应：`202 Accepted`，体 `{ "job_id": string }`。错误：`400` 参数快照损坏 / 类别未知；`401` 未认证；`403` 非管理员；`404` 未知 `id`；`409` 已有迁移任务在途（复用迁移单飞门）。
+
 ### 统一任务注册表（FR-131）
 
 把迁移 / 在线更新 / 漏洞库刷新等多类长耗时任务收口到**同一进程内注册表**，统一列出活跃 + 近期任务、查单任务进度。进程内、**有界、不落库**——服务器重启即清（与 ADR-0019 一致）。各 kind 进度明细仍由各自端点提供（`GET /migrate/jobs/{id}` / `GET /update/jobs/{id}`，契约不变），本端点只附带统一记录与（若专表仍在）进度明细。
