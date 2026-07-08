@@ -12,6 +12,7 @@ mod alerts;
 mod audit;
 mod groups;
 mod metrics;
+mod migrate;
 mod repo;
 mod settings;
 mod usage;
@@ -21,6 +22,10 @@ pub use alerts::{AlertQuery, AlertRecord, NewAlert};
 pub use audit::{AuditEntry, AuditQuery, NewAuditEntry};
 pub use groups::{GroupAclRecord, GroupMemberRecord, GroupRecord};
 pub use metrics::{MetricSample, NewMetricSample};
+pub use migrate::{
+    MigrationProgressSnapshot, MigrationRepoReport, MigrationTaskKind, MigrationTaskRecord,
+    MigrationTaskRepoRow, MigrationTaskState, NewMigrationTask,
+};
 pub use repo::{
     AclRecord, ArtifactRecord, ArtifactSearchHit, NewArtifact, NewRepository, Permission, RepoType,
     RepositoryRecord, Visibility,
@@ -438,6 +443,10 @@ mod tests {
             (
                 "0002_repo_acl_unique.sql",
                 include_bytes!("../../migrations/0002_repo_acl_unique.sql").as_slice(),
+            ),
+            (
+                "0014_migration_tasks.sql",
+                include_bytes!("../../migrations/0014_migration_tasks.sql").as_slice(),
             ),
         ] {
             assert!(
