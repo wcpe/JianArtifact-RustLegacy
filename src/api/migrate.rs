@@ -584,7 +584,8 @@ pub struct JobSummaryDto {
 ///
 /// 同步阶段：枚举源仓库配置、匹配所选仓库、解析凭据（失败即 400 / 502，不开任务）；随后**立即返回
 /// `job_id`（202）**，实际 asset 枚举 + HTTP 流式下载 + 落地在后台 tokio 任务执行，进度经任务注册表
-/// 轮询（`GET /migrate/jobs/{id}`）。仅 Maven hosted 参与，其余整体跳过。凭据真值走 env，绝不入库 / 不进日志。
+/// 轮询（`GET /migrate/jobs/{id}`）。Maven / Raw / npm hosted 参与（FR-82 + FR-143），其余（含 Docker/OCI
+/// 走 FR-144）与 proxy 整体跳过。凭据真值走 env，绝不入库 / 不进日志。
 pub async fn migrate_nexus_online(
     State(state): State<AppState>,
     Extension(jobs): Extension<Arc<MigrationJobs>>,

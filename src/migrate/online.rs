@@ -5,7 +5,8 @@
 //! 制品——**无需离线 blob store 目录**。落定后比对 sha256 保证文件字节一致；单 asset 失败记
 //! WARN 跳过、不中断整批。
 //!
-//! 范围（scope-discipline）：仅 **Maven（`maven2`）hosted** 仓库；其余格式 / 类型整体跳过。
+//! 范围（scope-discipline）：**Maven（`maven2`）/ Raw / npm 的 hosted** 仓库（FR-82 + FR-143）；
+//! 其余格式（含 Docker/OCI，走 FR-144）/ 类型整体跳过。proxy 在线只迁配置不搬缓存（可回源重建）。
 //! 与离线目录搬运（FR-39，见 [`super::hosted`]）互补：本路径制品本体来自 HTTP，而非磁盘 blob。
 //!
 //! 关键约束：凭据不入库、不进日志；锁外做 IO；下载流式经 `ingest_hosted`，不整体载入内存。
@@ -23,6 +24,24 @@ use super::{
 
 /// 单个 asset 下载 / 写入的最大尝试次数（含首次）：网络中断 / 流式解码失败等瞬时错误自动重试。
 const MAX_ASSET_ATTEMPTS: u32 = 3;
+
+/// 在线拉取当前支持搬运的 hosted 格式集合（FR-82 Maven + FR-143 Raw / npm）。
+///
+/// Docker/OCI（FR-144）与其余未实现格式不在此列——按 registry v2 协议搬运，另行实现。
+/// 集合即白名单，避免用 if-else 按格式名堆逻辑。
+const SUPPORTED_ONLINE_FORMATS: &[&str] = &["maven", "raw", "npm"];
+
+/// 把 Nexus 原样格式名映射为在线拉取当前支持搬运的本系统格式名；不支持则返回 None。
+///
+/// 复用 [`map_nexus_format`] 做统一格式映射，再据 [`SUPPORTED_ONLINE_FORMATS`] 白名单过滤——
+/// 仅放行在线搬运已实现的格式（Maven / Raw / npm），其余（含尚未支持的 Docker/OCI）整体跳过。
+fn online_hosted_format(nexus_format: &str) -> Option<&'static str> {
+    let mapped = map_nexus_format(nexus_format)?;
+    SUPPORTED_ONLINE_FORMATS
+        .iter()
+        .find(|f| **f == mapped)
+        .copied()
+}
 
 /// 在线拉取的网络错误是否为可重试的瞬时错误（传输失败 / 源系统 5xx；4xx 等确定性错误不重试）。
 fn is_transient_migrate(e: &MigrateError) -> bool {
@@ -61,7 +80,7 @@ pub struct OnlineRepoMigrationOutcome {
     pub source_repo: String,
     /// 本系统目标仓库名。
     pub target_repo: String,
-    /// 本系统格式名（本批恒为 `maven`）。
+    /// 本系统格式名（映射后的白名单格式：`maven` / `raw` / `npm`）。
     pub format: String,
     /// 目标仓库是否新建（false 表示同名仓库已存在、复用）。
     pub created: bool,
@@ -78,7 +97,7 @@ pub struct OnlineRepoMigrationOutcome {
 pub struct OnlineMigrationReport {
     /// 各仓库的在线拉取结果明细。
     pub repos: Vec<OnlineRepoMigrationOutcome>,
-    /// 因非 hosted / 非 maven（范围外）而整体跳过的源仓库名列表。
+    /// 因非 hosted / 格式不在在线搬运白名单（范围外）而整体跳过的源仓库名列表。
     pub skipped_repos: Vec<String>,
 }
 
@@ -183,7 +202,7 @@ pub struct OnlinePullProgress {
     pub paused: bool,
     /// 各仓库完成结果明细。
     pub repos: Vec<OnlineRepoMigrationOutcome>,
-    /// 因非 maven hosted 整体跳过的源仓库名。
+    /// 因非 hosted / 格式不在在线搬运白名单整体跳过的源仓库名。
     pub skipped_repos: Vec<String>,
     /// 失败原因（`phase == failed` 时）。
     pub error: Option<String>,
@@ -205,7 +224,8 @@ fn lock_progress(
 }
 
 /// （无进度上报的便捷入口）执行在线拉取迁移——内部用一次性进度委托
-/// [`migrate_online_with_progress`]；同步调用 / 测试用。仅 `maven2` + `hosted` 参与。
+/// [`migrate_online_with_progress`]；同步调用 / 测试用。仅 hosted 且格式在白名单
+/// （`maven` / `raw` / `npm`）内的仓库参与。
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_online_repositories<C, S, U>(
     client: &C,
@@ -234,8 +254,9 @@ where
 
 /// 执行 Nexus 在线拉取迁移并持续上报进度（FR-83，异步任务用）。
 ///
-/// 形参同上，另加 `progress` 进度共享态（任务执行期间持续更新，供查询端点读取）。仅 `maven2` +
-/// `hosted` 参与，其余计入 `skipped_repos`。进度锁临界区只更新内存态、不持锁做 IO（锁外做 IO）。
+/// 形参同上，另加 `progress` 进度共享态（任务执行期间持续更新，供查询端点读取）。仅 hosted 且格式在
+/// 白名单（`maven` / `raw` / `npm`）内参与，其余计入 `skipped_repos`。进度锁临界区只更新内存态、
+/// 不持锁做 IO（锁外做 IO）。
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_online_with_progress<C, S, U>(
     client: &C,
@@ -270,16 +291,21 @@ where
         }
 
         let src = &sel.source;
-        // 范围：仅 maven2 hosted；其余格式 / 类型整体跳过，不越界建仓
-        if src.r#type != "hosted" || map_nexus_format(&src.format) != Some("maven") {
+        // 范围：仅 hosted 且格式在在线搬运白名单（Maven / Raw / npm）内；其余格式 / 类型整体跳过，
+        // 不越界建仓（proxy 在线只迁配置不搬缓存，未支持格式含 Docker/OCI 走 FR-144）
+        let Some(target_format) = (if src.r#type == "hosted" {
+            online_hosted_format(&src.format)
+        } else {
+            None
+        }) else {
             tracing::info!(
                 仓库 = %src.name, 源格式 = %src.format, 类型 = %src.r#type,
-                "非 Maven hosted，跳过在线拉取迁移"
+                "非受支持 hosted 格式，跳过在线拉取迁移"
             );
             report.skipped_repos.push(src.name.clone());
             lock_progress(progress).skipped_repos.push(src.name.clone());
             continue;
-        }
+        };
 
         {
             let mut p = lock_progress(progress);
@@ -288,8 +314,8 @@ where
             p.current_path = None;
         }
 
-        // 建 / 复用目标 hosted 仓库（名取 target_repo，允许与源不同名）
-        let (repo, created) = ensure_hosted_repo(meta, &sel.target_repo, "maven").await?;
+        // 建 / 复用目标 hosted 仓库（名取 target_repo，允许与源不同名；格式取映射后的白名单格式）
+        let (repo, created) = ensure_hosted_repo(meta, &sel.target_repo, target_format).await?;
 
         let pulled = pull_repo_assets(
             client, artifacts, formats, base, &src.name, &repo, credential, max_size, progress,
@@ -298,15 +324,15 @@ where
         .await?;
 
         tracing::info!(
-            源仓库 = %src.name, 目标仓库 = %sel.target_repo,
+            源仓库 = %src.name, 目标仓库 = %sel.target_repo, 格式 = %target_format,
             新建 = created, 已搬运 = pulled.migrated, 增量跳过 = pulled.skipped_existing,
             失败跳过 = pulled.skipped, 已取消 = pulled.cancelled,
-            "Maven hosted 仓库在线拉取迁移结束"
+            "hosted 仓库在线拉取迁移结束"
         );
         let outcome = OnlineRepoMigrationOutcome {
             source_repo: src.name.clone(),
             target_repo: sel.target_repo.clone(),
-            format: "maven".to_string(),
+            format: target_format.to_string(),
             created,
             migrated_artifacts: pulled.migrated,
             skipped_existing_artifacts: pulled.skipped_existing,
@@ -602,7 +628,7 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
-    use crate::format::{ArtifactCoordinates, MavenFormat, RawFormat};
+    use crate::format::{ArtifactCoordinates, MavenFormat, NpmFormat, RawFormat};
     use crate::proxy::{Upstream, UpstreamBody, UpstreamError};
     use crate::storage::LocalFsStore;
 
@@ -670,6 +696,7 @@ mod tests {
         let mut formats = FormatRegistry::new();
         formats.register(Box::new(RawFormat));
         formats.register(Box::new(MavenFormat));
+        formats.register(Box::new(NpmFormat));
         (meta, svc, formats, dir)
     }
 
@@ -892,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 非maven或非hosted整体跳过不建仓() {
+    async fn proxy或未支持格式整体跳过不建仓() {
         let (meta, svc, formats, _d) = 新建().await;
         let client = MockOnline {
             pages: vec![],
@@ -906,10 +933,10 @@ mod tests {
             "https://nx",
             None,
             &[
-                // maven proxy（非 hosted）
+                // maven proxy（非 hosted）：在线只迁配置不搬缓存，此路径整体跳过
                 sel(src("maven-central", "maven2", "proxy"), "maven-central"),
-                // npm hosted（非 maven）
-                sel(src("npm-release", "npm", "hosted"), "npm-release"),
+                // cargo hosted（在线搬运未支持格式，FR-143 只扩 raw/npm）：整体跳过
+                sel(src("cargo-hosted", "cargo", "hosted"), "cargo-hosted"),
             ],
             None,
         )
@@ -918,12 +945,166 @@ mod tests {
 
         assert!(report.repos.is_empty());
         assert!(report.skipped_repos.contains(&"maven-central".to_string()));
-        assert!(report.skipped_repos.contains(&"npm-release".to_string()));
+        assert!(report.skipped_repos.contains(&"cargo-hosted".to_string()));
         assert!(meta
             .get_repository_by_name("maven-central")
             .await
             .unwrap()
             .is_none());
+        assert!(meta
+            .get_repository_by_name("cargo-hosted")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// raw hosted 在线拉取：枚举 → 流式下载 → sha256 校验 → 落为 raw hosted 制品，
+    /// 结果 format 如实为 raw（不再恒为 maven）。
+    #[tokio::test]
+    async fn raw_hosted_在线拉取落制品并校验sha256() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let url = "https://nx/repository/raw3d/dir/file.bin";
+        let page = format!(
+            r#"{{ "items": [ {{ "assets": [
+                {{ "path": "dir/file.bin", "downloadUrl": "{url}", "checksum": {{ "sha256": "{FIXTURE_SHA256}" }} }}
+            ]}} ], "continuationToken": null }}"#
+        );
+        let client = MockOnline {
+            pages: vec![page],
+            assets: HashMap::from([(url.to_string(), FIXTURE.to_vec())]),
+        };
+
+        let report = migrate_online_repositories(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx/",
+            None,
+            &[sel(src("raw3d", "raw", "hosted"), "raw3d")],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.repos.len(), 1);
+        let o = &report.repos[0];
+        assert!(o.created);
+        assert_eq!(o.format, "raw", "结果格式应如实为 raw");
+        assert_eq!(o.migrated_artifacts, 1);
+        assert_eq!(o.skipped_artifacts, 0);
+
+        // 目标仓库按 raw 格式建为 hosted，制品字节一致可读回
+        let repo = meta.get_repository_by_name("raw3d").await.unwrap().unwrap();
+        assert_eq!(repo.r#type, "hosted");
+        assert_eq!(repo.format, "raw");
+        let coords = ArtifactCoordinates {
+            path: "dir/file.bin".to_string(),
+        };
+        let svc = Arc::new(svc);
+        let (mut h, _) = svc.get(&repo, &RawFormat, &coords).await.unwrap();
+        let mut buf = Vec::new();
+        h.blob.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, FIXTURE);
+    }
+
+    /// npm hosted 在线拉取：tarball 与 packument 两类 asset 均按普通仓库内路径搬入，
+    /// 结果 format 如实为 npm。
+    #[tokio::test]
+    async fn npm_hosted_在线拉取落tarball与packument() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let tarball_url = "https://nx/repository/npm3d/lib/-/lib-1.0.0.tgz";
+        let packument_url = "https://nx/repository/npm3d/lib";
+        let page = format!(
+            r#"{{ "items": [ {{ "assets": [
+                {{ "path": "lib/-/lib-1.0.0.tgz", "downloadUrl": "{tarball_url}", "checksum": {{}} }},
+                {{ "path": "lib", "downloadUrl": "{packument_url}", "checksum": {{}} }}
+            ]}} ], "continuationToken": null }}"#
+        );
+        let client = MockOnline {
+            pages: vec![page],
+            assets: HashMap::from([
+                (tarball_url.to_string(), b"tarball-bytes".to_vec()),
+                (packument_url.to_string(), b"{\"name\":\"lib\"}".to_vec()),
+            ]),
+        };
+
+        let report = migrate_online_repositories(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &[sel(src("npm3d", "npm", "hosted"), "npm3d")],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let o = &report.repos[0];
+        assert_eq!(o.format, "npm", "结果格式应如实为 npm");
+        assert_eq!(o.migrated_artifacts, 2, "tarball 与 packument 均应搬入");
+        assert_eq!(o.skipped_artifacts, 0);
+
+        let repo = meta.get_repository_by_name("npm3d").await.unwrap().unwrap();
+        assert_eq!(repo.format, "npm");
+        assert!(meta
+            .list_artifacts_by_repo(&repo.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.path == "lib/-/lib-1.0.0.tgz"));
+    }
+
+    /// raw hosted 二次同 sha256：计增量跳过而非新搬（复用 FR-134 幂等引擎）。
+    #[tokio::test]
+    async fn raw_hosted_二次同sha256增量跳过() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let url = "https://nx/repository/raw3d/a.bin";
+        let page = format!(
+            r#"{{ "items": [ {{ "assets": [
+                {{ "path": "a.bin", "downloadUrl": "{url}", "checksum": {{ "sha256": "{FIXTURE_SHA256}" }} }}
+            ]}} ], "continuationToken": null }}"#
+        );
+        let client = MockOnline {
+            pages: vec![page],
+            assets: HashMap::from([(url.to_string(), FIXTURE.to_vec())]),
+        };
+        let selection = [sel(src("raw3d", "raw", "hosted"), "raw3d")];
+
+        let first = migrate_online_repositories(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &selection,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.repos[0].migrated_artifacts, 1);
+        assert_eq!(first.repos[0].skipped_existing_artifacts, 0);
+
+        let second = migrate_online_repositories(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            "https://nx",
+            None,
+            &selection,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.repos[0].migrated_artifacts, 0, "二次跑无新写入");
+        assert_eq!(
+            second.repos[0].skipped_existing_artifacts, 1,
+            "二次跑应计增量跳过"
+        );
     }
 
     #[tokio::test]
@@ -1141,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 非maven仓库计入进度的skipped_repos() {
+    async fn 未支持格式仓库计入进度的skipped_repos() {
         let (meta, svc, formats, _d) = 新建().await;
         let client = MockOnline {
             pages: vec![],
@@ -1149,6 +1330,7 @@ mod tests {
         };
         let progress = std::sync::Mutex::new(OnlinePullProgress::default());
         let control = JobControl::default();
+        // cargo hosted 属在线搬运未支持格式（FR-143 只扩 raw/npm）→ 整体跳过、计入 skipped_repos
         let _ = migrate_online_with_progress(
             &client,
             &meta,
@@ -1156,7 +1338,7 @@ mod tests {
             &formats,
             "https://nx",
             None,
-            &[sel(src("npm-release", "npm", "hosted"), "npm-release")],
+            &[sel(src("cargo-hosted", "cargo", "hosted"), "cargo-hosted")],
             None,
             &progress,
             &control,
@@ -1164,7 +1346,7 @@ mod tests {
         .await
         .unwrap();
         let p = progress.lock().unwrap();
-        assert!(p.skipped_repos.contains(&"npm-release".to_string()));
+        assert!(p.skipped_repos.contains(&"cargo-hosted".to_string()));
         assert_eq!(p.total_assets, 0);
     }
 
