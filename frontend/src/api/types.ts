@@ -437,6 +437,44 @@ export interface MigrationReport {
   skipped_repos: string[];
 }
 
+// —— 离线仓库索引双通道（FR-141，ADR-0041） ——
+
+/**
+ * 索引项格式来源（FR-141）：权威（源 Nexus REST 取回）或推断（离线内容路径启发式）。
+ * 严格对齐后端 FormatSource（src/migrate/index.rs，serde 小写）。
+ */
+export type FormatSource = 'authoritative' | 'inferred';
+
+/**
+ * 统一仓库索引项（FR-141）：双通道输出同一结构，供向导多选与后续搬运消费。
+ * 严格对齐后端 RepoIndexEntry（src/migrate/index.rs）。
+ * `name` / `blob_count` / `total_size` 取自离线扫描；`format` / `format_source` / `type` /
+ * `upstream_url` 视通道而定——权威通道取 REST 配置、类型 / 上游有值；推断通道类型 / 上游为 null，
+ * 由管理员在向导补填。
+ */
+export interface RepoIndexEntry {
+  name: string;
+  format: string;
+  format_source: FormatSource;
+  /** 仓库类型（hosted / proxy）；仅权威通道有值，推断通道为 null。 */
+  type: string | null;
+  blob_count: number;
+  total_size: number;
+  /** proxy 上游地址；仅权威通道的 proxy 有值，其余为 null。 */
+  upstream_url: string | null;
+}
+
+/**
+ * 离线仓库索引双通道请求体（FR-141）。
+ * `base_url` 给定且可达时走权威通道取仓库配置（格式 / 类型 / 上游）；未填或不可达时回退纯离线推断。
+ * `auth_ref` 仅引用，真值走后端 env，不入库、不回显。严格对齐后端 NexusOfflineIndexRequest。
+ */
+export interface NexusOfflineIndexRequest {
+  path: string;
+  base_url?: string | null;
+  auth_ref?: string | null;
+}
+
 /** 在线预览请求体（auth_ref 仅引用，凭据真值走后端 env，不入库不回显）。 */
 export interface NexusPreviewRequest {
   base_url: string;
@@ -523,12 +561,7 @@ export interface MigrationJobCreated {
  * 严格对齐后端 phase 字段取值。
  */
 export type OnlinePullPhase =
-  | 'enumerating'
-  | 'downloading'
-  | 'paused'
-  | 'cancelled'
-  | 'done'
-  | 'failed';
+  'enumerating' | 'downloading' | 'paused' | 'cancelled' | 'done' | 'failed';
 
 /**
  * 在线拉取任务进度快照（GET /migrate/jobs/{id}）。
@@ -565,6 +598,11 @@ export interface OnlinePullJob {
    * 在线拉取任务无此字段。严格对齐后端 OnlinePullProgress.offline_preview。
    */
   offline_preview?: OfflineRepoSummary[];
+  /**
+   * 离线仓库索引双通道枚举结果（FR-141）：仅离线索引任务在 `phase === 'done'` 时填充；
+   * 其他任务无此字段。严格对齐后端 OnlinePullProgress.repo_index。
+   */
+  repo_index?: RepoIndexEntry[];
 }
 
 /**
@@ -830,13 +868,7 @@ export type UpdateKind = 'check' | 'apply' | 'rollback';
 
 /** 更新任务阶段（FR-126）：按阶段反馈，不做字节级假百分比。 */
 export type UpdatePhase =
-  | 'checking'
-  | 'downloading'
-  | 'verifying'
-  | 'replacing'
-  | 'restarting'
-  | 'done'
-  | 'failed';
+  'checking' | 'downloading' | 'verifying' | 'replacing' | 'restarting' | 'done' | 'failed';
 
 /** 更新任务进度快照（GET /api/v1/update/jobs/{id}，FR-126）。 */
 export interface UpdateJob {
@@ -935,4 +967,66 @@ export interface TaskDetailDto extends TaskRecord {
   migration?: OnlinePullJob;
   /** 更新进度明细（仅 kind==='update' 且专表仍有记录时填）。 */
   update?: UpdateJob;
+}
+
+// —— 迁移历史与报告持久化（FR-140，ADR-0040，消费 GET /migrate/tasks 系列） ——
+
+/** 迁移任务类别（与后端 MigrationTaskKind 序列化对齐）。 */
+export type MigrationTaskKind = 'online' | 'offline_proxy' | 'offline_hosted';
+
+/**
+ * 迁移历史任务状态（FR-140）：在统一 TaskState 之上多一个 `interrupted`——
+ * 进程重启时残留的在途（running / paused）任务被归一为已中断。
+ */
+export type MigrationHistoryState =
+  'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+
+/**
+ * 迁移历史任务记录（GET /migrate/tasks 列表项；GET /migrate/tasks/{id} 展平字段）。
+ * 严格对齐后端 MigrationTaskDto（src/api/migrate.rs）。时间字段为 RFC3339 字符串。
+ */
+export interface MigrationTaskDto {
+  id: string;
+  kind: MigrationTaskKind;
+  state: MigrationHistoryState;
+  label: string | null;
+  phase: string;
+  total_assets: number;
+  done_assets: number;
+  migrated: number;
+  /** 增量跳过数（已存在且 sha256 一致）。 */
+  skipped_existing: number;
+  /** 失败跳过数。 */
+  skipped: number;
+  total_bytes: number;
+  done_bytes: number;
+  migrated_bytes: number;
+  skipped_bytes: number;
+  error: string | null;
+  started_at: string;
+  updated_at: string;
+  /** 终态时刻（未结束为 null）；与 started_at 之差即耗时。 */
+  finished_at: string | null;
+}
+
+/**
+ * 迁移历史分仓库报告项（GET /migrate/tasks/{id} 的 repos）。
+ * 严格对齐后端 MigrationRepoReportDto（src/api/migrate.rs）。
+ */
+export interface MigrationRepoReportDto {
+  source_repo: string;
+  target_repo: string;
+  format: string;
+  created: boolean;
+  migrated_artifacts: number;
+  skipped_existing_artifacts: number;
+  skipped_artifacts: number;
+}
+
+/**
+ * 迁移历史任务详情（GET /migrate/tasks/{id}）：任务记录展平 + 分仓库报告。
+ * 严格对齐后端 MigrationTaskDetailDto（task 字段 flatten）。
+ */
+export interface MigrationTaskDetailDto extends MigrationTaskDto {
+  repos: MigrationRepoReportDto[];
 }

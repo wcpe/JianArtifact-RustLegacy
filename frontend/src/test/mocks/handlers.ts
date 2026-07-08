@@ -13,10 +13,15 @@ import type {
   DynamicConfig,
   GroupAclView,
   GroupView,
+  MigrationRepoReportDto,
+  MigrationTaskDto,
+  MigrationTaskKind,
+  MigrationHistoryState,
   OnlinePullJob,
   Paginated,
   Permission,
   ProtectionConfig,
+  RepoIndexEntry,
   SearchHit,
   TaskRecord,
   UpdateRepositoryRequest,
@@ -82,6 +87,7 @@ function cloneMigrationJob(job: OnlinePullJob): OnlinePullJob {
       ...repo,
       blobs: repo.blobs.map((blob) => ({ ...blob })),
     })),
+    repo_index: job.repo_index?.map((entry) => ({ ...entry })),
   };
 }
 
@@ -148,6 +154,86 @@ function createMigrationJob(
     advancingMigrationJobReads.set(jobId, 0);
   }
   return job;
+}
+
+/** mock 离线索引双通道样本（FR-141）：混合权威（type/upstream 有值）与推断（type/upstream 为 null）项。 */
+const 索引样本: RepoIndexEntry[] = [
+  {
+    name: 'maven-central',
+    format: 'maven',
+    format_source: 'authoritative',
+    type: 'proxy',
+    blob_count: 3,
+    total_size: 6144,
+    upstream_url: 'https://repo1.maven.org/maven2/',
+  },
+  {
+    name: 'raw-hosted',
+    format: 'raw',
+    format_source: 'inferred',
+    type: null,
+    blob_count: 2,
+    total_size: 4096,
+    upstream_url: null,
+  },
+];
+
+/** 构造 mock 离线索引任务（FR-141）：终态 done、携带 repo_index 双通道样本，不搬运制品。 */
+function createIndexJob(): OnlinePullJob {
+  const job = createMigrationJob('离线仓库索引');
+  job.repos = [];
+  job.repo_index = 索引样本.map((entry) => ({ ...entry }));
+  return job;
+}
+
+/** mock 迁移任务 kind 推断：据标签映射到持久化历史 kind（FR-140）。 */
+function migrationHistoryKind(label: string): MigrationTaskKind {
+  if (label.includes('proxy')) {
+    return 'offline_proxy';
+  }
+  if (label.includes('hosted')) {
+    return 'offline_hosted';
+  }
+  return 'online';
+}
+
+/** mock 迁移任务转持久化历史 DTO（FR-140，GET /migrate/tasks 列表项 / 详情展平字段）。 */
+function migrationHistoryDto(job: OnlinePullJob): MigrationTaskDto {
+  const record = migrationTaskRecord(job);
+  const state: MigrationHistoryState = record.state;
+  return {
+    id: job.job_id,
+    kind: migrationHistoryKind(record.label ?? ''),
+    state,
+    label: record.label ?? null,
+    phase: job.phase,
+    total_assets: job.total_assets,
+    done_assets: job.done_assets,
+    migrated: job.migrated,
+    skipped_existing: job.skipped_existing ?? 0,
+    skipped: job.skipped,
+    total_bytes: job.total_bytes ?? 0,
+    done_bytes: job.done_bytes ?? 0,
+    migrated_bytes: job.migrated_bytes ?? 0,
+    skipped_bytes: job.skipped_bytes ?? 0,
+    error: job.error,
+    started_at: '2026-07-01T00:00:00Z',
+    updated_at: '2026-07-01T00:01:00Z',
+    finished_at: record.finished_at !== undefined ? '2026-07-01T00:01:00Z' : null,
+  };
+}
+
+/** mock 迁移任务的分仓库报告项（FR-140，GET /migrate/tasks/{id} 的 repos）。 */
+function migrationRepoReports(job: OnlinePullJob): MigrationRepoReportDto[] {
+  return job.repos.map((repo) => ({
+    source_repo: repo.source_repo,
+    target_repo: repo.target_repo,
+    format: repo.format,
+    created: repo.created,
+    migrated_artifacts: repo.migrated_artifacts,
+    skipped_existing_artifacts: repo.skipped_existing_artifacts ?? 0,
+    skipped_artifacts: repo.skipped_artifacts,
+  }));
 }
 
 /** 从迁移请求中读取用户选择的首个仓库名，用于让 mock 报告与前端选择保持一致。 */
@@ -932,6 +1018,15 @@ export const handlers = [
     return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
   }),
 
+  // 离线仓库索引双通道（FR-141）：异步 job，终态 repo_index 携带权威 + 推断样本。
+  http.post(`${API}/migrate/nexus/offline/index`, ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const job = createIndexJob();
+    state.migrationJobs.push(job);
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
   http.post(`${API}/migrate/nexus/proxy/migrate`, async ({ request }) => {
     const guard = requireUser(request, { admin: true });
     if (isResponse(guard)) return guard;
@@ -956,6 +1051,46 @@ export const handlers = [
     // 发起异步任务：先返回进行中快照，随后自动推进完成，便于验证任务页续看。
     const repoName = await firstRequestedRepository(request, 'maven-internal');
     const job = createMigrationJob('在线拉取导入队列', { repoName, running: true });
+    state.migrationJobs.push(job);
+    return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
+  }),
+
+  // —— 迁移历史与报告持久化（FR-140，仅 Admin） ——
+  // 历史列表只含真正的搬运任务（排除纯预览 / 索引枚举任务），按起始倒序。
+  http.get(`${API}/migrate/tasks`, ({ request }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const history = state.migrationJobs
+      .filter((job) => {
+        const label = migrationJobLabels.get(job.job_id) ?? '';
+        return !label.includes('预览') && !label.includes('索引');
+      })
+      .map(migrationHistoryDto)
+      .reverse();
+    return HttpResponse.json(history);
+  }),
+
+  http.get(`${API}/migrate/tasks/:id`, ({ request, params }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const job = state.migrationJobs.find((j) => j.job_id === params.id);
+    if (!job) return error(404, 'not_found', '任务不存在');
+    const snapshot = cloneMigrationJob(job);
+    return HttpResponse.json({
+      ...migrationHistoryDto(snapshot),
+      repos: migrationRepoReports(snapshot),
+    });
+  }),
+
+  // 一键幂等重跑：造新搬运 job，返回新 job_id（202）。
+  http.post(`${API}/migrate/tasks/:id/rerun`, ({ request, params }) => {
+    const guard = requireUser(request, { admin: true });
+    if (isResponse(guard)) return guard;
+    const original = state.migrationJobs.find((j) => j.job_id === params.id);
+    if (!original) return error(404, 'not_found', '任务不存在');
+    const label = migrationJobLabels.get(original.job_id) ?? '迁移重跑';
+    const repoName = original.repos[0]?.source_repo ?? 'maven-internal';
+    const job = createMigrationJob(label, { repoName, running: true });
     state.migrationJobs.push(job);
     return HttpResponse.json({ job_id: job.job_id }, { status: 202 });
   }),

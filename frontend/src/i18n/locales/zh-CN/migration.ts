@@ -7,12 +7,14 @@ export default {
 
   // 步骤条（Stepper.Step 的 label / description）
   step: {
-    sourceLabel: '选源与预览',
+    sourceLabel: '选源与加载',
     sourceDesc: '在线填源地址，离线填本地路径',
-    selectLabel: '勾选执行',
-    selectDesc: '选仓库、选方式并搬运',
-    reportLabel: '迁移报告',
-    reportDesc: '查看结果',
+    selectLabel: '勾选仓库',
+    selectDesc: '选仓库、改名、补填推断项',
+    planLabel: '确认计划',
+    planDesc: '核对执行计划后开始',
+    reportLabel: '执行与报告',
+    reportDesc: '查看进度与结果',
   },
 
   // 源形态切换（SegmentedControl）
@@ -35,6 +37,10 @@ export default {
     authRefPlaceholder: '例如 NEXUS_SRC',
     offlinePathLabel: '离线 blob store 路径',
     offlinePathDesc: '服务进程可访问的本地 Nexus 文件型 blob store 根目录。',
+    offlineBaseUrlLabel: '源 Nexus 地址（可选，权威通道）',
+    offlineBaseUrlDesc:
+      '可选填源 Nexus REST 地址；可达时取权威仓库配置（格式 / 类型 / 上游），否则回退按内容路径推断。',
+    offlineBaseUrlPlaceholder: 'https://nexus.example（留空则纯离线推断）',
     migratePathLabel: '离线 blob store 路径（制品本体来源）',
     migratePathDesc: '搬运需从离线 blob store 读取制品本体，其下应含 content/ 子目录。',
     targetRepoAria: '{{name}} 目标仓库名',
@@ -51,19 +57,32 @@ export default {
     failed: '失败',
   },
 
-  // 预览结果区
+  // 预览 / 索引加载结果区
   preview: {
     button: '预览仓库',
-    next: '下一步：勾选执行',
+    // 离线入口：加载仓库索引（双通道）
+    indexButton: '加载仓库索引',
+    next: '下一步：勾选仓库',
     count: '可迁移仓库（{{count}}）',
     thRepo: '仓库',
     thFormat: '格式',
     thDetail: '类型 / 内容',
+    thSource: '格式来源',
+    thType: '类型',
+    thBlobCount: 'blob 数',
+    thSize: '大小',
+    thUpstream: '上游',
     // 离线预览行的内容文案（blob 数量）
     blobCount: '{{count}} 个 blob',
+    // 格式来源徽章（FR-141 双通道）
+    sourceAuthoritative: '权威',
+    sourceInferred: '推断',
     // FR-124 离线预览异步化：枚举任务超时 / 失败提示
     timeout: '离线预览任务超时（blob store 可能过大），请稍后重试或缩小目录',
     failed: '离线预览枚举失败，请检查 blob store 路径与目录结构',
+    // FR-141 索引加载超时 / 失败
+    indexTimeout: '仓库索引加载超时（blob store 可能过大），请稍后重试或缩小目录',
+    indexFailed: '仓库索引加载失败，请检查 blob store 路径与目录结构',
   },
 
   // 勾选与执行区
@@ -82,6 +101,62 @@ export default {
     activeMigrationBlocked: '已有迁移任务在途，请在任务中心或本页续看',
     offlineFootnote:
       '离线搬运只读取本地 blob store，不需要源 Nexus 地址或凭据；proxy 搬运缓存制品，hosted 搬运完整制品。',
+    // FR-141 推断项补填：类型由管理员选，proxy 需补上游
+    inferredHint:
+      '「推断」项的仓库类型由内容路径猜得，请为勾选的推断项确认类型（proxy 需补上游）。',
+    typeLabel: '类型',
+    typeAria: '{{name}} 仓库类型',
+    typeProxy: 'proxy',
+    typeHosted: 'hosted',
+    typePlaceholder: '选类型',
+    upstreamAria: '{{name}} 上游地址',
+    upstreamPlaceholder: 'proxy 上游 URL（可选）',
+    nextPlan: '下一步：确认计划',
+    inferredNeedsType: '有勾选的推断仓库尚未确认类型，请先补填后再继续。',
+  },
+
+  // 执行计划确认区（FR-142）
+  plan: {
+    title: '执行计划',
+    intro: '核对以下计划后开始迁移。目标已存在且 sha256 一致的制品会被幂等跳过。',
+    thSource: '源仓库',
+    thTarget: '目标仓库',
+    thMethod: '方式',
+    thType: '类型',
+    thUpstream: '上游',
+    methodOnline: '在线拉取',
+    methodProxy: 'proxy 搬运',
+    methodHosted: 'hosted 搬运',
+    prevStep: '上一步',
+    start: '开始迁移',
+    empty: '未选择任何仓库。',
+    upstreamNote: '上游仅作展示与运维参考，不随本次搬运下发（P1 建仓后由运维配置）。',
+  },
+
+  // 迁移历史区（FR-140 持久化）
+  history: {
+    title: '迁移历史',
+    refresh: '刷新',
+    empty: '暂无迁移历史。',
+    loadError: '加载迁移历史失败',
+    thTask: '任务',
+    thState: '状态',
+    thStarted: '开始时间',
+    thFinished: '完成时间',
+    view: '查看报告',
+    rerun: '重跑续传',
+    rerunStarted: '重跑任务已发起，正在导入',
+    detailTitle: '分仓库报告',
+    detailError: '加载报告失败',
+    kindOnline: '在线拉取',
+    kindOfflineProxy: '离线 proxy',
+    kindOfflineHosted: '离线 hosted',
+    stateRunning: '运行中',
+    statePaused: '已暂停',
+    stateSucceeded: '已完成',
+    stateFailed: '失败',
+    stateCancelled: '已取消',
+    stateInterrupted: '已中断',
   },
 
   // 迁移报告区
@@ -123,6 +198,9 @@ export default {
     offlinePreviewTitle: '离线预览',
     offlinePreviewSummary: '离线预览已完成：共 {{repos}} 个仓库、{{blobs}} 个 blob。',
     offlinePreviewNoRepos: '离线预览已完成，但未发现可迁移仓库。',
+    indexTitle: '离线仓库索引',
+    indexSummary: '仓库索引已加载：共 {{repos}} 个仓库。',
+    indexNoRepos: '仓库索引已加载，但未发现可迁移仓库。',
     migrated: '新搬 {{count}}',
     skipped: '已跳过 {{count}}',
     skippedExisting: '已存在跳过 {{count}}',

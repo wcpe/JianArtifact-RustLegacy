@@ -1,12 +1,13 @@
-// Nexus 迁移管理页面（FR-81 / FR-82，对接 ADR-0006 已有迁移端点，仅 Admin）。
+// Nexus 迁移向导（FR-142，重构 FR-81/82；消费 FR-140 持久化 + FR-141 索引双通道，仅 Admin）。
 //
-// 多步流程（Mantine Stepper）：
-//   ① 选迁移形态（在线 REST / 离线 blob store）+ 填源 → 预览可迁移仓库列表（不搬运）。
-//   ② 勾选要搬运的仓库 + 选迁移方式：
-//        · 在线拉取（FR-82）：经 REST 枚举 + HTTP 下载同步，无需离线目录；
-//          可为每个仓库选填目标仓库名（默认与源同名）；仅 maven2 hosted 有效。
-//        · 离线目录（FR-81）：填离线 blob store 路径，执行 proxy / hosted 搬运。
-//   ③ 展示迁移报告（每仓库已迁 / 跳过数、整仓跳过列表）。
+// 统一向导（Mantine Stepper）：
+//   ① 源配置：在线填源地址 / 离线填本地路径（离线可选填源地址走权威通道）→ 加载仓库索引 / 预览。
+//   ② 勾选仓库：多选、目标改名（在线）、推断项补填类型与上游（离线 FR-141）。
+//   ③ 确认执行计划：核对源→目标 / 方式 / 类型 / 上游后开始迁移。
+//   ④ 执行与报告：轮询进度队列（暂停 / 继续 / 取消），终态展示分仓库报告。
+//
+// 执行中刷新 / 离开回来：经 URL job_id / 本地存档 / 服务端活跃任务恢复到进度视图。
+// 完成后历史报告可回看：消费 GET /migrate/tasks（含 interrupted）与详情，支持一键幂等重跑。
 //
 // 凭据脱敏（红线）：源 Nexus 凭据仅以「引用名 auth_ref」形式输入，用口令型输入框承载、
 // 真值在后端 env 解析，前端绝不回显明文、不持久化。
@@ -23,6 +24,7 @@ import {
   SegmentedControl,
   TextInput,
   PasswordInput,
+  Select,
   Button,
   Group,
   Table,
@@ -37,16 +39,17 @@ import {
 import * as api from '../api/endpoints';
 import { ApiError } from '../api/client';
 import type {
-  MigrationReport,
+  FormatSource,
   NexusRepoSummary,
-  OfflineRepoSummary,
   OnlinePullJob,
+  RepoIndexEntry,
   TaskDetailDto,
   TaskRecord,
 } from '../api/types';
 import { errorMessage, formatBytes } from '../lib/format';
 import { ErrorAlert } from '../components/ErrorAlert';
 import { notifySuccess } from '../lib/notify';
+import { MigrationHistoryPanel } from './MigrationHistory';
 
 /** 迁移形态：在线 REST 入口 / 离线 blob store 入口。 */
 type SourceMode = 'online' | 'offline';
@@ -54,27 +57,49 @@ type SourceMode = 'online' | 'offline';
 /** 离线目录搬运目标类型：proxy 仓库 / hosted 仓库。 */
 type MigrateKind = 'proxy' | 'hosted';
 
-/** 预览到的仓库名集合（在线与离线归一为「仓库名 + 类型/计数」用于展示与勾选）。 */
+/**
+ * 归一后的可选择仓库行（在线预览与离线索引统一为一种结构，供勾选 / 计划 / 搬运消费）。
+ */
 interface PreviewRow {
-  /** 仓库名（在线取 name，离线取 repo_name）。 */
+  /** 仓库名（在线取 name，离线取索引 name）。 */
   name: string;
-  /** 在线：格式；离线：'-'。 */
+  /** 本系统格式名（maven / npm / docker / raw…）。 */
   format: string;
-  /** 在线：hosted/proxy；离线：blob 数量文案。 */
-  detail: string;
+  /** 格式来源（FR-141；在线一律 authoritative）。 */
+  formatSource: FormatSource;
+  /** 仓库类型（hosted / proxy）；离线推断项为 null，待补填。 */
+  type: MigrateKind | null;
+  /** proxy 上游地址（可空）。 */
+  upstreamUrl: string | null;
+  /** 离线 blob 数（在线为 null）。 */
+  blobCount: number | null;
+  /** 离线总大小字节（在线为 null）。 */
+  totalSize: number | null;
 }
 
-/** 把在线预览结果归一为展示行。 */
+/** 把在线预览结果归一为展示行（在线一律权威、类型取 Nexus 原值）。 */
 function fromOnline(repos: NexusRepoSummary[]): PreviewRow[] {
-  return repos.map((r) => ({ name: r.name, format: r.format, detail: r.type }));
+  return repos.map((r) => ({
+    name: r.name,
+    format: r.format,
+    formatSource: 'authoritative',
+    type: r.type === 'proxy' ? 'proxy' : r.type === 'hosted' ? 'hosted' : null,
+    upstreamUrl: r.upstream_url,
+    blobCount: null,
+    totalSize: null,
+  }));
 }
 
-/** 把离线预览结果归一为展示行（t 由调用方组件传入，模块级函数自身无法使用 hook）。 */
-function fromOffline(repos: OfflineRepoSummary[], t: TFunction): PreviewRow[] {
-  return repos.map((r) => ({
-    name: r.repo_name,
-    format: '-',
-    detail: t('preview.blobCount', { count: r.blob_count }),
+/** 把离线索引双通道结果归一为展示行（FR-141）。 */
+function fromIndex(entries: RepoIndexEntry[]): PreviewRow[] {
+  return entries.map((e) => ({
+    name: e.name,
+    format: e.format,
+    formatSource: e.format_source,
+    type: e.type === 'proxy' ? 'proxy' : e.type === 'hosted' ? 'hosted' : null,
+    upstreamUrl: e.upstream_url,
+    blobCount: e.blob_count,
+    totalSize: e.total_size,
   }));
 }
 
@@ -89,16 +114,16 @@ function isTerminalPhase(phase: OnlinePullJob['phase']): boolean {
   return phase === 'done' || phase === 'failed' || phase === 'cancelled';
 }
 
-/** 统一任务注册表中的离线预览任务：对外 kind 仍是 migration，但不参与搬运单飞。 */
-function isOfflinePreviewTask(task: TaskRecord): boolean {
-  return task.kind === 'migration' && task.label === '离线预览';
+/** 统一任务注册表中的离线枚举任务（预览 / 索引）：对外 kind 仍是 migration，但不参与搬运单飞。 */
+function isOfflineEnumTask(task: TaskRecord): boolean {
+  return task.kind === 'migration' && (task.label === '离线预览' || task.label === '离线仓库索引');
 }
 
 /** 统一任务注册表中仍在途的迁移搬运任务：运行中或暂停中均需前端单飞。 */
 function isActiveMigrationTask(task: TaskRecord): boolean {
   return (
     task.kind === 'migration' &&
-    !isOfflinePreviewTask(task) &&
+    !isOfflineEnumTask(task) &&
     (task.state === 'running' || task.state === 'paused')
   );
 }
@@ -145,23 +170,13 @@ async function loadMigrationProgressJob(jobId: string): Promise<OnlinePullJob> {
   return api.getMigrationJob(jobId);
 }
 
-/** 离线预览与迁移搬运共用同一进度读取入口，保证任务跳转后视图一致。 */
-async function loadOfflinePreviewJob(jobId: string): Promise<OnlinePullJob> {
-  return loadMigrationProgressJob(jobId);
-}
-
-/** 是否是离线预览任务：以任务标签或摘要字段识别，避免把预览终态当成搬运报告。 */
-function isOfflinePreviewJob(job: OnlinePullJob, title: string | null | undefined, t: TFunction) {
-  return job.offline_preview !== undefined || title === t('job.offlinePreviewTitle');
-}
-
 /**
- * 轮询离线预览任务直到终态（FR-124）。返回终态快照；超时返回 null。
+ * 轮询离线枚举任务（预览 / 索引）直到终态。返回终态快照；超时返回 null。
  * 间隔 800ms、上限约 5 分钟（上万 blob 枚举可能较久）。
  */
-async function pollOfflinePreview(jobId: string): Promise<OnlinePullJob | null> {
+async function pollEnumJob(jobId: string): Promise<OnlinePullJob | null> {
   for (let i = 0; i < 375; i++) {
-    const job = await loadOfflinePreviewJob(jobId);
+    const job = await loadMigrationProgressJob(jobId);
     if (isTerminalPhase(job.phase)) {
       return job;
     }
@@ -229,7 +244,7 @@ function migrationSummary(job: OnlinePullJob) {
   };
 }
 
-/** Nexus 迁移管理页面。 */
+/** Nexus 迁移向导页。 */
 export function MigrationPage() {
   const { t } = useTranslation('migration');
   const [searchParams] = useSearchParams();
@@ -241,56 +256,51 @@ export function MigrationPage() {
   const [baseUrl, setBaseUrl] = useState('');
   const [authRef, setAuthRef] = useState('');
   const [offlinePath, setOfflinePath] = useState('');
+  // 离线入口的可选源地址 / 凭据引用（走权威通道，FR-141）。
+  const [offlineBaseUrl, setOfflineBaseUrl] = useState('');
+  const [offlineAuthRef, setOfflineAuthRef] = useState('');
 
-  // —— 预览结果（步骤 ①→②）——
+  // —— 预览 / 索引结果（步骤 ①→②）——
   const [rows, setRows] = useState<PreviewRow[]>([]);
   const [previewing, setPreviewing] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
-  // —— 勾选与搬运（步骤 ②）——
+  // —— 勾选与补填（步骤 ②）——
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [migratePath, setMigratePath] = useState('');
   // 在线拉取：源仓库名 → 目标仓库名改名映射（空 / 缺省即与源同名）。
   const [renames, setRenames] = useState<Record<string, string>>({});
+  // 离线推断项补填：仓库名 → 类型（proxy / hosted）。
+  const [typeFills, setTypeFills] = useState<Record<string, MigrateKind>>({});
+  // 离线推断项补填：仓库名 → 上游 URL（仅展示 / 运维参考，不下发）。
+  const [upstreamFills, setUpstreamFills] = useState<Record<string, string>>({});
   const [migrating, setMigrating] = useState(false);
   const [migrateError, setMigrateError] = useState<string | null>(null);
 
-  // —— 报告（步骤 ③）——
-  // 离线目录报告同步返回；在线拉取改为异步任务，以进度快照承载（含终态报告）。
-  const [report, setReport] = useState<MigrationReport | null>(null);
-  // 在线拉取任务的当前进度快照（轮询刷新；null 表示尚无在线任务）。
+  // —— 报告（步骤 ④）——
+  // 迁移任务的当前进度快照（轮询刷新；null 表示尚无任务）。
   const [onlineJob, setOnlineJob] = useState<OnlinePullJob | null>(null);
   // 正在轮询的任务 id（非 null 即开启轮询；终态或清理时置 null）。
   const [pollingJobId, setPollingJobId] = useState<string | null>(null);
   // 已拿到 job_id、但首次进度快照尚未返回时，用占位卡避免报告页空态。
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
-  // 任务中心与后端任务注册表提供的任务标题，用于区分在线拉取 / 离线 proxy / 离线 hosted。
+  // 任务标题，用于区分在线拉取 / 离线 proxy / 离线 hosted。
   const [jobTitle, setJobTitle] = useState<string | null>(null);
 
-  /** auth_ref 为空白时按未提供处理（匿名源）。 */
-  const authRefValue = authRef.trim() === '' ? undefined : authRef.trim();
-
-  /** 离线预览任务完成后，把轻量仓库摘要回填到预览行，供用户手动进入勾选步骤。 */
-  const applyOfflinePreviewRows = useCallback(
-    (job: OnlinePullJob) => {
-      if (job.offline_preview === undefined) {
-        return;
-      }
-      setRows(fromOffline(job.offline_preview, t));
-      setSelected(new Set(job.offline_preview.map((repo) => repo.repo_name)));
-    },
-    [t],
+  /** 某仓库的有效类型：权威 / 在线取行内类型，推断项取补填。 */
+  const effectiveType = useCallback(
+    (row: PreviewRow): MigrateKind | null => row.type ?? typeFills[row.name] ?? null,
+    [typeFills],
   );
 
   /** 记录并进入某个迁移任务的续看状态，等待轮询填充真实快照。 */
   const watchMigrationJob = (jobId: string, title?: string) => {
     localStorage.setItem(ONLINE_JOB_STORAGE_KEY, jobId);
-    setReport(null);
     setOnlineJob(null);
     setJobTitle(title ?? null);
     setPendingJobId(jobId);
     setPollingJobId(jobId);
-    setActive(2);
+    setActive(3);
   };
 
   /** 发起新迁移前做前端单飞检查，避免已有迁移在途时继续 POST。 */
@@ -310,45 +320,53 @@ export function MigrationPage() {
     return false;
   };
 
-  /** 切换源入口时只切换入口本身，执行按钮由入口决定，避免在线与离线串台。 */
+  /** 切换源入口时只切换入口本身，清空跨入口的选择与补填，避免在线与离线串台。 */
   const handleModeChange = (nextMode: SourceMode) => {
     setMode(nextMode);
     setRows([]);
     setSelected(new Set());
     setRenames({});
+    setTypeFills({});
+    setUpstreamFills({});
     setPreviewError(null);
     setMigrateError(null);
   };
 
-  /** 执行预览：据形态调用在线 / 离线预览端点，归一展示行。 */
-  const handlePreview = async () => {
+  /** 执行预览（在线）/ 加载索引（离线双通道）：据形态调用对应端点，归一展示行。 */
+  const handleLoad = async () => {
     setPreviewError(null);
     setPreviewing(true);
     try {
       if (mode === 'online') {
         const repos = await api.previewNexusRepositories({
           base_url: baseUrl.trim(),
-          auth_ref: authRefValue,
+          auth_ref: authRef.trim() === '' ? undefined : authRef.trim(),
         });
         setRows(fromOnline(repos));
       } else {
-        // FR-124：离线预览异步化——发起任务后轮询，避免大库同步枚举在反代后 504。
-        const created = await api.previewNexusOffline({ path: offlinePath.trim() });
+        // FR-141：离线索引双通道异步化——发起任务后轮询，读 repo_index 回填。
+        const created = await api.indexNexusOffline({
+          path: offlinePath.trim(),
+          base_url: offlineBaseUrl.trim() === '' ? undefined : offlineBaseUrl.trim(),
+          auth_ref: offlineAuthRef.trim() === '' ? undefined : offlineAuthRef.trim(),
+        });
         const jobId = requireJobId(created, t('job.missingJobId'));
-        const job = await pollOfflinePreview(jobId);
+        const job = await pollEnumJob(jobId);
         if (!job) {
-          throw new Error(t('preview.timeout'));
+          throw new Error(t('preview.indexTimeout'));
         }
         if (job.phase === 'failed') {
-          throw new Error(job.error ?? t('preview.failed'));
+          throw new Error(job.error ?? t('preview.indexFailed'));
         }
-        setRows(fromOffline(job.offline_preview ?? [], t));
+        setRows(fromIndex(job.repo_index ?? []));
         if (migratePath.trim() === '') {
           setMigratePath(offlinePath.trim());
         }
       }
       setSelected(new Set());
       setRenames({});
+      setTypeFills({});
+      setUpstreamFills({});
     } catch (err) {
       setPreviewError(errorMessage(err));
     } finally {
@@ -374,64 +392,76 @@ export function MigrationPage() {
     setRenames((prev) => ({ ...prev, [source]: target }));
   };
 
-  /**
-   * 执行离线目录搬运（FR-125 异步化）：调用 proxy / hosted 端点得 job_id；
-   * 立即存档 job_id（重连续看）、开启轮询并进入步骤 ③ 看进度队列（与在线拉取共用进度 UI）。
-   * 同步阶段失败（offline_path 为空 / 已有迁移在途）就地展示错误，不进入步骤 ③。
-   */
-  const handleMigrateOffline = async (kind: MigrateKind) => {
-    setMigrateError(null);
-    setMigrating(true);
-    try {
-      if (!(await canStartMigration())) {
-        return;
-      }
-      const repositories = rows.filter((row) => selected.has(row.name)).map((row) => row.name);
-      const req = {
-        offline_path: migratePath.trim(),
-        repositories,
-      };
-      const created =
-        kind === 'proxy' ? await api.migrateNexusProxy(req) : await api.migrateNexusHosted(req);
-      const jobId = requireJobId(created, t('job.missingJobId'));
-      // 存档 job_id（重连续看）；清旧报告；开启轮询、进入步骤 ③ 看进度。
-      watchMigrationJob(jobId, kind === 'proxy' ? '离线 proxy 搬运' : '离线 hosted 搬运');
-      notifySuccess(t('toast.offlineStarted'));
-    } catch (err) {
-      setMigrateError(errorMessage(err));
-    } finally {
-      setMigrating(false);
-    }
+  /** 设置某推断仓库补填的类型。 */
+  const setTypeFill = (name: string, type: MigrateKind) => {
+    setTypeFills((prev) => ({ ...prev, [name]: type }));
+  };
+
+  /** 设置某推断仓库补填的上游。 */
+  const setUpstreamFill = (name: string, url: string) => {
+    setUpstreamFills((prev) => ({ ...prev, [name]: url }));
+  };
+
+  /** 勾选的推断项是否仍有未补填类型的：有则不允许进入执行计划。 */
+  const hasUnfilledInferred = rows.some(
+    (row) =>
+      selected.has(row.name) && row.formatSource === 'inferred' && effectiveType(row) === null,
+  );
+
+  /** 发起离线搬运（FR-125 异步化）：按类型调用 proxy / hosted 端点。 */
+  const startOfflineMigration = async (kind: MigrateKind, repos: string[]) => {
+    const req = { offline_path: migratePath.trim(), repositories: repos };
+    const created =
+      kind === 'proxy' ? await api.migrateNexusProxy(req) : await api.migrateNexusHosted(req);
+    const jobId = requireJobId(created, t('job.missingJobId'));
+    watchMigrationJob(jobId, kind === 'proxy' ? '离线 proxy 搬运' : '离线 hosted 搬运');
+    notifySuccess(t('toast.offlineStarted'));
+  };
+
+  /** 发起在线拉取搬运。 */
+  const startOnlineMigration = async (repos: string[]) => {
+    const repositories = repos.map((name) => {
+      const target = (renames[name] ?? '').trim();
+      return target === '' ? { source: name } : { source: name, target };
+    });
+    const created = await api.migrateNexusOnline({
+      base_url: baseUrl.trim(),
+      auth_ref: authRef.trim() === '' ? undefined : authRef.trim(),
+      repositories,
+    });
+    const jobId = requireJobId(created, t('job.missingJobId'));
+    watchMigrationJob(jobId, t('job.queueTitle'));
+    notifySuccess(t('toast.onlineStarted'));
   };
 
   /**
-   * 发起在线拉取迁移（异步）：把所选仓库（含改名）映射为请求，调用在线端点得 job_id；
-   * 立即把 job_id 存档（供重连）、开启轮询并进入步骤 ③ 看进度队列。
-   * 同步阶段失败（未选仓库 / 源不存在 / 凭据未配置 / 源不可达）就地展示错误，不进入步骤 ③。
+   * 从执行计划确认发起迁移：单飞检查通过后按入口 / 类型分派。
+   * 离线混合 proxy / hosted 时，因迁移单飞只允许一个在途，本批次优先发起 proxy 一类；
+   * hosted 待前一批完成后由用户在历史 / 计划再发（P1 单飞取舍）。
    */
-  const handleMigrateOnline = async () => {
+  const handleStartMigration = async () => {
     setMigrateError(null);
     setMigrating(true);
     try {
       if (!(await canStartMigration())) {
         return;
       }
-      const repositories = rows
-        .filter((row) => selected.has(row.name))
-        .map((row) => {
-          const target = (renames[row.name] ?? '').trim();
-          // 目标为空即与源同名：省略 target 字段交后端默认处理。
-          return target === '' ? { source: row.name } : { source: row.name, target };
-        });
-      const created = await api.migrateNexusOnline({
-        base_url: baseUrl.trim(),
-        auth_ref: authRefValue,
-        repositories,
-      });
-      const jobId = requireJobId(created, t('job.missingJobId'));
-      // 存档 job_id（重连续看）；清理离线报告；占位并开启轮询。
-      watchMigrationJob(jobId, t('job.queueTitle'));
-      notifySuccess(t('toast.onlineStarted'));
+      const chosen = rows.filter((row) => selected.has(row.name));
+      if (mode === 'online') {
+        await startOnlineMigration(chosen.map((row) => row.name));
+        return;
+      }
+      const proxyRepos = chosen
+        .filter((row) => effectiveType(row) === 'proxy')
+        .map((row) => row.name);
+      const hostedRepos = chosen
+        .filter((row) => effectiveType(row) === 'hosted')
+        .map((row) => row.name);
+      if (proxyRepos.length > 0) {
+        await startOfflineMigration('proxy', proxyRepos);
+      } else if (hostedRepos.length > 0) {
+        await startOfflineMigration('hosted', hostedRepos);
+      }
     } catch (err) {
       setMigrateError(errorMessage(err));
     } finally {
@@ -445,7 +475,6 @@ export function MigrationPage() {
     try {
       const job = await loadMigrationProgressJob(id);
       setOnlineJob(job);
-      applyOfflinePreviewRows(job);
       setPendingJobId(null);
       if (isTerminalPhase(job.phase)) {
         setPollingJobId(null);
@@ -465,7 +494,7 @@ export function MigrationPage() {
     }
   };
 
-  // 轮询在线拉取任务进度：pollingJobId 非空即立即拉一次并定时刷新；终态 / 卸载时清理定时器。
+  // 轮询任务进度：pollingJobId 非空即立即拉一次并定时刷新；终态 / 卸载时清理定时器。
   useEffect(() => {
     if (pollingJobId === null) {
       return;
@@ -493,9 +522,8 @@ export function MigrationPage() {
         }
         setOnlineJob(job);
         setJobTitle(title ?? null);
-        applyOfflinePreviewRows(job);
         setPendingJobId(null);
-        setActive(2);
+        setActive(3);
         if (isTerminalPhase(job.phase)) {
           if (persist) {
             localStorage.removeItem(ONLINE_JOB_STORAGE_KEY);
@@ -528,9 +556,8 @@ export function MigrationPage() {
             localStorage.setItem(ONLINE_JOB_STORAGE_KEY, requestedJobId);
             setOnlineJob(job);
             setJobTitle(title);
-            applyOfflinePreviewRows(job);
             setPendingJobId(null);
-            setActive(2);
+            setActive(3);
             if (isTerminalPhase(job.phase)) {
               localStorage.removeItem(ONLINE_JOB_STORAGE_KEY);
             } else {
@@ -550,7 +577,7 @@ export function MigrationPage() {
               setJobTitle(detail.label ?? null);
             }
           } catch {
-            // 任务登记表暂不可用时保留专用迁移任务快照，避免丢失 offline_preview 明细。
+            // 任务登记表暂不可用时保留专用迁移任务快照。
           }
           return;
         }
@@ -566,7 +593,7 @@ export function MigrationPage() {
           setJobTitle(activeTask.label ?? null);
           setPendingJobId(activeTask.id);
           setPollingJobId(activeTask.id);
-          setActive(2);
+          setActive(3);
           await restoreJob(activeTask.id, true, activeTask.label);
           return;
         }
@@ -583,10 +610,9 @@ export function MigrationPage() {
     return () => {
       mounted = false;
     };
-  }, [applyOfflinePreviewRows, requestedJobId]);
+  }, [requestedJobId]);
 
   // 任务控制（FR-91）：取消 / 暂停 / 继续。控制端点幂等返回 200，调用后立即拉一次快照刷新按钮态。
-  // 取消后任务转终态、轮询自停；暂停 / 继续后轮询照旧反映新态。
   const [controlling, setControlling] = useState(false);
   const runControl = async (action: (id: string) => Promise<void>, id: string) => {
     setControlling(true);
@@ -595,7 +621,6 @@ export function MigrationPage() {
       await action(id);
       await fetchJobRef.current(id);
     } catch (err) {
-      // 未知 id（任务已过期 / 被清理）：清存档并停止轮询，不再续看。
       if (err instanceof ApiError && err.status === 404) {
         setPollingJobId(null);
         setOnlineJob(null);
@@ -609,14 +634,24 @@ export function MigrationPage() {
     }
   };
 
-  // 在线拉取：只属于在线入口，选中仓库且有源地址即可执行（无需离线路径）。
-  const canMigrateOnline =
-    mode === 'online' && selected.size > 0 && baseUrl.trim() !== '' && !migrating;
-  // 离线目录：只属于离线入口，按钮只按勾选仓库 + 离线路径启用，不要求源地址或凭据。
-  const canMigrateOffline =
-    mode === 'offline' && selected.size > 0 && migratePath.trim() !== '' && !migrating;
-  const canPreview =
+  /** 历史区一键重跑：发起重跑任务并进入进度续看。 */
+  const handleRerun = async (taskId: string) => {
+    const created = await api.rerunMigrationTask(taskId);
+    const jobId = requireJobId(created, t('job.missingJobId'));
+    watchMigrationJob(jobId, t('job.queueTitle'));
+    notifySuccess(t('history.rerunStarted'));
+  };
+
+  const chosenRows = rows.filter((row) => selected.has(row.name));
+
+  // 索引 / 预览加载：在线要源地址、离线要本地路径。
+  const canLoad =
     (mode === 'online' ? baseUrl.trim() !== '' : offlinePath.trim() !== '') && !previewing;
+  // 进入执行计划：选了仓库、离线需路径、推断项已补填类型。
+  const canGoPlan =
+    selected.size > 0 &&
+    !hasUnfilledInferred &&
+    (mode === 'online' ? baseUrl.trim() !== '' : migratePath.trim() !== '');
 
   return (
     <Stack>
@@ -624,6 +659,7 @@ export function MigrationPage() {
       <Text c="dimmed">{t('intro')}</Text>
 
       <Stepper active={active} onStepClick={setActive}>
+        {/* ① 源配置 */}
         <Stepper.Step label={t('step.sourceLabel')} description={t('step.sourceDesc')}>
           <Stack mt="md">
             <SegmentedControl
@@ -662,14 +698,28 @@ export function MigrationPage() {
                   onChange={(e) => setOfflinePath(e.currentTarget.value)}
                   required
                 />
+                <TextInput
+                  label={t('source.offlineBaseUrlLabel')}
+                  description={t('source.offlineBaseUrlDesc')}
+                  placeholder={t('source.offlineBaseUrlPlaceholder')}
+                  value={offlineBaseUrl}
+                  onChange={(e) => setOfflineBaseUrl(e.currentTarget.value)}
+                />
+                <PasswordInput
+                  label={t('source.authRefLabel')}
+                  description={t('source.authRefDesc')}
+                  placeholder={t('source.authRefPlaceholder')}
+                  value={offlineAuthRef}
+                  onChange={(e) => setOfflineAuthRef(e.currentTarget.value)}
+                />
               </>
             )}
 
             {previewError && <ErrorAlert message={previewError} />}
 
             <Group>
-              <Button onClick={handlePreview} disabled={!canPreview} loading={previewing}>
-                {t('preview.button')}
+              <Button onClick={handleLoad} disabled={!canLoad} loading={previewing}>
+                {mode === 'online' ? t('preview.button') : t('preview.indexButton')}
               </Button>
               {rows.length > 0 && (
                 <Button variant="default" onClick={() => setActive(1)}>
@@ -683,37 +733,12 @@ export function MigrationPage() {
                 <Loader />
               </Center>
             ) : (
-              rows.length > 0 && (
-                <Card withBorder padding="md" radius="md">
-                  <Text fw={600} mb="sm">
-                    {t('preview.count', { count: rows.length })}
-                  </Text>
-                  <Table.ScrollContainer minWidth={420}>
-                    <Table striped highlightOnHover>
-                      <Table.Thead>
-                        <Table.Tr>
-                          <Table.Th>{t('preview.thRepo')}</Table.Th>
-                          <Table.Th>{t('preview.thFormat')}</Table.Th>
-                          <Table.Th>{t('preview.thDetail')}</Table.Th>
-                        </Table.Tr>
-                      </Table.Thead>
-                      <Table.Tbody>
-                        {rows.map((row) => (
-                          <Table.Tr key={row.name}>
-                            <Table.Td>{row.name}</Table.Td>
-                            <Table.Td>{row.format}</Table.Td>
-                            <Table.Td>{row.detail}</Table.Td>
-                          </Table.Tr>
-                        ))}
-                      </Table.Tbody>
-                    </Table>
-                  </Table.ScrollContainer>
-                </Card>
-              )
+              rows.length > 0 && <PreviewTable rows={rows} />
             )}
           </Stack>
         </Stepper.Step>
 
+        {/* ② 勾选仓库（含推断补填） */}
         <Stepper.Step label={t('step.selectLabel')} description={t('step.selectDesc')}>
           <Stack mt="md">
             {rows.length === 0 ? (
@@ -729,7 +754,7 @@ export function MigrationPage() {
                       {rows.map((row) => (
                         <Group key={row.name} align="center" wrap="nowrap">
                           <Checkbox
-                            label={`${row.name}（${row.format} / ${row.detail}）`}
+                            label={`${row.name}（${row.format} / ${row.type ?? '-'}）`}
                             checked={selected.has(row.name)}
                             onChange={() => toggleSelect(row.name)}
                             style={{ flex: 1 }}
@@ -746,13 +771,17 @@ export function MigrationPage() {
                       ))}
                     </Stack>
                   ) : (
-                    <Stack gap="xs">
+                    <Stack gap="sm">
                       {rows.map((row) => (
-                        <Checkbox
+                        <OfflineSelectRow
                           key={row.name}
-                          label={`${row.name}（${row.format} / ${row.detail}）`}
+                          row={row}
                           checked={selected.has(row.name)}
-                          onChange={() => toggleSelect(row.name)}
+                          typeFill={typeFills[row.name]}
+                          upstreamFill={upstreamFills[row.name] ?? ''}
+                          onToggle={() => toggleSelect(row.name)}
+                          onTypeChange={(type) => setTypeFill(row.name, type)}
+                          onUpstreamChange={(url) => setUpstreamFill(row.name, url)}
                         />
                       ))}
                     </Stack>
@@ -764,68 +793,68 @@ export function MigrationPage() {
                     {t('select.onlineHint')}
                   </Alert>
                 ) : (
-                  <TextInput
-                    label={t('source.migratePathLabel')}
-                    description={t('source.migratePathDesc')}
-                    placeholder="/data/nexus/blobs/default"
-                    value={migratePath}
-                    onChange={(e) => setMigratePath(e.currentTarget.value)}
-                    required
-                  />
+                  <>
+                    <TextInput
+                      label={t('source.migratePathLabel')}
+                      description={t('source.migratePathDesc')}
+                      placeholder="/data/nexus/blobs/default"
+                      value={migratePath}
+                      onChange={(e) => setMigratePath(e.currentTarget.value)}
+                      required
+                    />
+                    <Alert color="orange" variant="light">
+                      {t('select.inferredHint')}
+                    </Alert>
+                  </>
                 )}
 
+                {hasUnfilledInferred && <ErrorAlert message={t('select.inferredNeedsType')} />}
                 {migrateError && <ErrorAlert message={migrateError} />}
 
-                {mode === 'online' ? (
-                  <>
-                    <Group>
-                      <Button onClick={() => setActive(0)} variant="default">
-                        {t('select.prevStep')}
-                      </Button>
-                      <Button
-                        onClick={handleMigrateOnline}
-                        disabled={!canMigrateOnline}
-                        loading={migrating}
-                      >
-                        {t('select.runOnline')}
-                      </Button>
-                    </Group>
-                    <Text size="xs" c="dimmed">
-                      {t('select.onlineFootnote')}
-                    </Text>
-                  </>
-                ) : (
-                  <>
-                    <Group>
-                      <Button onClick={() => setActive(0)} variant="default">
-                        {t('select.prevStep')}
-                      </Button>
-                      <Button
-                        onClick={() => handleMigrateOffline('proxy')}
-                        disabled={!canMigrateOffline}
-                        loading={migrating}
-                      >
-                        {t('select.runProxy')}
-                      </Button>
-                      <Button
-                        onClick={() => handleMigrateOffline('hosted')}
-                        disabled={!canMigrateOffline}
-                        loading={migrating}
-                        color="grape"
-                      >
-                        {t('select.runHosted')}
-                      </Button>
-                    </Group>
-                    <Text size="xs" c="dimmed">
-                      {t('select.offlineFootnote')}
-                    </Text>
-                  </>
-                )}
+                <Group>
+                  <Button onClick={() => setActive(0)} variant="default">
+                    {t('select.prevStep')}
+                  </Button>
+                  <Button onClick={() => setActive(2)} disabled={!canGoPlan}>
+                    {t('select.nextPlan')}
+                  </Button>
+                </Group>
               </>
             )}
           </Stack>
         </Stepper.Step>
 
+        {/* ③ 确认执行计划 */}
+        <Stepper.Step label={t('step.planLabel')} description={t('step.planDesc')}>
+          <Stack mt="md">
+            {chosenRows.length === 0 ? (
+              <Text c="dimmed">{t('plan.empty')}</Text>
+            ) : (
+              <ExecutionPlan
+                mode={mode}
+                rows={chosenRows}
+                renames={renames}
+                effectiveType={effectiveType}
+                upstreamOf={(row) => row.upstreamUrl ?? upstreamFills[row.name] ?? ''}
+              />
+            )}
+            {migrateError && <ErrorAlert message={migrateError} />}
+            <Group>
+              <Button onClick={() => setActive(1)} variant="default">
+                {t('plan.prevStep')}
+              </Button>
+              <Button
+                onClick={handleStartMigration}
+                disabled={chosenRows.length === 0 || migrating}
+                loading={migrating}
+              >
+                {t('plan.start')}
+              </Button>
+            </Group>
+          </Stack>
+        </Stepper.Step>
+
+        {/* ④ 执行与报告 */}
         <Stepper.Step label={t('step.reportLabel')} description={t('step.reportDesc')}>
           <Stack mt="md">
             {onlineJob ? (
@@ -840,109 +869,213 @@ export function MigrationPage() {
               />
             ) : pendingJobId ? (
               <PendingMigrationPanel jobId={pendingJobId} title={jobTitle} />
-            ) : !report ? (
-              <Text c="dimmed">{t('report.empty')}</Text>
             ) : (
-              <Card withBorder padding="md" radius="md">
-                <Text fw={600} mb="sm">
-                  {t('report.title')}
-                </Text>
-                {report.repos.length === 0 ? (
-                  <Text c="dimmed" size="sm">
-                    {t('report.noRepos')}
-                  </Text>
-                ) : (
-                  <Table.ScrollContainer minWidth={520}>
-                    <Table striped>
-                      <Table.Thead>
-                        <Table.Tr>
-                          <Table.Th>{t('report.thRepo')}</Table.Th>
-                          <Table.Th>{t('report.thFormat')}</Table.Th>
-                          <Table.Th>{t('report.thCreated')}</Table.Th>
-                          <Table.Th ta="right">{t('report.thMigrated')}</Table.Th>
-                          <Table.Th ta="right">{t('report.thSkipped')}</Table.Th>
-                        </Table.Tr>
-                      </Table.Thead>
-                      <Table.Tbody>
-                        {report.repos.map((r) => (
-                          <Table.Tr key={r.repo_name}>
-                            <Table.Td>{r.repo_name}</Table.Td>
-                            <Table.Td>{r.format}</Table.Td>
-                            <Table.Td>
-                              <Badge color={r.created ? 'green' : 'gray'} variant="light">
-                                {r.created ? t('report.createdYes') : t('report.createdExisting')}
-                              </Badge>
-                            </Table.Td>
-                            <Table.Td ta="right">{r.migrated_artifacts}</Table.Td>
-                            <Table.Td ta="right">{r.skipped_artifacts}</Table.Td>
-                          </Table.Tr>
-                        ))}
-                      </Table.Tbody>
-                    </Table>
-                  </Table.ScrollContainer>
-                )}
-
-                {report.skipped_repos.length > 0 && (
-                  <Group mt="sm" gap="xs">
-                    <Text size="sm" c="dimmed">
-                      {t('report.skippedRepos')}
-                    </Text>
-                    {report.skipped_repos.map((name) => (
-                      <Badge key={name} color="orange" variant="light">
-                        {name}
-                      </Badge>
-                    ))}
-                  </Group>
-                )}
-              </Card>
+              <Text c="dimmed">{t('report.empty')}</Text>
             )}
             <Group>
-              <Button variant="default" onClick={() => setActive(1)}>
+              <Button variant="default" onClick={() => setActive(2)}>
                 {t('report.backToSelect')}
               </Button>
             </Group>
           </Stack>
         </Stepper.Step>
       </Stepper>
+
+      {/* 迁移历史（FR-140 持久化，含 interrupted，可回看报告 + 重跑） */}
+      <MigrationHistoryPanel onRerun={handleRerun} />
     </Stack>
   );
 }
 
-/** 离线预览任务终态结果：有明细时展示仓库列表，无明细时给出清晰完成报告。 */
-function OfflinePreviewResultPanel({ repos }: { repos: OfflineRepoSummary[] }) {
+/** 归一后的仓库索引 / 预览表（含格式来源、类型、blob 数、大小、上游）。 */
+function PreviewTable({ rows }: { rows: PreviewRow[] }) {
   const { t } = useTranslation('migration');
-  const totalBlobs = repos.reduce((sum, repo) => sum + repo.blob_count, 0);
+  return (
+    <Card withBorder padding="md" radius="md">
+      <Text fw={600} mb="sm">
+        {t('preview.count', { count: rows.length })}
+      </Text>
+      <Table.ScrollContainer minWidth={640}>
+        <Table striped highlightOnHover>
+          <Table.Thead>
+            <Table.Tr>
+              <Table.Th>{t('preview.thRepo')}</Table.Th>
+              <Table.Th>{t('preview.thFormat')}</Table.Th>
+              <Table.Th>{t('preview.thSource')}</Table.Th>
+              <Table.Th>{t('preview.thType')}</Table.Th>
+              <Table.Th ta="right">{t('preview.thBlobCount')}</Table.Th>
+              <Table.Th ta="right">{t('preview.thSize')}</Table.Th>
+              <Table.Th>{t('preview.thUpstream')}</Table.Th>
+            </Table.Tr>
+          </Table.Thead>
+          <Table.Tbody>
+            {rows.map((row) => (
+              <Table.Tr key={row.name}>
+                <Table.Td>{row.name}</Table.Td>
+                <Table.Td>{row.format}</Table.Td>
+                <Table.Td>
+                  <FormatSourceBadge source={row.formatSource} />
+                </Table.Td>
+                <Table.Td>{row.type ?? '-'}</Table.Td>
+                <Table.Td ta="right">
+                  {row.blobCount !== null ? t('preview.blobCount', { count: row.blobCount }) : '-'}
+                </Table.Td>
+                <Table.Td ta="right">
+                  {row.totalSize !== null ? formatBytes(row.totalSize) : '-'}
+                </Table.Td>
+                <Table.Td>{row.upstreamUrl ?? '-'}</Table.Td>
+              </Table.Tr>
+            ))}
+          </Table.Tbody>
+        </Table>
+      </Table.ScrollContainer>
+    </Card>
+  );
+}
+
+/** 格式来源徽章（权威 / 推断）。 */
+function FormatSourceBadge({ source }: { source: FormatSource }) {
+  const { t } = useTranslation('migration');
+  return source === 'authoritative' ? (
+    <Badge color="green" variant="light">
+      {t('preview.sourceAuthoritative')}
+    </Badge>
+  ) : (
+    <Badge color="orange" variant="light">
+      {t('preview.sourceInferred')}
+    </Badge>
+  );
+}
+
+/** 离线勾选行：权威项类型只读，推断项要求补填类型（proxy 可填上游）。 */
+function OfflineSelectRow({
+  row,
+  checked,
+  typeFill,
+  upstreamFill,
+  onToggle,
+  onTypeChange,
+  onUpstreamChange,
+}: {
+  row: PreviewRow;
+  checked: boolean;
+  typeFill: MigrateKind | undefined;
+  upstreamFill: string;
+  onToggle: () => void;
+  onTypeChange: (type: MigrateKind) => void;
+  onUpstreamChange: (url: string) => void;
+}) {
+  const { t } = useTranslation('migration');
+  const inferred = row.formatSource === 'inferred';
+  const currentType = row.type ?? typeFill ?? null;
 
   return (
-    <Stack gap="sm" mt="sm">
-      <Text size="sm">
-        {t('job.offlinePreviewSummary', { repos: repos.length, blobs: totalBlobs })}
-      </Text>
-      {repos.length === 0 ? (
-        <Text c="dimmed" size="sm">
-          {t('job.offlinePreviewNoRepos')}
-        </Text>
+    <Group align="center" wrap="nowrap">
+      <Checkbox
+        label={`${row.name}（${row.format}）`}
+        checked={checked}
+        onChange={onToggle}
+        style={{ flex: 1 }}
+      />
+      <FormatSourceBadge source={row.formatSource} />
+      {inferred ? (
+        <Select
+          aria-label={t('select.typeAria', { name: row.name })}
+          placeholder={t('select.typePlaceholder')}
+          data={[
+            { value: 'proxy', label: t('select.typeProxy') },
+            { value: 'hosted', label: t('select.typeHosted') },
+          ]}
+          value={typeFill ?? null}
+          onChange={(v) => v && onTypeChange(v as MigrateKind)}
+          disabled={!checked}
+          w={130}
+        />
       ) : (
-        <Table.ScrollContainer minWidth={420}>
-          <Table striped>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>{t('preview.thRepo')}</Table.Th>
-                <Table.Th ta="right">{t('job.thBlobCount')}</Table.Th>
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {repos.map((repo) => (
-                <Table.Tr key={repo.repo_name}>
-                  <Table.Td>{repo.repo_name}</Table.Td>
-                  <Table.Td ta="right">{repo.blob_count}</Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-        </Table.ScrollContainer>
+        <Text size="sm" w={130}>
+          {row.type ?? '-'}
+        </Text>
       )}
-    </Stack>
+      {inferred && currentType === 'proxy' && (
+        <TextInput
+          aria-label={t('select.upstreamAria', { name: row.name })}
+          placeholder={t('select.upstreamPlaceholder')}
+          value={upstreamFill}
+          onChange={(e) => onUpstreamChange(e.currentTarget.value)}
+          disabled={!checked}
+          w={220}
+        />
+      )}
+    </Group>
+  );
+}
+
+/** 执行计划只读汇总表。 */
+function ExecutionPlan({
+  mode,
+  rows,
+  renames,
+  effectiveType,
+  upstreamOf,
+}: {
+  mode: SourceMode;
+  rows: PreviewRow[];
+  renames: Record<string, string>;
+  effectiveType: (row: PreviewRow) => MigrateKind | null;
+  upstreamOf: (row: PreviewRow) => string;
+}) {
+  const { t } = useTranslation('migration');
+  const methodLabel = (row: PreviewRow): string => {
+    if (mode === 'online') {
+      return t('plan.methodOnline');
+    }
+    return effectiveType(row) === 'proxy' ? t('plan.methodProxy') : t('plan.methodHosted');
+  };
+
+  return (
+    <Card withBorder padding="md" radius="md">
+      <Text fw={600} mb="xs">
+        {t('plan.title')}
+      </Text>
+      <Text size="sm" c="dimmed" mb="sm">
+        {t('plan.intro')}
+      </Text>
+      <Table.ScrollContainer minWidth={640}>
+        <Table striped>
+          <Table.Thead>
+            <Table.Tr>
+              <Table.Th>{t('plan.thSource')}</Table.Th>
+              <Table.Th>{t('plan.thTarget')}</Table.Th>
+              <Table.Th>{t('plan.thMethod')}</Table.Th>
+              <Table.Th>{t('plan.thType')}</Table.Th>
+              <Table.Th>{t('plan.thUpstream')}</Table.Th>
+            </Table.Tr>
+          </Table.Thead>
+          <Table.Tbody>
+            {rows.map((row) => {
+              const target =
+                mode === 'online' && (renames[row.name] ?? '').trim() !== ''
+                  ? renames[row.name].trim()
+                  : row.name;
+              return (
+                <Table.Tr key={row.name}>
+                  <Table.Td>{row.name}</Table.Td>
+                  <Table.Td>{target}</Table.Td>
+                  <Table.Td>{methodLabel(row)}</Table.Td>
+                  <Table.Td>{effectiveType(row) ?? '-'}</Table.Td>
+                  <Table.Td>{upstreamOf(row) || '-'}</Table.Td>
+                </Table.Tr>
+              );
+            })}
+          </Table.Tbody>
+        </Table>
+      </Table.ScrollContainer>
+      {mode === 'offline' && (
+        <Text size="xs" c="dimmed" mt="sm">
+          {t('plan.upstreamNote')}
+        </Text>
+      )}
+    </Card>
   );
 }
 
@@ -966,7 +1099,7 @@ function PendingMigrationPanel({ jobId, title }: { jobId: string; title: string 
   );
 }
 
-/** 在线拉取任务进度面板：进行中展示导入队列进度，终态展示最终报告，并提供取消 / 暂停 / 继续。 */
+/** 迁移任务进度面板：进行中展示导入队列进度，终态展示最终报告，并提供取消 / 暂停 / 继续。 */
 function OnlineJobPanel({
   job,
   title,
@@ -1001,8 +1134,6 @@ function OnlineJobPanel({
     : t('job.progress', { done: job.done_assets, total: job.total_assets, percent });
   const terminal = isTerminalPhase(job.phase);
   const summary = migrationSummary(job);
-  const offlinePreview = job.offline_preview;
-  const isOfflinePreview = isOfflinePreviewJob(job, title, t);
   // 按钮可用性（FR-91）：仅进行中（未暂停的活动态）可暂停 / 取消；仅已暂停可继续；终态全禁用。
   const canPause = !terminal && !job.paused && !controlling;
   const canResume = !terminal && job.paused && !controlling;
@@ -1020,46 +1151,42 @@ function OnlineJobPanel({
         </Group>
       </Group>
 
-      {!isOfflinePreview && (
-        <>
-          {/* 任务控制：取消 / 暂停 / 继续（按任务态启停） */}
-          <Group gap="xs" mb="sm">
-            {job.paused ? (
-              <Button size="xs" variant="light" onClick={onResume} disabled={!canResume}>
-                {t('job.resume')}
-              </Button>
-            ) : (
-              <Button size="xs" variant="light" onClick={onPause} disabled={!canPause}>
-                {t('job.pause')}
-              </Button>
-            )}
-            <Button size="xs" variant="light" color="red" onClick={onCancel} disabled={!canCancel}>
-              {t('job.cancel')}
-            </Button>
-          </Group>
+      {/* 任务控制：取消 / 暂停 / 继续（按任务态启停） */}
+      <Group gap="xs" mb="sm">
+        {job.paused ? (
+          <Button size="xs" variant="light" onClick={onResume} disabled={!canResume}>
+            {t('job.resume')}
+          </Button>
+        ) : (
+          <Button size="xs" variant="light" onClick={onPause} disabled={!canPause}>
+            {t('job.pause')}
+          </Button>
+        )}
+        <Button size="xs" variant="light" color="red" onClick={onCancel} disabled={!canCancel}>
+          {t('job.cancel')}
+        </Button>
+      </Group>
 
-          {/* 进度条 + 资产计数 */}
-          <Progress
-            value={percent}
-            aria-label={t('job.progressAria')}
-            animated={!terminal && !job.paused}
-          />
-          <Group justify="space-between" mt="xs">
-            <Text size="sm" c="dimmed">
-              {progressText}
-            </Text>
-            <Group gap="md">
-              <Text size="sm">{t('job.migrated', { count: summary.migrated })}</Text>
-              <Text size="sm" c="dimmed">
-                {t('job.skippedExisting', { count: summary.skippedExisting })}
-              </Text>
-              <Text size="sm" c="dimmed">
-                {t('job.skippedFailed', { count: summary.skippedFailed })}
-              </Text>
-            </Group>
-          </Group>
-        </>
-      )}
+      {/* 进度条 + 资产计数 */}
+      <Progress
+        value={percent}
+        aria-label={t('job.progressAria')}
+        animated={!terminal && !job.paused}
+      />
+      <Group justify="space-between" mt="xs">
+        <Text size="sm" c="dimmed">
+          {progressText}
+        </Text>
+        <Group gap="md">
+          <Text size="sm">{t('job.migrated', { count: summary.migrated })}</Text>
+          <Text size="sm" c="dimmed">
+            {t('job.skippedExisting', { count: summary.skippedExisting })}
+          </Text>
+          <Text size="sm" c="dimmed">
+            {t('job.skippedFailed', { count: summary.skippedFailed })}
+          </Text>
+        </Group>
+      </Group>
 
       {/* 当前仓库 / 当前文件（进行中显示） */}
       {!terminal && (job.current_repo || job.current_path) && (
@@ -1088,66 +1215,60 @@ function OnlineJobPanel({
         </Alert>
       )}
 
-      {/* 终态：离线预览展示预览结果；迁移任务展示完成报告和各仓库明细 */}
+      {/* 终态：展示完成报告和各仓库明细 */}
       {terminal && (
         <>
-          {isOfflinePreview ? (
-            <OfflinePreviewResultPanel repos={offlinePreview ?? []} />
-          ) : (
-            <>
-              <Group gap="md" mt="sm">
-                <Text size="sm">{t('job.summaryTotal', { count: summary.total })}</Text>
-                <Text size="sm">{t('job.summaryMigrated', { count: summary.migrated })}</Text>
-                <Text size="sm" c="dimmed">
-                  {t('job.summarySkippedExisting', { count: summary.skippedExisting })}
-                </Text>
-                <Text size="sm" c="dimmed">
-                  {t('job.summarySkippedFailed', { count: summary.skippedFailed })}
-                </Text>
-              </Group>
+          <Group gap="md" mt="sm">
+            <Text size="sm">{t('job.summaryTotal', { count: summary.total })}</Text>
+            <Text size="sm">{t('job.summaryMigrated', { count: summary.migrated })}</Text>
+            <Text size="sm" c="dimmed">
+              {t('job.summarySkippedExisting', { count: summary.skippedExisting })}
+            </Text>
+            <Text size="sm" c="dimmed">
+              {t('job.summarySkippedFailed', { count: summary.skippedFailed })}
+            </Text>
+          </Group>
 
-              {job.repos.length === 0 ? (
-                <Text c="dimmed" size="sm" mt="sm">
-                  {t('job.noRepos')}
-                </Text>
-              ) : (
-                <Table.ScrollContainer minWidth={640}>
-                  <Table striped mt="sm">
-                    <Table.Thead>
-                      <Table.Tr>
-                        <Table.Th>{t('job.thSourceRepo')}</Table.Th>
-                        <Table.Th>{t('job.thTargetRepo')}</Table.Th>
-                        <Table.Th>{t('job.thFormat')}</Table.Th>
-                        <Table.Th>{t('job.thCreated')}</Table.Th>
-                        <Table.Th ta="right">{t('job.thMigrated')}</Table.Th>
-                        <Table.Th ta="right">{t('job.thSkippedExisting')}</Table.Th>
-                        <Table.Th ta="right">{t('job.thSkippedFailed')}</Table.Th>
-                      </Table.Tr>
-                    </Table.Thead>
-                    <Table.Tbody>
-                      {job.repos.map((r) => (
-                        <Table.Tr key={`${r.source_repo}->${r.target_repo}`}>
-                          <Table.Td>{r.source_repo}</Table.Td>
-                          <Table.Td>{r.target_repo}</Table.Td>
-                          <Table.Td>{r.format}</Table.Td>
-                          <Table.Td>
-                            <Badge color={r.created ? 'green' : 'gray'} variant="light">
-                              {r.created ? t('job.createdYes') : t('job.createdExisting')}
-                            </Badge>
-                          </Table.Td>
-                          <Table.Td ta="right">{r.migrated_artifacts}</Table.Td>
-                          <Table.Td ta="right">{r.skipped_existing_artifacts ?? 0}</Table.Td>
-                          <Table.Td ta="right">{r.skipped_artifacts}</Table.Td>
-                        </Table.Tr>
-                      ))}
-                    </Table.Tbody>
-                  </Table>
-                </Table.ScrollContainer>
-              )}
-            </>
+          {job.repos.length === 0 ? (
+            <Text c="dimmed" size="sm" mt="sm">
+              {t('job.noRepos')}
+            </Text>
+          ) : (
+            <Table.ScrollContainer minWidth={640}>
+              <Table striped mt="sm">
+                <Table.Thead>
+                  <Table.Tr>
+                    <Table.Th>{t('job.thSourceRepo')}</Table.Th>
+                    <Table.Th>{t('job.thTargetRepo')}</Table.Th>
+                    <Table.Th>{t('job.thFormat')}</Table.Th>
+                    <Table.Th>{t('job.thCreated')}</Table.Th>
+                    <Table.Th ta="right">{t('job.thMigrated')}</Table.Th>
+                    <Table.Th ta="right">{t('job.thSkippedExisting')}</Table.Th>
+                    <Table.Th ta="right">{t('job.thSkippedFailed')}</Table.Th>
+                  </Table.Tr>
+                </Table.Thead>
+                <Table.Tbody>
+                  {job.repos.map((r) => (
+                    <Table.Tr key={`${r.source_repo}->${r.target_repo}`}>
+                      <Table.Td>{r.source_repo}</Table.Td>
+                      <Table.Td>{r.target_repo}</Table.Td>
+                      <Table.Td>{r.format}</Table.Td>
+                      <Table.Td>
+                        <Badge color={r.created ? 'green' : 'gray'} variant="light">
+                          {r.created ? t('job.createdYes') : t('job.createdExisting')}
+                        </Badge>
+                      </Table.Td>
+                      <Table.Td ta="right">{r.migrated_artifacts}</Table.Td>
+                      <Table.Td ta="right">{r.skipped_existing_artifacts ?? 0}</Table.Td>
+                      <Table.Td ta="right">{r.skipped_artifacts}</Table.Td>
+                    </Table.Tr>
+                  ))}
+                </Table.Tbody>
+              </Table>
+            </Table.ScrollContainer>
           )}
 
-          {!isOfflinePreview && job.skipped_repos.length > 0 && (
+          {job.skipped_repos.length > 0 && (
             <Group mt="sm" gap="xs">
               <Text size="sm" c="dimmed">
                 {t('job.skippedRepos')}

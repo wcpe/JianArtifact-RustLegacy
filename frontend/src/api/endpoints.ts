@@ -29,7 +29,10 @@ import type {
   LoginResponse,
   MigrationJobCreated,
   MigrationJobSummary,
+  MigrationTaskDto,
+  MigrationTaskDetailDto,
   NexusMigrateRequest,
+  NexusOfflineIndexRequest,
   NexusOfflinePreviewRequest,
   NexusPreviewRequest,
   NexusRepoSummary,
@@ -482,6 +485,19 @@ export function previewNexusOffline(req: NexusOfflinePreviewRequest): Promise<Mi
 }
 
 /**
+ * 离线仓库索引双通道（FR-141，ADR-0041）：发起异步任务、立即返回 job_id；
+ * 结果经 getMigrationJob 轮询的 `repo_index` 字段取回（每仓库含格式及来源〔权威/推断〕、
+ * 类型、blob 数、总大小、上游）。给定 `base_url` 且源可达时走权威通道，否则回退推断通道。
+ * `auth_ref` 仅引用，真值走后端 env，不入库、不回显。
+ */
+export function indexNexusOffline(req: NexusOfflineIndexRequest): Promise<MigrationJobCreated> {
+  return request<MigrationJobCreated>('/migrate/nexus/offline/index', {
+    method: 'POST',
+    body: req,
+  });
+}
+
+/**
  * 执行 proxy 仓库配置创建 + 缓存制品搬运（FR-125 异步化）：发起异步任务、立即返回 job_id；
  * 实际搬运在后台运行、进度经 getMigrationJob 轮询（避免大库同步搬运在反代后 504）。
  * 同步阶段失败（offline_path 为空）仍同步返回错误；目录读取错误会在后台任务进度中展示。
@@ -547,6 +563,31 @@ export function pauseMigrationJob(id: string): Promise<void> {
  */
 export function resumeMigrationJob(id: string): Promise<void> {
   return request<void>(`/migrate/jobs/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+}
+
+// —— 迁移历史与报告持久化（FR-140，ADR-0040，仅 Admin） ——
+
+/**
+ * 列出迁移历史（库中持久记录，仅 Admin）：跨重启的历史 + 报告视图，
+ * 含重启后被标 `interrupted` 的任务。按起始时刻倒序。
+ */
+export function listMigrationTasks(): Promise<MigrationTaskDto[]> {
+  return request<MigrationTaskDto[]>('/migrate/tasks');
+}
+
+/** 查单个迁移历史任务详情 + 分仓库报告（仅 Admin）；未知 id 返回 404。 */
+export function getMigrationTask(id: string): Promise<MigrationTaskDetailDto> {
+  return request<MigrationTaskDetailDto>(`/migrate/tasks/${encodeURIComponent(id)}`);
+}
+
+/**
+ * 一键幂等重跑某历史迁移任务（仅 Admin）：据脱敏参数快照重建原请求并重新触发幂等搬运
+ *（sha256 一致即跳过，等效断点续传）；生成新 job_id（202）。已有迁移在途时返回 409。
+ */
+export function rerunMigrationTask(id: string): Promise<MigrationJobCreated> {
+  return request<MigrationJobCreated>(`/migrate/tasks/${encodeURIComponent(id)}/rerun`, {
+    method: 'POST',
+  });
 }
 
 // —— 设置页（FR-87，仅管理员） ——

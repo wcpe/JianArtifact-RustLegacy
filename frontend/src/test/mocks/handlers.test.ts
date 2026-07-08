@@ -153,4 +153,52 @@ describe('新增 MSW handlers（管理员端点不返 401）', () => {
     await expect(api.resumeMigrationJob(created.job_id)).resolves.toBeUndefined();
     await expect(api.cancelMigrationJob(created.job_id)).resolves.toBeUndefined();
   });
+
+  it('离线索引双通道（FR-141）：发起任务，进度 repo_index 含权威 + 推断项', async () => {
+    const created = await api.indexNexusOffline({ path: '/data/blobs' });
+    expect(created.job_id).toBeTruthy();
+
+    const job = await api.getMigrationJob(created.job_id);
+    expect(job.repo_index).toBeDefined();
+    const idx = job.repo_index ?? [];
+    // 权威 proxy（有类型 / 上游）+ 推断（类型 / 上游为 null）
+    const authoritative = idx.find((e) => e.format_source === 'authoritative');
+    const inferred = idx.find((e) => e.format_source === 'inferred');
+    expect(authoritative?.type).toBe('proxy');
+    expect(authoritative?.upstream_url).toBeTruthy();
+    expect(inferred?.type).toBeNull();
+    expect(inferred?.upstream_url).toBeNull();
+    expect(idx.every((e) => typeof e.blob_count === 'number')).toBe(true);
+  });
+
+  it('迁移历史（FR-140）：搬运任务落历史，详情含分仓库报告，重跑得新 job_id', async () => {
+    const created = await api.migrateNexusHosted({
+      offline_path: '/data/blobs',
+      repositories: ['maven-internal'],
+    });
+    expect(created.job_id).toBeTruthy();
+
+    // 历史列表含该搬运任务（排除纯预览 / 索引枚举）
+    const history = await api.listMigrationTasks();
+    const entry = history.find((h) => h.id === created.job_id);
+    expect(entry).toBeDefined();
+    expect(entry?.kind).toBe('offline_hosted');
+
+    // 详情含分仓库报告
+    const detail = await api.getMigrationTask(created.job_id);
+    expect(detail.id).toBe(created.job_id);
+    expect(detail.repos.length).toBeGreaterThan(0);
+    expect(detail.repos[0].source_repo).toBe('maven-internal');
+
+    // 重跑得新 job_id（不覆盖原任务）
+    const rerun = await api.rerunMigrationTask(created.job_id);
+    expect(rerun.job_id).toBeTruthy();
+    expect(rerun.job_id).not.toBe(created.job_id);
+  });
+
+  it('迁移历史：纯离线索引枚举任务不进历史列表', async () => {
+    const created = await api.indexNexusOffline({ path: '/data/blobs' });
+    const history = await api.listMigrationTasks();
+    expect(history.some((h) => h.id === created.job_id)).toBe(false);
+  });
 });
