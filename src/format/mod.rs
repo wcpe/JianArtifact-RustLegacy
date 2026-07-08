@@ -6,6 +6,11 @@
 //!
 //! 依赖方向（ARCHITECTURE §2）：`api` → `format` → (`storage` / `meta` / `proxy`)，单向无环。
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, ReadBuf};
+
 use crate::meta::ArtifactRecord;
 
 mod browse;
@@ -189,6 +194,76 @@ pub(crate) fn normalize_repo_path(raw_path: &str) -> Result<String, PathError> {
         return Err(PathError::Empty);
     }
     Ok(segments.join("/"))
+}
+
+/// 超限专属错误载荷：包进 `io::Error::other`，供上层精确识别"上传超限"而非普通 IO 失败。
+///
+/// 通用制品机理（[`service`]）与 docker registry（[`docker_registry`]）迁移搬运共用同一超限识别，
+/// 不各自复制一份限长逻辑。
+#[derive(Debug)]
+struct TooLargeMarker;
+
+impl std::fmt::Display for TooLargeMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "制品体积超过上限")
+    }
+}
+
+impl std::error::Error for TooLargeMarker {}
+
+/// 判断一个 IO 错误是否由限长读的超限触发（据专属 sentinel 载荷识别）。
+pub(crate) fn is_too_large(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .map(|inner| inner.is::<TooLargeMarker>())
+        .unwrap_or(false)
+}
+
+/// 限长读包装：累计读取字节超过上限时返回专属超限错误，供上层映射 413。
+///
+/// `limit` 为 None 时不施加限制，直接透传底层读。通用制品机理与 docker 迁移搬运共用。
+pub(crate) struct LimitedReader<R> {
+    /// 底层读。
+    inner: R,
+    /// 字节上限（None 表示不限）。
+    limit: Option<u64>,
+    /// 已读取字节累计。
+    read: u64,
+}
+
+impl<R> LimitedReader<R> {
+    /// 构造限长读。
+    pub(crate) fn new(inner: R, limit: Option<u64>) -> Self {
+        Self {
+            inner,
+            limit,
+            read: 0,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let inner = Pin::new(&mut self.inner);
+        match inner.poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let n = (buf.filled().len() - before) as u64;
+                self.read += n;
+                if let Some(limit) = self.limit {
+                    if self.read > limit {
+                        // 超限：以专属 sentinel 作为 error 载荷，上层据此精确识别并返回 413
+                        return Poll::Ready(Err(std::io::Error::other(TooLargeMarker)));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
 }
 
 #[cfg(test)]

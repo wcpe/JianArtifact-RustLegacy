@@ -7,18 +7,16 @@
 //! - 覆盖策略经 [`Format::can_overwrite`] 判定（Raw 允许覆盖；其余格式各自语义）。
 //! - proxy cache-miss 经**单飞合并**一次回源，上游失败不缓存损坏内容；**锁外做 IO**。
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::AsyncRead;
 
 use crate::meta::{ArtifactRecord, MetaError, MetaStore, NewArtifact, RepoType, RepositoryRecord};
 use crate::metrics_keys as keys;
 use crate::proxy::{SingleFlight, Upstream};
 use crate::storage::{BlobReader, BlobStore, StorageError};
 
-use super::{ArtifactCoordinates, Format};
+use super::{is_too_large, ArtifactCoordinates, Format, LimitedReader};
 
 /// 通用制品机理错误。
 #[derive(Debug, thiserror::Error)]
@@ -611,25 +609,6 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
     }
 }
 
-/// 超限专属错误载荷：包进 `io::Error::other`，供上层精确识别"上传超限"而非普通 IO 失败。
-#[derive(Debug)]
-struct TooLargeMarker;
-
-impl std::fmt::Display for TooLargeMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "制品体积超过上限")
-    }
-}
-
-impl std::error::Error for TooLargeMarker {}
-
-/// 判断一个 IO 错误是否由限长读的超限触发（据专属 sentinel 载荷识别）。
-fn is_too_large(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .map(|inner| inner.is::<TooLargeMarker>())
-        .unwrap_or(false)
-}
-
 /// 把绝对文件 URL 拆为 (基址, 末段文件名)，供 [`Upstream::fetch`] 的「基址 + 相对路径」拼接复用。
 ///
 /// 如 `https://h/a/b/x.whl` → (`https://h/a/b`, `x.whl`)；无 `/` 时基址为空、文件名为整串。
@@ -669,54 +648,6 @@ fn record_upstream_failure(repo: &RepositoryRecord) {
         keys::LABEL_FORMAT => keys::format_label_for(&repo.format),
     )
     .increment(1);
-}
-
-/// 限长读包装：累计读取字节超过上限时返回专属超限错误，供上层映射 413。
-///
-/// `limit` 为 None 时不施加限制，直接透传底层读。
-struct LimitedReader<R> {
-    /// 底层读。
-    inner: R,
-    /// 字节上限（None 表示不限）。
-    limit: Option<u64>,
-    /// 已读取字节累计。
-    read: u64,
-}
-
-impl<R> LimitedReader<R> {
-    /// 构造限长读。
-    fn new(inner: R, limit: Option<u64>) -> Self {
-        Self {
-            inner,
-            limit,
-            read: 0,
-        }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let inner = Pin::new(&mut self.inner);
-        match inner.poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                let n = (buf.filled().len() - before) as u64;
-                self.read += n;
-                if let Some(limit) = self.limit {
-                    if self.read > limit {
-                        // 超限：以专属 sentinel 作为 error 载荷，上层据此精确识别并返回 413
-                        return Poll::Ready(Err(std::io::Error::other(TooLargeMarker)));
-                    }
-                }
-                Poll::Ready(Ok(()))
-            }
-            other => other,
-        }
-    }
 }
 
 #[cfg(test)]
