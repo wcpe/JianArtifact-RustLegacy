@@ -47,3 +47,4 @@ config.local.toml
 # 散落构建产物（非项目交付物）
 /rust_out.exe
 /rust_out.pdb
+/output/
