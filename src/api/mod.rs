@@ -49,6 +49,7 @@ mod metrics_query;
 mod metrics_sampler;
 mod migrate;
 mod migration_jobs;
+mod migration_persist;
 mod monitor;
 mod npm_routes;
 mod nuget_routes;
@@ -89,6 +90,7 @@ pub use identity::resolve_identity;
 pub use metrics::{install_recorder, MetricsHandle};
 pub use metrics_sampler::{spawn_metrics_retention, spawn_metrics_sampler};
 pub use migration_jobs::MigrationJobs;
+pub(crate) use migration_persist::MigrationPersister;
 pub use oidc_routes::OidcFlowStore;
 pub use protection_state::{ProtectionSnapshot, ProtectionState};
 pub use rate_limit::RateLimiter;
@@ -485,6 +487,13 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/migrate/nexus/group/migrate",
             post(migrate::migrate_nexus_group),
+        )
+        // 迁移历史与报告持久化（FR-140，ADR-0040）：库中历史任务列表 / 详情 + 一键幂等重跑（仅 Admin）
+        .route("/migrate/tasks", get(migrate::list_migration_tasks))
+        .route("/migrate/tasks/{id}", get(migrate::get_migration_task))
+        .route(
+            "/migrate/tasks/{id}/rerun",
+            post(migrate::rerun_migration_task),
         )
         // 统一任务注册表（FR-131）：跨 kind 列出活跃 + 近期任务、查单任务进度（仅 Admin）
         .route("/tasks", get(tasks::list_tasks))

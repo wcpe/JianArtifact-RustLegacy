@@ -100,6 +100,15 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("打开元数据库失败: {}", db_path.display()))?;
     info!(数据库 = %db_path.display(), "元数据库就绪");
 
+    // 迁移任务中断标记（FR-140，ADR-0040）：进程启动时把库中残留的 running / paused 迁移任务
+    // 统一归为「已中断（interrupted）」——上次运行崩溃 / 重启遗留的在途任务不会续跑，标中断供运维
+    // 一键幂等重跑。失败只记 WARN、不阻断启动（历史状态归一非关键路径）。
+    match meta.mark_running_migration_tasks_interrupted().await {
+        Ok(0) => {}
+        Ok(n) => info!(条数 = n, "已把残留在途迁移任务标记为已中断"),
+        Err(e) => warn!(原因 = %e, "标记残留迁移任务为已中断失败，跳过"),
+    }
+
     // 动态配置入库覆盖（FR-106，ADR-0028）：meta 就绪后读 app_settings 作 DB 覆盖，按优先级
     // env 显式 > DB > 文件默认 合并出生效配置，再供下方各热替换槽 / 后台任务消费。覆盖在装配层完成、
     // config 零 DB 依赖（守红线）；DB 空 / 损坏只 WARN、回落文件默认，不阻断启动。

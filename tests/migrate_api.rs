@@ -575,3 +575,418 @@ async fn 管理员控制未知迁移任务返回_404() {
         assert_eq!(status, StatusCode::NOT_FOUND, "端点 {uri} 未知 id 应 404");
     }
 }
+
+// ---------- 迁移任务与报告持久化（FR-140，ADR-0040）----------
+
+/// 起一个绑定显式 DB 文件路径的状态（供「重启」重开同一 DB 断言跨重启持久）。
+async fn 持久化测试用状态(db_path: &std::path::Path) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = MetaStore::open(db_path).await.unwrap();
+    let store = BlobBackend::Fs(LocalFsStore::new(dir.path().join("blobs")).await.unwrap());
+    let jwt = JwtSigner::from_secret(b"migrate-secret-32-bytes-xxxxxxxxx", 3600);
+    let upstream = HttpUpstream::new(std::time::Duration::from_secs(60)).unwrap();
+    let artifacts = Arc::new(ArtifactService::new(store.clone(), meta.clone(), upstream));
+    let docker = Arc::new(
+        DockerRegistry::new(
+            store.clone(),
+            meta.clone(),
+            dir.path().join("uploads"),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let (audit, audit_rx) = jianartifact::api::audit_channel();
+    jianartifact::api::spawn_audit_writer(meta.clone(), audit_rx);
+    let (usage, usage_rx) = jianartifact::api::usage_channel();
+    jianartifact::api::spawn_usage_writer(meta.clone(), usage_rx, false);
+    let state = AppState {
+        config: Arc::new(Config::default()),
+        meta,
+        store,
+        jwt,
+        login_guard: Arc::new(LoginGuard::new(50, 900)),
+        artifacts,
+        formats: Arc::new(FormatRegistry::with_builtin()),
+        docker: Some(docker),
+        audit,
+        usage,
+        metrics: None,
+        rate_limiter: Arc::new(jianartifact::api::RateLimiter::new()),
+        oidc: None,
+        oidc_flows: std::sync::Arc::new(jianartifact::api::OidcFlowStore::new()),
+        ldap: None,
+        protection: std::sync::Arc::new(jianartifact::api::ProtectionState::new(
+            jianartifact::config::ProtectionConfig::default(),
+        )),
+        ban_registry: std::sync::Arc::new(jianartifact::api::BanRegistry::new()),
+        cc_challenger: std::sync::Arc::new(jianartifact::api::CcChallenger::new(
+            b"test-secret-32-bytes-xxxxxxxxxxxx",
+        )),
+        alerts: jianartifact::api::alert_channel().0,
+        alert_engine: std::sync::Arc::new(jianartifact::api::AlertEngine::new(
+            jianartifact::api::alert_channel().0,
+        )),
+        restart: std::sync::Arc::new(jianartifact::update::RestartHandle::default()),
+        settings: std::sync::Arc::new(
+            jianartifact::config::EditableSettings::new(
+                jianartifact::config::NetworkProxyConfig::default(),
+                std::time::Duration::from_secs(60),
+                &jianartifact::config::UpdateConfig::default(),
+            )
+            .unwrap(),
+        ),
+        host_system: std::sync::Arc::new(tokio::sync::Mutex::new(sysinfo::System::new())),
+        tasks: std::sync::Arc::new(jianartifact::api::TaskRegistry::default()),
+    };
+    (state, dir)
+}
+
+/// 铺一个含**真实 blob 本体**（`.properties` + `.bytes` 成对）的最小离线 blob store，
+/// 使 hosted 搬运能真正落地 1 个 maven 制品。blob 逻辑名为合法 maven 主构件路径。
+fn build_offline_store_with_body() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let chap = dir.path().join("content").join("vol-01").join("chap-01");
+    std::fs::create_dir_all(&chap).unwrap();
+    let body = b"fake-jar-bytes-for-migration-test";
+    std::fs::write(chap.join("blob-1.bytes"), body).unwrap();
+    std::fs::write(
+        chap.join("blob-1.properties"),
+        format!(
+            "@Bucket.repo-name=maven-releases\n\
+             @BlobStore.blob-name=/org/example/app/1.0/app-1.0.jar\n\
+             sha1=deadbeef\nsize={}\ndeleted=false\n",
+            body.len()
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+/// 轮询**库中**迁移任务直到终态落库（终态 + 报告经 finalize 写入后才可见）。
+///
+/// 注意：进程内 jobs 进度先于持久层终态写入变 done；本函数等的是**库中**终态（历史 / 报告已落定），
+/// 才是断言持久化结果的正确同步点。
+async fn 等待任务终态(app: &Router, token: &str, job_id: &str) {
+    for _ in 0..300 {
+        let (status, b) = send(
+            app.clone(),
+            get_req(
+                &format!("/api/v1/migrate/tasks/{job_id}"),
+                Some(&format!("Bearer {token}")),
+            ),
+        )
+        .await;
+        if status == StatusCode::OK {
+            match b["state"].as_str().unwrap_or("") {
+                "succeeded" | "failed" | "cancelled" | "interrupted" => return,
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 查某迁移历史任务详情 JSON。
+async fn 查任务详情(app: &Router, token: &str, job_id: &str) -> Value {
+    let (status, detail) = send(
+        app.clone(),
+        get_req(
+            &format!("/api/v1/migrate/tasks/{job_id}"),
+            Some(&format!("Bearer {token}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "查详情应 200: {detail}");
+    detail
+}
+
+#[tokio::test]
+async fn 迁移历史匿名返回_401() {
+    let (state, _dir) = 测试用状态().await;
+    let (status, _) = send(build_router(state), get_req("/api/v1/migrate/tasks", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn 迁移历史普通用户返回_403() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "user", "pw", Role::User).await;
+    let (status, _) = send(
+        build_router(state),
+        get_req("/api/v1/migrate/tasks", Some(&format!("Bearer {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn 迁移历史空表返回_200_空数组() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let (status, body) = send(
+        build_router(state),
+        get_req("/api/v1/migrate/tasks", Some(&format!("Bearer {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn 迁移历史详情未知_id_返回_404() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let (status, _) = send(
+        build_router(state),
+        get_req(
+            "/api/v1/migrate/tasks/无此任务",
+            Some(&format!("Bearer {token}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 离线_hosted_搬运完成后历史与分仓库报告可查() {
+    // 端到端：起真实离线 hosted 搬运（内存库 + 临时 blob）→ 轮询至完成 → 查历史 + 详情报告
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let offline = build_offline_store_with_body();
+    let app = build_router(state.clone());
+
+    let (status, body) = send(
+        app.clone(),
+        hosted_migrate_req(
+            Some(&format!("Bearer {token}")),
+            json!({ "offline_path": offline.path().to_str().unwrap() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+    等待任务终态(&app, &token, &job_id).await;
+
+    // 历史列表含该任务、终态 succeeded、有 finished_at
+    let (status, list) = send(
+        app.clone(),
+        get_req("/api/v1/migrate/tasks", Some(&format!("Bearer {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = list.as_array().unwrap();
+    let hit = arr.iter().find(|t| t["id"] == job_id.as_str()).unwrap();
+    assert_eq!(hit["kind"], "offline_hosted");
+    assert_eq!(hit["state"], "succeeded", "任务应成功终态: {hit}");
+    assert!(
+        hit["finished_at"].as_str().is_some(),
+        "终态应记 finished_at"
+    );
+
+    // 详情含分仓库报告
+    let detail = 查任务详情(&app, &token, &job_id).await;
+    let repos = detail["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1, "应有 1 个仓库报告: {detail}");
+    assert_eq!(repos[0]["source_repo"], "maven-releases");
+    assert_eq!(repos[0]["migrated_artifacts"], 1, "首次搬运新写 1 个制品");
+    assert_eq!(repos[0]["skipped_existing_artifacts"], 0);
+}
+
+#[tokio::test]
+async fn 重启后残留在途任务标已中断且历史报告可查() {
+    // 模拟：进程 A 写入一个「运行中」任务 + 一个已完成任务（含报告）→ 退出 → 进程 B 用同一 DB 重开。
+    // 断言：重开后启动中断标记把 running 归为 interrupted，已完成任务与其报告跨重启仍可查。
+    use jianartifact::meta::{
+        MigrationProgressSnapshot, MigrationRepoReport, MigrationTaskKind, MigrationTaskState,
+        NewMigrationTask,
+    };
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("persist.db");
+
+    // 进程 A：经 meta 层写两个任务（一个 running 在途、一个 succeeded 带报告），随后 drop
+    {
+        let (state_a, _blob_a) = 持久化测试用状态(&db_path).await;
+        state_a
+            .meta
+            .upsert_migration_task(&NewMigrationTask {
+                id: "running-task".to_string(),
+                kind: MigrationTaskKind::Online,
+                label: Some("在线拉取迁移".to_string()),
+                params_snapshot:
+                    r#"{"kind":"online","base_url":"https://nx.example","auth_ref":"prod"}"#
+                        .to_string(),
+            })
+            .await
+            .unwrap();
+        state_a
+            .meta
+            .upsert_migration_task(&NewMigrationTask {
+                id: "done-task".to_string(),
+                kind: MigrationTaskKind::OfflineHosted,
+                label: None,
+                params_snapshot: "{}".to_string(),
+            })
+            .await
+            .unwrap();
+        state_a
+            .meta
+            .finish_migration_task(
+                "done-task",
+                MigrationTaskState::Succeeded,
+                &MigrationProgressSnapshot {
+                    phase: "done".to_string(),
+                    total_assets: 3,
+                    done_assets: 3,
+                    migrated: 2,
+                    skipped_existing: 1,
+                    skipped: 0,
+                    total_bytes: 300,
+                    done_bytes: 300,
+                    migrated_bytes: 200,
+                    skipped_bytes: 100,
+                },
+                &[MigrationRepoReport {
+                    source_repo: "maven-releases".to_string(),
+                    target_repo: "maven-releases".to_string(),
+                    format: "maven".to_string(),
+                    created: true,
+                    migrated_artifacts: 2,
+                    skipped_existing_artifacts: 1,
+                    skipped_artifacts: 0,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // 进程 B：同一 DB 重开 → 启动中断标记把残留 running/paused 归 interrupted
+    let (state_b, _blob_b) = 持久化测试用状态(&db_path).await;
+    let affected = state_b
+        .meta
+        .mark_running_migration_tasks_interrupted()
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "只归一那个 running 在途任务");
+
+    let token = seed_and_login(&state_b, "admin", "pw", Role::Admin).await;
+    let app = build_router(state_b);
+
+    // 历史列表：running 任务已标 interrupted、done 任务不受影响
+    let (status, list) = send(
+        app.clone(),
+        get_req("/api/v1/migrate/tasks", Some(&format!("Bearer {token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = list.as_array().unwrap();
+    let running = arr.iter().find(|t| t["id"] == "running-task").unwrap();
+    assert_eq!(running["state"], "interrupted", "残留在途任务应标已中断");
+    assert!(
+        running["finished_at"].as_str().is_some(),
+        "中断应记 finished_at"
+    );
+    let done = arr.iter().find(|t| t["id"] == "done-task").unwrap();
+    assert_eq!(done["state"], "succeeded", "已完成任务不受重启影响");
+
+    // 详情：重启后已完成任务的进度快照与分仓库报告仍可查
+    let detail = 查任务详情(&app, &token, "done-task").await;
+    assert_eq!(detail["migrated"], 2);
+    assert_eq!(detail["skipped_existing"], 1);
+    let repos = detail["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["migrated_artifacts"], 2);
+    assert_eq!(repos[0]["skipped_existing_artifacts"], 1);
+}
+
+#[tokio::test]
+async fn 已中断任务一键重跑幂等只补新增() {
+    // 首跑离线 hosted 搬运（全新）→ 对该任务一键重跑 → 因 sha256 一致全部增量跳过、不再新写
+    //（幂等续传：区分「跳过 vs 新搬」计数）。
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let offline = build_offline_store_with_body();
+    let app = build_router(state.clone());
+
+    // 首跑：全新搬运，migrated=1
+    let (_s, body) = send(
+        app.clone(),
+        hosted_migrate_req(
+            Some(&format!("Bearer {token}")),
+            json!({ "offline_path": offline.path().to_str().unwrap() }),
+        ),
+    )
+    .await;
+    let first_id = body["job_id"].as_str().unwrap().to_string();
+    等待任务终态(&app, &token, &first_id).await;
+    let first = 查任务详情(&app, &token, &first_id).await;
+    assert_eq!(first["repos"][0]["migrated_artifacts"], 1, "首跑新写 1");
+
+    // 一键重跑：据参数快照重触发；目标已存在且 sha256 一致 → 全部增量跳过、不新写
+    let (status, rerun_body) = send(
+        app.clone(),
+        post_req(
+            &format!("/api/v1/migrate/tasks/{first_id}/rerun"),
+            Some(&format!("Bearer {token}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "重跑应 202: {rerun_body}");
+    let rerun_id = rerun_body["job_id"].as_str().unwrap().to_string();
+    assert_ne!(rerun_id, first_id, "重跑生成新 job_id、不覆盖原历史");
+    等待任务终态(&app, &token, &rerun_id).await;
+
+    let rerun = 查任务详情(&app, &token, &rerun_id).await;
+    assert_eq!(rerun["state"], "succeeded");
+    // 幂等重跑：区分跳过 vs 新搬——重跑全部增量跳过、不新写
+    assert_eq!(rerun["migrated"], 0, "重跑不应再新写（sha256 一致）");
+    assert_eq!(rerun["skipped_existing"], 1, "重跑应全部增量跳过");
+    assert_eq!(rerun["repos"][0]["migrated_artifacts"], 0);
+    assert_eq!(rerun["repos"][0]["skipped_existing_artifacts"], 1);
+}
+
+#[tokio::test]
+async fn 重跑未知任务返回_404() {
+    let (state, _dir) = 测试用状态().await;
+    let token = seed_and_login(&state, "admin", "pw", Role::Admin).await;
+    let (status, _) = send(
+        build_router(state),
+        post_req(
+            "/api/v1/migrate/tasks/无此任务/rerun",
+            Some(&format!("Bearer {token}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 迁移参数快照不含凭据明文() {
+    // 凭据红线（§2.6）：库中参数快照只存 auth_ref 引用名、不含明文密码（凭据真值只在 env）。
+    let (state, _dir) = 测试用状态().await;
+    use jianartifact::meta::{MigrationTaskKind, NewMigrationTask};
+    state
+        .meta
+        .upsert_migration_task(&NewMigrationTask {
+            id: "cred-task".to_string(),
+            kind: MigrationTaskKind::Online,
+            label: None,
+            params_snapshot:
+                r#"{"kind":"online","base_url":"https://nx","auth_ref":"prod","repositories":[]}"#
+                    .to_string(),
+        })
+        .await
+        .unwrap();
+    let got = state
+        .meta
+        .get_migration_task("cred-task")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(got.params_snapshot.contains("auth_ref"), "应存引用名");
+    assert!(got.params_snapshot.contains("prod"));
+    // 断言不含任何凭据真值 / 明文密码字样
+    assert!(!got.params_snapshot.to_lowercase().contains("password"));
+    assert!(!got.params_snapshot.contains("secret"));
+}

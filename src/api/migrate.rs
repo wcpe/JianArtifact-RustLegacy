@@ -14,12 +14,13 @@ use axum::{http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::meta::MigrationTaskKind;
 use crate::migrate::{
     self, HttpNexusClient, JobControl, MigrateError, NexusRepoSummary, OnlinePullPhase,
     OnlinePullProgress,
 };
 
-use super::{ApiError, AppState, Identity, MigrationJobs, TaskState};
+use super::{ApiError, AppState, Identity, MigrationJobs, MigrationPersister, TaskState};
 
 /// 把迁移入口错误映射为 HTTP 错误。
 impl From<MigrateError> for ApiError {
@@ -209,12 +210,26 @@ pub async fn migrate_nexus_proxy(
     let control = Arc::new(JobControl::default());
     jobs.register(job_id.clone(), progress.clone(), control.clone());
 
+    // FR-140：迁移任务落库首行 + 节流进度 ticker
+    let params = offline_params_snapshot("offline_proxy", &offline_path, &selected_repositories);
+    let persister = Arc::new(
+        MigrationPersister::begin(
+            state.meta.clone(),
+            job_id.clone(),
+            MigrationTaskKind::OfflineProxy,
+            Some("离线 proxy 搬运".to_string()),
+            params,
+        )
+        .await,
+    );
+
     let meta = state.meta.clone();
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
+        let ticker = persister.clone().spawn_progress_ticker(progress.clone());
         let result = migrate::migrate_proxy_repositories_offline_with_progress(
             &meta,
             &artifacts,
@@ -242,7 +257,15 @@ pub async fn migrate_nexus_proxy(
             }
             p.phase
         };
-        sync_migration_task_state(&tasks, &task_job_id, final_phase);
+        finalize_migration_task(
+            &tasks,
+            &task_job_id,
+            final_phase,
+            &progress,
+            &persister,
+            ticker,
+        )
+        .await;
         tracing::info!(任务 = %task_job_id, "离线 proxy 仓库搬运后台任务结束");
     });
 
@@ -326,6 +349,19 @@ pub async fn migrate_nexus_hosted(
     let control = Arc::new(JobControl::default());
     jobs.register(job_id.clone(), progress.clone(), control.clone());
 
+    // FR-140：迁移任务落库首行 + 节流进度 ticker
+    let params = offline_params_snapshot("offline_hosted", &offline_path, &selected_repositories);
+    let persister = Arc::new(
+        MigrationPersister::begin(
+            state.meta.clone(),
+            job_id.clone(),
+            MigrationTaskKind::OfflineHosted,
+            Some("离线 hosted 搬运".to_string()),
+            params,
+        )
+        .await,
+    );
+
     let meta = state.meta.clone();
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
@@ -333,6 +369,7 @@ pub async fn migrate_nexus_hosted(
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
+        let ticker = persister.clone().spawn_progress_ticker(progress.clone());
         let result = migrate::migrate_hosted_repositories_offline_with_progress(
             &meta,
             &artifacts,
@@ -360,7 +397,15 @@ pub async fn migrate_nexus_hosted(
             }
             p.phase
         };
-        sync_migration_task_state(&tasks, &task_job_id, final_phase);
+        finalize_migration_task(
+            &tasks,
+            &task_job_id,
+            final_phase,
+            &progress,
+            &persister,
+            ticker,
+        )
+        .await;
         tracing::info!(任务 = %task_job_id, "离线 hosted 仓库搬运后台任务结束");
     });
 
@@ -496,6 +541,19 @@ pub async fn migrate_nexus_online(
     let control = Arc::new(JobControl::default());
     jobs.register(job_id.clone(), progress.clone(), control.clone());
 
+    // FR-140：迁移任务落库首行 + 节流进度 ticker。参数快照仅存 auth_ref 引用与非敏感配置，凭据真值不入库。
+    let params = online_params_snapshot(&base_url, req.auth_ref.as_deref(), &req.repositories);
+    let persister = Arc::new(
+        MigrationPersister::begin(
+            state.meta.clone(),
+            job_id.clone(),
+            MigrationTaskKind::Online,
+            Some("在线拉取迁移".to_string()),
+            params,
+        )
+        .await,
+    );
+
     let meta = state.meta.clone();
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
@@ -503,6 +561,7 @@ pub async fn migrate_nexus_online(
     let tasks = state.tasks.clone();
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
+        let ticker = persister.clone().spawn_progress_ticker(progress.clone());
         let result = migrate::migrate_online_with_progress(
             &client,
             &meta,
@@ -534,12 +593,58 @@ pub async fn migrate_nexus_online(
             }
             p.phase
         };
-        // 据 kind 专表终态同步统一注册表（FR-131），释放迁移单飞门
-        sync_migration_task_state(&tasks, &task_job_id, final_phase);
+        finalize_migration_task(
+            &tasks,
+            &task_job_id,
+            final_phase,
+            &progress,
+            &persister,
+            ticker,
+        )
+        .await;
         tracing::info!(任务 = %task_job_id, "在线拉取后台任务结束");
     });
 
     Ok((StatusCode::ACCEPTED, Json(JobCreatedDto { job_id })))
+}
+
+/// 构造在线拉取迁移的**脱敏**参数快照 JSON（供重跑，凭据真值绝不入库，仅存 `auth_ref` 引用名）。
+fn online_params_snapshot(
+    base_url: &str,
+    auth_ref: Option<&str>,
+    repositories: &[OnlineRepoSelectionDto],
+) -> String {
+    let repos: Vec<serde_json::Value> = repositories
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source": r.source.trim(),
+                "target": r.target.as_deref().map(str::trim).filter(|t| !t.is_empty()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "kind": "online",
+        "base_url": base_url,
+        // 仅引用名，凭据真值走 env、绝不入库
+        "auth_ref": auth_ref.filter(|r| !r.is_empty()),
+        "repositories": repos,
+    })
+    .to_string()
+}
+
+/// 构造离线搬运（proxy / hosted）的参数快照 JSON（无凭据；离线路径 + 可选仓库白名单）。
+fn offline_params_snapshot(
+    kind: &str,
+    offline_path: &str,
+    repositories: &Option<Vec<String>>,
+) -> String {
+    serde_json::json!({
+        "kind": kind,
+        "offline_path": offline_path,
+        "repositories": repositories,
+    })
+    .to_string()
 }
 
 /// 把迁移 kind 专表的最终阶段映射并同步到统一任务注册表（FR-131）。
@@ -560,6 +665,36 @@ fn sync_migration_task_state(
         // 非终态：后台任务正常结束不会停在此（防御性不更新，避免误把在途置终态）
         OnlinePullPhase::Enumerating | OnlinePullPhase::Downloading | OnlinePullPhase::Paused => {}
     }
+}
+
+/// 后台迁移任务收尾（FR-131 + FR-140）：同步统一注册表终态 + 停节流 ticker + 写持久化终态报告。
+///
+/// 先同步统一注册表释放单飞门（保持 FR-131 行为不变），再 `abort` 节流 ticker，最后据统一注册表
+/// 终态与最终进度快照把完整报告 + 分仓库明细落库（ADR-0040 终态强一致）。持久化失败只记 WARN、
+/// 不影响业务（历史缺一条可接受）。
+async fn finalize_migration_task(
+    tasks: &Arc<super::TaskRegistry>,
+    job_id: &str,
+    final_phase: OnlinePullPhase,
+    progress: &Arc<Mutex<OnlinePullProgress>>,
+    persister: &MigrationPersister,
+    ticker: tokio::task::JoinHandle<()>,
+) {
+    // 先据 kind 专表终态同步统一注册表（FR-131），释放迁移单飞门
+    sync_migration_task_state(tasks, job_id, final_phase);
+    // 停节流 ticker，避免其与终态写竞态覆盖
+    ticker.abort();
+    // 取统一注册表的终态（succeeded / failed / cancelled）作为持久层终态来源
+    let final_state = tasks
+        .get(job_id)
+        .map(|t| t.state)
+        .unwrap_or(TaskState::Failed);
+    // 锁外 clone 出最终进度快照，落终态 + 完整报告
+    let snapshot = {
+        let g = progress.lock().unwrap_or_else(|e| e.into_inner());
+        g.clone()
+    };
+    persister.finish(final_state, &snapshot).await;
 }
 
 /// 查询某在线拉取任务的进度（仅管理员，FR-83）。未知 id 返回 404。
@@ -634,9 +769,17 @@ pub async fn migrate_nexus_job_pause(
     identity.require_admin()?;
     let control = job_control(&jobs, &job_id)?;
     control.request_pause();
-    state
+    // 仅当命中可控在途搬运任务才同步状态（离线预览等不可控任务不改写）
+    if state
         .tasks
-        .set_controllable_migration_state(&job_id, TaskState::Paused);
+        .set_controllable_migration_state(&job_id, TaskState::Paused)
+    {
+        // FR-140：状态变更即时落库（暂停），失败只记 WARN 不影响业务
+        let _ = state
+            .meta
+            .set_migration_task_state(&job_id, crate::meta::MigrationTaskState::Paused)
+            .await;
+    }
     tracing::info!(任务 = %job_id, "已请求暂停在线拉取任务");
     Ok(StatusCode::OK)
 }
@@ -654,9 +797,17 @@ pub async fn migrate_nexus_job_resume(
     identity.require_admin()?;
     let control = job_control(&jobs, &job_id)?;
     control.request_resume();
-    state
+    // 仅当命中可控在途搬运任务才同步状态
+    if state
         .tasks
-        .set_controllable_migration_state(&job_id, TaskState::Running);
+        .set_controllable_migration_state(&job_id, TaskState::Running)
+    {
+        // FR-140：状态变更即时落库（继续），失败只记 WARN 不影响业务
+        let _ = state
+            .meta
+            .set_migration_task_state(&job_id, crate::meta::MigrationTaskState::Running)
+            .await;
+    }
     tracing::info!(任务 = %job_id, "已请求继续在线拉取任务");
     Ok(StatusCode::OK)
 }
@@ -699,6 +850,268 @@ pub async fn migrate_nexus_group(
         "group 仓库迁移完成"
     );
     Ok(Json(report))
+}
+
+/// 迁移历史列表默认返回上限（近期任务，避免一次拉爆）。
+const MIGRATION_HISTORY_LIMIT: i64 = 100;
+
+/// 迁移历史任务的分仓库报告项（对外 DTO）。
+#[derive(Debug, Serialize)]
+pub struct MigrationRepoReportDto {
+    /// 源仓库名。
+    pub source_repo: String,
+    /// 本系统目标仓库名。
+    pub target_repo: String,
+    /// 本系统格式名。
+    pub format: String,
+    /// 目标仓库是否新建。
+    pub created: bool,
+    /// 成功新写入的制品数。
+    pub migrated_artifacts: i64,
+    /// 增量跳过数（目标已存在且 sha256 一致）。
+    pub skipped_existing_artifacts: i64,
+    /// 失败跳过数。
+    pub skipped_artifacts: i64,
+}
+
+/// 迁移历史任务记录（对外 DTO）：列表项与详情共用的任务元数据 + 进度快照。
+#[derive(Debug, Serialize)]
+pub struct MigrationTaskDto {
+    /// 任务 id。
+    pub id: String,
+    /// 迁移类别（online / offline_proxy / offline_hosted）。
+    pub kind: String,
+    /// 统一状态（running / paused / succeeded / failed / cancelled / interrupted）。
+    pub state: String,
+    /// 人类可读标签。
+    pub label: Option<String>,
+    /// 引擎阶段。
+    pub phase: String,
+    /// 已枚举待搬运 asset 总数。
+    pub total_assets: i64,
+    /// 已处理 asset 数。
+    pub done_assets: i64,
+    /// 成功新写入数。
+    pub migrated: i64,
+    /// 增量跳过数。
+    pub skipped_existing: i64,
+    /// 失败跳过数。
+    pub skipped: i64,
+    /// 待搬运逻辑总字节数。
+    pub total_bytes: i64,
+    /// 已处理逻辑字节数。
+    pub done_bytes: i64,
+    /// 成功新写入逻辑字节数。
+    pub migrated_bytes: i64,
+    /// 跳过 / 失败逻辑字节数。
+    pub skipped_bytes: i64,
+    /// 失败原因（失败时非空）。
+    pub error: Option<String>,
+    /// 起始时刻。
+    pub started_at: String,
+    /// 最近落库时刻。
+    pub updated_at: String,
+    /// 终态时刻（未结束为空）；与 started_at 之差即耗时。
+    pub finished_at: Option<String>,
+}
+
+impl From<crate::meta::MigrationTaskRecord> for MigrationTaskDto {
+    fn from(r: crate::meta::MigrationTaskRecord) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            state: r.state,
+            label: r.label,
+            phase: r.phase,
+            total_assets: r.total_assets,
+            done_assets: r.done_assets,
+            migrated: r.migrated,
+            skipped_existing: r.skipped_existing,
+            skipped: r.skipped,
+            total_bytes: r.total_bytes,
+            done_bytes: r.done_bytes,
+            migrated_bytes: r.migrated_bytes,
+            skipped_bytes: r.skipped_bytes,
+            error: r.error,
+            started_at: r.started_at,
+            updated_at: r.updated_at,
+            finished_at: r.finished_at,
+        }
+    }
+}
+
+/// 迁移历史任务详情（DTO）：任务记录 + 分仓库报告。
+#[derive(Debug, Serialize)]
+pub struct MigrationTaskDetailDto {
+    /// 任务记录（含进度快照）。
+    #[serde(flatten)]
+    pub task: MigrationTaskDto,
+    /// 分仓库明细报告。
+    pub repos: Vec<MigrationRepoReportDto>,
+}
+
+/// 列出迁移历史（库中持久记录，仅 Admin，FR-140）。
+///
+/// 与 `GET /migrate/jobs`（进程内活跃任务）互补：本端点返回跨重启的历史 + 报告视图，
+/// 含重启后被标 `interrupted` 的任务。按起始时刻倒序。
+pub async fn list_migration_tasks(
+    State(state): State<AppState>,
+    identity: Identity,
+) -> Result<Json<Vec<MigrationTaskDto>>, ApiError> {
+    identity.require_admin()?;
+    let records = state
+        .meta
+        .list_migration_tasks(MIGRATION_HISTORY_LIMIT)
+        .await
+        .map_err(db_internal)?;
+    Ok(Json(
+        records.into_iter().map(MigrationTaskDto::from).collect(),
+    ))
+}
+
+/// 把 meta 层错误映射为 500，并记 WARN（不向调用方泄露 DB 内部细节）。
+fn db_internal(e: crate::meta::MetaError) -> ApiError {
+    tracing::warn!(错误 = %e, "迁移历史查询 / 落库失败");
+    ApiError::Internal
+}
+
+/// 查单个迁移历史任务详情 + 分仓库报告（仅 Admin，FR-140）。未知 id 返回 404。
+pub async fn get_migration_task(
+    State(state): State<AppState>,
+    identity: Identity,
+    Path(task_id): Path<String>,
+) -> Result<Json<MigrationTaskDetailDto>, ApiError> {
+    identity.require_admin()?;
+    let task = state
+        .meta
+        .get_migration_task(&task_id)
+        .await
+        .map_err(db_internal)?
+        .ok_or(ApiError::NotFound)?;
+    let repos = state
+        .meta
+        .get_migration_task_repos(&task_id)
+        .await
+        .map_err(db_internal)?;
+    Ok(Json(MigrationTaskDetailDto {
+        task: MigrationTaskDto::from(task),
+        repos: repos
+            .into_iter()
+            .map(|r| MigrationRepoReportDto {
+                source_repo: r.source_repo,
+                target_repo: r.target_repo,
+                format: r.format,
+                created: r.created != 0,
+                migrated_artifacts: r.migrated_artifacts,
+                skipped_existing_artifacts: r.skipped_existing_artifacts,
+                skipped_artifacts: r.skipped_artifacts,
+            })
+            .collect(),
+    }))
+}
+
+/// 一键幂等重跑某历史迁移任务（仅 Admin，FR-140）。
+///
+/// 据任务库中**脱敏参数快照**重建原请求，委托对应触发端点重新执行一次幂等搬运——复用既有引擎的
+/// sha256 跳过（目标已存在且一致即跳过），进度区分「跳过 vs 新搬」，等效断点续传。凭据仍从 env 现解析
+/// （快照只存 `auth_ref` 引用），不从库取。复用既有迁移单飞门（已有在途则 409）。
+///
+/// 未知 id / 无参数快照返回 404 / 400；快照解析失败返回 400。重跑生成**新 job_id**（不覆盖原历史记录）。
+pub async fn rerun_migration_task(
+    State(state): State<AppState>,
+    Extension(jobs): Extension<Arc<MigrationJobs>>,
+    identity: Identity,
+    Path(task_id): Path<String>,
+) -> Result<(StatusCode, Json<JobCreatedDto>), ApiError> {
+    identity.require_admin()?;
+    let task = state
+        .meta
+        .get_migration_task(&task_id)
+        .await
+        .map_err(db_internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    // 解析脱敏参数快照 → 据 kind 重建请求并委托对应触发端点（复用其校验 / 单飞 / 落库）
+    let params: serde_json::Value = serde_json::from_str(&task.params_snapshot)
+        .map_err(|_| ApiError::BadRequest("迁移参数快照损坏，无法重跑".to_string()))?;
+    let kind = params.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "online" => {
+            let req = rebuild_online_request(&params)?;
+            migrate_nexus_online(State(state), Extension(jobs), identity, Json(req)).await
+        }
+        "offline_proxy" => {
+            let req = NexusProxyMigrateRequest {
+                offline_path: rebuild_offline_path(&params)?,
+                repositories: rebuild_offline_repositories(&params),
+            };
+            migrate_nexus_proxy(State(state), Extension(jobs), identity, Json(req)).await
+        }
+        "offline_hosted" => {
+            let req = NexusHostedMigrateRequest {
+                offline_path: rebuild_offline_path(&params)?,
+                repositories: rebuild_offline_repositories(&params),
+            };
+            migrate_nexus_hosted(State(state), Extension(jobs), identity, Json(req)).await
+        }
+        _ => Err(ApiError::BadRequest(
+            "迁移参数快照类别未知，无法重跑".to_string(),
+        )),
+    }
+}
+
+/// 从参数快照重建在线拉取请求。
+fn rebuild_online_request(
+    params: &serde_json::Value,
+) -> Result<NexusOnlineMigrateRequest, ApiError> {
+    let base_url = params
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::BadRequest("迁移参数快照缺 base_url".to_string()))?;
+    let auth_ref = params
+        .get("auth_ref")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let repositories = params
+        .get("repositories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let source = r.get("source").and_then(|v| v.as_str())?.to_string();
+                    let target = r.get("target").and_then(|v| v.as_str()).map(str::to_string);
+                    Some(OnlineRepoSelectionDto { source, target })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(NexusOnlineMigrateRequest {
+        base_url,
+        auth_ref,
+        repositories,
+    })
+}
+
+/// 从参数快照重建离线路径。
+fn rebuild_offline_path(params: &serde_json::Value) -> Result<String, ApiError> {
+    params
+        .get("offline_path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::BadRequest("迁移参数快照缺 offline_path".to_string()))
+}
+
+/// 从参数快照重建离线仓库白名单（可空）。
+fn rebuild_offline_repositories(params: &serde_json::Value) -> Option<Vec<String>> {
+    params
+        .get("repositories")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        })
 }
 
 #[cfg(test)]
