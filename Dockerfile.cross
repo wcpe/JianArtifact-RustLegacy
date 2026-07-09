@@ -41,4 +41,7 @@ RUN rustup component add rust-src \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
     && cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
 
+# bash -l 登录 shell 经 /etc/profile 重置 PATH、丢掉 /usr/local/cargo/bin，补 profile.d 脚本让 cargo 在登录 shell 可见
+RUN printf 'export PATH=/usr/local/cargo/bin:$PATH\n' > /etc/profile.d/cargo.sh
+
 WORKDIR /workspace
