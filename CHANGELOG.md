@@ -6,6 +6,10 @@
 
 ## 未发布版本
 
+（暂无）
+
+## 0.6.0（2026-07-09）
+
 ### 新增
 - Linux systemd 自动部署（FR-139）：新增 `make env` / `make ssh-key` / `make cross-image` / `make cross-build` / `make deploy`，通过项目内 `Dockerfile.cross` 在 Docker 中构建 Linux amd64 / arm64 tar.gz，再由 `scripts/deploy-linux-systemd.sh` 使用 SSH key 上传并安装远端 systemd 服务。部署过程不提交 `.env` / SSH 私钥 / `output/` 产物，重复执行不清空数据目录、不覆盖已有 `config.toml`，替换二进制前先停止服务并备份旧文件；本地语法与 dry-run 可验，真实服务器部署需用户提供 Linux systemd 环境。
 - 离线迁移增量幂等续传（FR-134，增强 FR-38/39）：支持「旧仓库未停、边迁边用、反复跑至一致」——重跑时**跳过目标已存在且 sha256 一致**的制品、只搬新增 / 变化的。`ingest_cached` / `ingest_hosted` 改返 `IngestOutcome`（`Written` 新写 / `AlreadyExists` 命中一致已存在），搬运层（proxy/hosted）据此把进度 `skipped` 拆为「**增量跳过**（已存在一致）」与「**失败跳过**（路径非法 / 不可覆盖 / 读写失败）」两类计数，`migrated` 只计真正新写；二次跑同源 `migrated=0`、增量跳过=N，可反复跑收敛。既有幂等 / 单飞 / 取消 / 暂停 / 「blob 先落盘校验再写索引、失败回滚」不变量不变；无新依赖。单测覆盖二次跑增量跳过、进度分类计数、失败跳过不计入增量跳过。**真实大库多次增量迁移属真机维度、待真机验收**
