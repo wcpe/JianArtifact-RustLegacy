@@ -561,7 +561,12 @@ export interface MigrationJobCreated {
  * 严格对齐后端 phase 字段取值。
  */
 export type OnlinePullPhase =
-  'enumerating' | 'downloading' | 'paused' | 'cancelled' | 'done' | 'failed';
+  | 'enumerating'
+  | 'downloading'
+  | 'paused'
+  | 'cancelled'
+  | 'done'
+  | 'failed';
 
 /**
  * 在线拉取任务进度快照（GET /migrate/jobs/{id}）。
@@ -868,7 +873,13 @@ export type UpdateKind = 'check' | 'apply' | 'rollback';
 
 /** 更新任务阶段（FR-126）：按阶段反馈，不做字节级假百分比。 */
 export type UpdatePhase =
-  'checking' | 'downloading' | 'verifying' | 'replacing' | 'restarting' | 'done' | 'failed';
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
+  | 'replacing'
+  | 'restarting'
+  | 'done'
+  | 'failed';
 
 /** 更新任务进度快照（GET /api/v1/update/jobs/{id}，FR-126）。 */
 export interface UpdateJob {
@@ -979,7 +990,12 @@ export type MigrationTaskKind = 'online' | 'offline_proxy' | 'offline_hosted';
  * 进程重启时残留的在途（running / paused）任务被归一为已中断。
  */
 export type MigrationHistoryState =
-  'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  | 'running'
+  | 'paused'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
 
 /**
  * 迁移历史任务记录（GET /migrate/tasks 列表项；GET /migrate/tasks/{id} 展平字段）。
