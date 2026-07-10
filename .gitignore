@@ -48,3 +48,4 @@ config.local.toml
 /rust_out.exe
 /rust_out.pdb
 /output/
+/.pnpm-store/

@@ -186,6 +186,8 @@
 | FR-143 | [增强 FR-82] 在线 hosted 搬运扩 Raw + npm：REST 枚举 + HTTP 流式下载，复用既有幂等 / 重试 / 校验引擎；proxy 仓库在线只迁配置不搬缓存。验收：真机对源 Nexus raw / npm hosted 迁移后，curl GET / npm install 从本系统成功且 sha256 一致 | P2 | M4 | 已交付@v0.6.0 |
 | FR-144 | [增强 FR-82] 在线 hosted 搬运扩 Docker/OCI：经 registry v2 协议按 manifest + layers 搬运镜像（tag 清单 → manifest → 层 blob，校验 digest）。验收：真机迁移后 docker pull 从本系统成功、digest 一致 | P2 | M4 | 开发中 |
 | FR-145 | [增强 FR-140] 迁移报告 per-asset 明细与 per-repo 字节/耗时：改迁移引擎产出并落库 per-asset 失败清单与原因、per-repo 字节数与耗时，补齐 ADR-0040 报告口径（FR-140 为避免写放大与引擎侵入，仅持久化了聚合字节 + per-repo 计数 + 任务级 error）。验收：迁移完成后报告含 per-asset 失败原因与 per-repo 字节 / 耗时 | P2 | M4 | 计划 |
+| FR-146 | [增强 FR-84/100，先写新 ADR 取代 ADR-0024 三键决策] 单一通用出站代理：`[network.proxy]` 收敛为单键 `url`（用户自填前缀 `http://` / `https://` / `socks5://` / `socks5h://`）+ `no_proxy`，经 `Proxy::all` 注入全 scheme；旧 `http`/`https`/`all` 键自动映射（优先 all > https > http）并启动 WARN 废弃提示；凭据保持 URL + 用户名 + 密码三字段（密码三态不回显，沿用 ADR-0024 安全模型）；设置页只剩一个代理槽位。验收：旧三键配置启动可用且有 WARN；真机各配一次 socks5 与 http 代理，proxy 回源 / 漏洞库 / 更新检查经代理成功 | P2 | M4 | 已交付@v0.7.0 |
+| FR-147 | [增强 FR-128，依赖 FR-146] 代理测试重做：测试改为验证**表单当前填的代理**（proxy-test 接受可选代理参数，后端临时构造 client；密码未填回落已存凭据）；默认目标 URL 固定 `https://www.google.com`、不再预填代理地址；loading 永不卡死（双层超时真机生效，10s 内必出结果或超时提示）。验收：真机填好未保存即可测试、成败结果正确；反复开关模态框无残留卡死 | P2 | M4 | 已交付@v0.7.0 |
 
 > 状态取值：计划 / 开发中 / 已交付@vX.Y.Z。优先级：P1(MVP) / P2 / P3——只表达重要性。期（M1~M5）：路线图归属，见 §7；期与优先级解耦，判断某期完成度看该期 FR 的状态列。
 > 标 `已交付` 是有门的：只有该 FR 的 §6 / spec 验收标准全部满足、对应测试 / 实机验收通过后，才由 `sdd-release-version` 在发版时统一标 `已交付@vX.Y.Z`——开发 / 修复过程中不得自行预标。FR 标了 `已交付` 实际是断的（false-done）：功能坏了要修回 done 走 `sdd-fix-bug` 把状态归真（从没真正工作过 → 回退 `开发中`）；需求本身要撤 / 推迟则走 `sdd-rollback-change`。

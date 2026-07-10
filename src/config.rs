@@ -963,27 +963,64 @@ pub struct NetworkConfig {
     pub proxy: NetworkProxyConfig,
 }
 
-/// 出站正向代理配置（FR-84，ADR-0020；`all` 见 FR-100 / ADR-0024）。
+/// 出站正向代理配置（FR-146 / ADR-0042 单键收敛；历史见 FR-84 / ADR-0020、FR-100 / ADR-0024）。
 ///
-/// 四键均默认 `None`：全不配置时不显式注入代理，保持 reqwest 既有行为不变
-/// （含其默认 honor 系统 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 环境变量）。
-/// 任一键给值即以配置为真源（见 [`build_outbound_client`] 与 ADR-0020 / ADR-0024）。
+/// 唯一生效键为 `url`：单一通用代理，经 [`reqwest::Proxy::all`] 注入全 scheme。全不配置时不显式
+/// 注入代理，保持 reqwest 既有行为不变（含其默认 honor 系统 `HTTP_PROXY` / `HTTPS_PROXY` /
+/// `NO_PROXY` 环境变量）；给值即以配置为真源（见 [`build_outbound_client`]）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkProxyConfig {
-    /// HTTP 出站代理 URL（如 `http://proxy.internal:8080`，可含 `user:pass@` 凭据）。
+    /// 通用出站代理 URL：接受 `http://` / `https://` / `socks5://` / `socks5h://` 前缀，
+    /// 可含 `user:pass@` 凭据（如 `socks5://user:pass@proxy.internal:1080`）。
     #[serde(default)]
+    pub url: Option<String>,
+    /// 已废弃（ADR-0042）：旧 HTTP scheme 专属代理键，仅为旧配置反序列化兼容保留，
+    /// 装载后经 [`Self::normalize`] 折叠进 `url` 并 WARN。
+    #[serde(default, skip_serializing)]
     pub http: Option<String>,
-    /// HTTPS 出站代理 URL。
-    #[serde(default)]
+    /// 已废弃（ADR-0042）：旧 HTTPS scheme 专属代理键，同 `http`。
+    #[serde(default, skip_serializing)]
     pub https: Option<String>,
-    /// 全 scheme 兜底代理 URL（FR-100 / ADR-0024）：接受 `socks5://` / `socks5h://` / `http(s)://`，
-    /// 可含 `user:pass@` 凭据，经 [`reqwest::Proxy::all`] 注入。`http` / `https` 仍为 scheme 专属代理、
-    /// 各自优先，`all` 兜底其余（仅配 `all` 即覆盖 http+https，正是 SOCKS5 单代理常见用法）。
-    #[serde(default)]
+    /// 已废弃（ADR-0042）：旧全 scheme 兜底代理键，同 `http`。
+    #[serde(default, skip_serializing)]
     pub all: Option<String>,
     /// 直连绕过列表（逗号分隔的主机 / 域 / CIDR），命中者不经代理。
     #[serde(default)]
     pub no_proxy: Option<String>,
+}
+
+impl NetworkProxyConfig {
+    /// 当前生效的代理 URL：`url` 为真源；未给时按旧键优先级 `all > https > http` 兜底（ADR-0042）。
+    pub fn effective_url(&self) -> Option<&str> {
+        self.url
+            .as_deref()
+            .or(self.all.as_deref())
+            .or(self.https.as_deref())
+            .or(self.http.as_deref())
+    }
+
+    /// 折叠旧三键为单键 `url`（ADR-0042 自动映射）：`url` 未给时按 `all > https > http` 取值；
+    /// 清空旧键并返回 WARN 文案（由调用方打日志——本方法保持纯函数便于穷举测试）。
+    pub fn normalize(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let has_legacy = self.http.is_some() || self.https.is_some() || self.all.is_some();
+        if has_legacy {
+            if self.url.is_none() {
+                self.url = self.effective_url().map(str::to_string);
+                warnings.push(
+                    "网络代理配置键 http / https / all 已废弃，已按优先级 all > https > http 自动映射为 url，请改用 [network.proxy] url".to_string(),
+                );
+            } else {
+                warnings.push(
+                    "网络代理配置同时给出了 url 与已废弃的 http / https / all，以 url 为准、旧键被忽略".to_string(),
+                );
+            }
+            self.http = None;
+            self.https = None;
+            self.all = None;
+        }
+        warnings
+    }
 }
 
 /// 在线更新配置（FR-85，ADR-0021）。
@@ -1032,18 +1069,18 @@ impl Default for UpdateConfig {
     }
 }
 
-/// 构造统一的出站 reqwest 客户端（FR-84，ADR-0020；`all` / SOCKS5 见 FR-100 / ADR-0024）。
+/// 通用代理 URL 允许的 scheme 前缀（FR-146 / ADR-0042）。
+const PROXY_URL_SCHEMES: [&str; 4] = ["http://", "https://", "socks5://", "socks5h://"];
+
+/// 构造统一的出站 reqwest 客户端（FR-146 / ADR-0042 单键；SOCKS5 见 FR-100 / ADR-0024）。
 ///
-/// 在固定的 rustls / stream / socks 特性（见 Cargo.toml）与给定整体超时基础上，按 `proxy`
-/// 配置注入出站正向代理：
-/// - `http` / `https` 任一给值即注入对应 scheme 的 [`reqwest::Proxy`]，并关闭 reqwest 的
-///   自动系统代理探测（配置为真源，压过系统环境）；
-/// - `all` 给值则经 [`reqwest::Proxy::all`] 注入全 scheme 兜底代理（启 `socks` 特性后认
-///   `socks5://` / `socks5h://` 并解析 `user:pass@` 为认证）；
-/// - 注入顺序固定 `http → https → all`：reqwest 按注册顺序首个匹配生效，scheme 专属的
-///   http / https 对各自 scheme 优先，`all` 兜底其余（仅配 `all` 即覆盖 http+https）；
-/// - `no_proxy` 给值则解析为绕过列表挂到所注入的各 Proxy 上；
-/// - 四键全空时不调用任何 `.proxy()`，保持 reqwest 默认行为（含其系统环境变量 honor），
+/// 在固定的 rustls / stream / socks 特性（见 Cargo.toml）与给定整体超时基础上，按
+/// [`NetworkProxyConfig::effective_url`]（`url` 为真源、旧键兜底）注入出站正向代理：
+/// - 给值即先校验 scheme（仅 `http://` / `https://` / `socks5://` / `socks5h://`），再经
+///   [`reqwest::Proxy::all`] 注入为全 scheme 代理，并关闭 reqwest 的自动系统代理探测
+///   （配置为真源，压过系统环境）；
+/// - `no_proxy` 给值则解析为绕过列表挂到所注入的 Proxy 上；
+/// - 全空时不调用 `.proxy()`，保持 reqwest 默认行为（含其系统环境变量 honor），
 ///   从而「不配置即与现状一致」。
 ///
 /// 失败返回的错误信息**不含原始代理 URL**（避免泄露代理凭据，守安全脱敏红线）。
@@ -1053,29 +1090,21 @@ pub fn build_outbound_client(
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder().timeout(timeout);
 
-    // no_proxy 解析一次，挂到每个注入的 Proxy 上（reqwest 的绕过列表绑定在 Proxy 维度）
-    let no_proxy = proxy
-        .no_proxy
-        .as_deref()
-        .and_then(reqwest::NoProxy::from_string);
-
-    // 注入顺序 http → https → all：scheme 专属者各自优先，all 兜底其余（首个匹配生效）
-    if let Some(url) = proxy.http.as_deref() {
-        let p = reqwest::Proxy::http(url)
-            .map_err(|_| "出站 HTTP 代理配置无效".to_string())?
-            .no_proxy(no_proxy.clone());
-        builder = builder.proxy(p);
-    }
-    if let Some(url) = proxy.https.as_deref() {
-        let p = reqwest::Proxy::https(url)
-            .map_err(|_| "出站 HTTPS 代理配置无效".to_string())?
-            .no_proxy(no_proxy.clone());
-        builder = builder.proxy(p);
-    }
-    if let Some(url) = proxy.all.as_deref() {
-        let p = reqwest::Proxy::all(url)
-            .map_err(|_| "出站全局(all)代理配置无效".to_string())?
-            .no_proxy(no_proxy.clone());
+    if let Some(url) = proxy.effective_url() {
+        let lower = url.trim().to_ascii_lowercase();
+        if !PROXY_URL_SCHEMES.iter().any(|s| lower.starts_with(s)) {
+            return Err(
+                "出站代理 URL 无效：仅支持 http:// / https:// / socks5:// / socks5h:// 前缀"
+                    .to_string(),
+            );
+        }
+        let no_proxy = proxy
+            .no_proxy
+            .as_deref()
+            .and_then(reqwest::NoProxy::from_string);
+        let p = reqwest::Proxy::all(url.trim())
+            .map_err(|_| "出站代理配置无效".to_string())?
+            .no_proxy(no_proxy);
         builder = builder.proxy(p);
     }
 
@@ -1114,8 +1143,16 @@ pub struct NetworkState {
 impl NetworkState {
     /// 用初始代理配置与超时构造热替换槽（启动期由 `[network.proxy]` 文件 / env 配置装载）。
     ///
-    /// 构造失败（代理 URL 无效 / TLS 初始化异常）冒泡给调用方；错误信息不含代理凭据。
-    pub fn new(proxy: NetworkProxyConfig, timeout: std::time::Duration) -> Result<Self, String> {
+    /// 先经 [`NetworkProxyConfig::normalize`] 折叠旧三键（ADR-0042）并对折叠情况打 WARN，
+    /// 保证快照内只有单键 `url` 生效。构造失败（代理 URL 无效 / TLS 初始化异常）冒泡给调用方；
+    /// 错误信息不含代理凭据。
+    pub fn new(
+        mut proxy: NetworkProxyConfig,
+        timeout: std::time::Duration,
+    ) -> Result<Self, String> {
+        for w in proxy.normalize() {
+            tracing::warn!("{w}");
+        }
         let client = build_outbound_client(timeout, &proxy)?;
         Ok(Self {
             current: std::sync::RwLock::new(std::sync::Arc::new(NetworkSnapshot {
@@ -1245,12 +1282,14 @@ impl EditableUpdate {
 ///
 /// 收拢两块可运行时调整的配置：出站网络代理（[`NetworkState`]，含据代理构造的 client）与在线更新
 /// 可调字段（[`EditableUpdate`]）。设置页 `PATCH /api/v1/settings` 校验后换槽即时生效、无须重启；
-/// 凭据（代理 `user:pass@` 与 update token）只入本内存槽、不写回 TOML / 不入 DB / 不回显。
+/// 代理密码由 API 层加密落库，update token 只入内存；二者均不写回 TOML、不回显。
 pub struct EditableSettings {
     /// 出站网络代理热替换槽（含当前 client）；`Arc` 共享给各出站点持有。
     pub network: std::sync::Arc<NetworkState>,
     /// 在线更新可调字段（`RwLock<Arc<..>>` 原子换）。
     update: std::sync::RwLock<std::sync::Arc<EditableUpdate>>,
+    /// 设置 PATCH 串行锁，保证运行时换槽与对应 DB 持久化顺序一致。
+    patch_lock: tokio::sync::Mutex<()>,
 }
 
 impl EditableSettings {
@@ -1268,7 +1307,13 @@ impl EditableSettings {
             update: std::sync::RwLock::new(std::sync::Arc::new(EditableUpdate::from_config(
                 update,
             ))),
+            patch_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// 串行进入设置 PATCH 的运行时换槽与 DB 持久化区。
+    pub async fn lock_patch(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.patch_lock.lock().await
     }
 
     /// 取当前在线更新可调配置：读锁内 clone `Arc` 立即放锁。
@@ -2009,10 +2054,9 @@ mod tests {
     #[test]
     fn 出站代理默认全为空() {
         let cfg = Config::default();
-        // 四键默认 None：不显式注入代理，保持现状（FR-84；all 见 FR-100）
-        assert!(cfg.network.proxy.http.is_none());
-        assert!(cfg.network.proxy.https.is_none());
-        assert!(cfg.network.proxy.all.is_none());
+        // 默认不配置代理：不显式注入，保持现状（FR-146 单键 url；旧键仅兼容反序列化）
+        assert!(cfg.network.proxy.url.is_none());
+        assert!(cfg.network.proxy.effective_url().is_none());
         assert!(cfg.network.proxy.no_proxy.is_none());
     }
 
@@ -2021,7 +2065,7 @@ mod tests {
         with_env_vars(
             &[
                 (
-                    "JIANARTIFACT_NETWORK_PROXY_HTTPS",
+                    "JIANARTIFACT_NETWORK_PROXY_URL",
                     "http://proxy.internal:8080",
                 ),
                 ("JIANARTIFACT_NETWORK_PROXY_NO_PROXY", "localhost,127.0.0.1"),
@@ -2030,14 +2074,34 @@ mod tests {
                 let cfg = Config::load(Path::new("不存在的配置文件.toml")).unwrap();
                 // network_proxy_ 前缀正确映射到 network.proxy.*
                 assert_eq!(
-                    cfg.network.proxy.https.as_deref(),
+                    cfg.network.proxy.url.as_deref(),
                     Some("http://proxy.internal:8080")
                 );
                 assert_eq!(
                     cfg.network.proxy.no_proxy.as_deref(),
                     Some("localhost,127.0.0.1")
                 );
-                assert!(cfg.network.proxy.http.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn 旧环境变量键仍可反序列化并折叠为_url() {
+        // ADR-0042 向后兼容：旧 env 键仍被装载进旧字段，normalize 后折叠为 url + WARN
+        with_env_vars(
+            &[(
+                "JIANARTIFACT_NETWORK_PROXY_ALL",
+                "socks5h://proxy.internal:1080",
+            )],
+            || {
+                let mut cfg = Config::load(Path::new("不存在的配置文件.toml")).unwrap();
+                let warnings = cfg.network.proxy.normalize();
+                assert_eq!(
+                    cfg.network.proxy.url.as_deref(),
+                    Some("socks5h://proxy.internal:1080")
+                );
+                assert!(cfg.network.proxy.all.is_none(), "折叠后旧键应被清空");
+                assert_eq!(warnings.len(), 1, "旧键折叠应产生一条废弃 WARN");
             },
         );
     }
@@ -2047,19 +2111,61 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[network.proxy]\nhttp = \"http://p1:3128\"\nhttps = \"http://p2:3128\""
+            "[network.proxy]\nurl = \"socks5://p1:1080\"\nno_proxy = \"localhost\""
         )
         .unwrap();
         with_env_vars(&[], || {
             let cfg = Config::load(file.path()).unwrap();
-            assert_eq!(cfg.network.proxy.http.as_deref(), Some("http://p1:3128"));
-            assert_eq!(cfg.network.proxy.https.as_deref(), Some("http://p2:3128"));
+            assert_eq!(cfg.network.proxy.url.as_deref(), Some("socks5://p1:1080"));
+            assert_eq!(cfg.network.proxy.no_proxy.as_deref(), Some("localhost"));
         });
     }
 
     #[test]
-    fn toml_可覆盖出站全局代理_all() {
-        // FR-100：新增 all 键，TOML 可配，向后兼容（未配 all 仍回落 None）
+    fn 旧_toml_三键折叠优先级_all_https_http() {
+        // ADR-0042：旧三键并存时按 all > https > http 折叠
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[network.proxy]\nhttp = \"http://p1:3128\"\nhttps = \"http://p2:3128\""
+        )
+        .unwrap();
+        with_env_vars(&[], || {
+            let mut cfg = Config::load(file.path()).unwrap();
+            let warnings = cfg.network.proxy.normalize();
+            // https 优先于 http
+            assert_eq!(cfg.network.proxy.url.as_deref(), Some("http://p2:3128"));
+            assert_eq!(warnings.len(), 1);
+        });
+    }
+
+    #[test]
+    fn 新旧键同时给值时_url_为准旧键忽略() {
+        let mut proxy = NetworkProxyConfig {
+            url: Some("socks5://new:1080".to_string()),
+            all: Some("http://old:3128".to_string()),
+            ..Default::default()
+        };
+        let warnings = proxy.normalize();
+        assert_eq!(proxy.url.as_deref(), Some("socks5://new:1080"));
+        assert!(proxy.all.is_none());
+        assert_eq!(warnings.len(), 1, "旧键被忽略应产生一条 WARN");
+    }
+
+    #[test]
+    fn 无旧键时_normalize_不产生告警() {
+        let mut proxy = NetworkProxyConfig {
+            url: Some("http://p:3128".to_string()),
+            ..Default::default()
+        };
+        assert!(proxy.normalize().is_empty());
+        let mut empty = NetworkProxyConfig::default();
+        assert!(empty.normalize().is_empty());
+    }
+
+    #[test]
+    fn 旧_toml_all_键折叠为_url_且凭据保留() {
+        // ADR-0042 向后兼容：旧 all 键（含凭据）折叠为 url，凭据不丢
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
@@ -2067,51 +2173,49 @@ mod tests {
         )
         .unwrap();
         with_env_vars(&[], || {
-            let cfg = Config::load(file.path()).unwrap();
+            let mut cfg = Config::load(file.path()).unwrap();
+            cfg.network.proxy.normalize();
             assert_eq!(
-                cfg.network.proxy.all.as_deref(),
+                cfg.network.proxy.url.as_deref(),
                 Some("socks5://user:pass@host:1080")
             );
-            // 未配置的 http / https 回落 None
-            assert!(cfg.network.proxy.http.is_none());
-            assert!(cfg.network.proxy.https.is_none());
         });
     }
 
     #[test]
-    fn 环境变量覆盖出站全局代理_all() {
-        // FR-100：env JIANARTIFACT_NETWORK_PROXY_ALL 能覆盖 all 键
-        with_env_vars(
-            &[(
-                "JIANARTIFACT_NETWORK_PROXY_ALL",
-                "socks5h://proxy.internal:1080",
-            )],
-            || {
-                let cfg = Config::load(Path::new("不存在的配置文件.toml")).unwrap();
-                assert_eq!(
-                    cfg.network.proxy.all.as_deref(),
-                    Some("socks5h://proxy.internal:1080")
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn 出站全局代理_socks5_含认证能构造客户端() {
-        // FR-100：all 给 socks5://user:pass@host:1080 应能构造出站 client（socks 特性已启）
+    fn 出站代理_socks5_含认证能构造客户端() {
+        // FR-146：url 给 socks5://user:pass@host:1080 应能构造出站 client（socks 特性已启）
         let proxy = NetworkProxyConfig {
-            all: Some("socks5://user:pass@host:1080".to_string()),
+            url: Some("socks5://user:pass@host:1080".to_string()),
             ..Default::default()
         };
         let client = build_outbound_client(DUR, &proxy);
-        assert!(client.is_ok(), "合法 socks5 全局代理应能构造 client");
+        assert!(client.is_ok(), "合法 socks5 代理应能构造 client");
+    }
+
+    #[test]
+    fn 出站代理_非法_scheme_被拒绝() {
+        // FR-146：仅接受 http/https/socks5/socks5h 前缀，其余给中文校验错误
+        for bad in [
+            "ftp://host:21",
+            "file:///etc/passwd",
+            "host:1080",
+            "socks4://h:1",
+        ] {
+            let proxy = NetworkProxyConfig {
+                url: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let result = build_outbound_client(DUR, &proxy);
+            assert!(result.is_err(), "非法 scheme 应被拒绝：{bad}");
+        }
     }
 
     #[test]
     fn 出站全局代理_非法_socks_url_构造失败且错误不含_url() {
         // FR-100：非法 socks url 构造失败，错误信息不含原始 URL（守凭据脱敏）
         let proxy = NetworkProxyConfig {
-            all: Some("socks5://secretuser:secretpass@".to_string()),
+            url: Some("socks5://secretuser:secretpass@".to_string()),
             ..Default::default()
         };
         let result = build_outbound_client(DUR, &proxy);
@@ -2125,15 +2229,16 @@ mod tests {
     }
 
     #[test]
-    fn 出站_http_与_all_并存能构造客户端() {
-        // FR-100：http 走 http 代理、其余走 all（兜底），二者并存应能构造 client
+    fn 未_normalize_的旧键经_effective_url_仍生效() {
+        // 防御性兜底：即便调用方漏了 normalize，build_outbound_client 经 effective_url 仍按旧键构造
         let proxy = NetworkProxyConfig {
             http: Some("http://p1.internal:3128".to_string()),
             all: Some("socks5://p2.internal:1080".to_string()),
             ..Default::default()
         };
+        assert_eq!(proxy.effective_url(), Some("socks5://p2.internal:1080"));
         let client = build_outbound_client(DUR, &proxy);
-        assert!(client.is_ok(), "http 与 all 并存应能构造 client");
+        assert!(client.is_ok(), "旧键兜底应能构造 client");
     }
 
     #[test]
@@ -2194,10 +2299,10 @@ mod tests {
 
     // ===== FR-88 / ADR-0022：NetworkState 热替换与 EditableUpdate 校验 =====
 
-    /// 便捷：构造一份指定 http 代理的网络配置。
-    fn 含代理的网络配置(http: &str) -> NetworkProxyConfig {
+    /// 便捷：构造一份指定通用代理 URL 的网络配置（FR-146 单键）。
+    fn 含代理的网络配置(url: &str) -> NetworkProxyConfig {
         NetworkProxyConfig {
-            http: Some(http.to_string()),
+            url: Some(url.to_string()),
             ..Default::default()
         }
     }
@@ -2206,7 +2311,7 @@ mod tests {
     fn network_state_初始快照反映初始代理() {
         let state = NetworkState::new(含代理的网络配置("http://p1.internal:8080"), DUR).unwrap();
         let snap = state.snapshot();
-        assert_eq!(snap.proxy.http.as_deref(), Some("http://p1.internal:8080"));
+        assert_eq!(snap.proxy.url.as_deref(), Some("http://p1.internal:8080"));
     }
 
     #[test]
@@ -2214,18 +2319,18 @@ mod tests {
         let state = NetworkState::new(NetworkProxyConfig::default(), DUR).unwrap();
         // 初始无代理
         let old = state.snapshot();
-        assert!(old.proxy.http.is_none());
+        assert!(old.proxy.url.is_none());
         // 热替换为新代理
         state
             .replace_proxy(含代理的网络配置("http://p2.internal:3128"))
             .unwrap();
         // 新快照反映新代理
         assert_eq!(
-            state.snapshot().proxy.http.as_deref(),
+            state.snapshot().proxy.url.as_deref(),
             Some("http://p2.internal:3128")
         );
         // 替换前持有的旧快照仍是替换前一致视图（不会半新半旧）
-        assert!(old.proxy.http.is_none());
+        assert!(old.proxy.url.is_none());
     }
 
     #[test]
@@ -2237,7 +2342,7 @@ mod tests {
         assert!(res.is_err(), "非法代理应构造失败");
         // 现有生效代理不变
         assert_eq!(
-            state.snapshot().proxy.http.as_deref(),
+            state.snapshot().proxy.url.as_deref(),
             Some("http://good.internal:8080"),
             "非法替换不得改动现有生效代理"
         );
@@ -2283,6 +2388,33 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn editable_settings_并发patch锁串行化() {
+        let settings = std::sync::Arc::new(
+            EditableSettings::new(NetworkProxyConfig::default(), DUR, &UpdateConfig::default())
+                .unwrap(),
+        );
+        let first = settings.lock_patch().await;
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let contender = std::sync::Arc::clone(&settings);
+        let task = tokio::spawn(async move {
+            let _guard = contender.lock_patch().await;
+            let _ = tx.send(());
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            rx.try_recv().is_err(),
+            "首个 PATCH 未完成时后继 PATCH 不得进入换槽与持久化区"
+        );
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut rx)
+            .await
+            .expect("释放锁后后继 PATCH 应继续")
+            .expect("后继 PATCH 任务不应取消");
+        task.await.unwrap();
     }
 
     #[test]

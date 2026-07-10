@@ -47,9 +47,8 @@ function renderPage() {
 const 启用样例: SettingsView = {
   current_version: '0.3.0',
   network_proxy: {
-    http: { url: null, username: null, has_password: false },
-    https: { url: null, username: null, has_password: false },
-    all: { url: null, username: null, has_password: false },
+    // FR-146：单一通用代理槽
+    proxy: { url: null, username: null, has_password: false },
     no_proxy: null,
   },
   update: {

@@ -1,6 +1,6 @@
 [package]
 name = "jianartifact"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "单文件、零外部依赖、开箱即用的轻量级多格式制品库管理器"
 license = "Apache-2.0"
@@ -74,7 +74,7 @@ mime_guess = "2"
 # .nupkg 仅用 deflate / store 压缩，足够解压，守 SECURITY 零原生运行时依赖。
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # 解析 NuGet .nuspec（XML）取包 id / version（FR-29）。纯 Rust、零原生依赖。
-quick-xml = "0.40"
+quick-xml = "0.41"
 # Prometheus 指标（FR-32，ADR-0015）：metrics facade + 进程内 prometheus recorder。
 # 纯 Rust、进程内注册表，只在 GET /metrics 被抓取时渲染；不引外部时序库、不 push / remote-write（pull 模型）。
 metrics = "0.24"

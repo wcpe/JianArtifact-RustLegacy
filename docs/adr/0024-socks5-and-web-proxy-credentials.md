@@ -2,7 +2,9 @@
 
 ## 状态
 
-已接受（取代 ADR-0020「后果」中「不支持 SOCKS（未引入 reqwest `socks` 特性）」一条；ADR-0020 其余决策、ADR-0022 热替换决策均沿用）
+部分被 ADR-0042 取代（取代 ADR-0020「后果」中「不支持 SOCKS（未引入 reqwest `socks` 特性）」一条；ADR-0020 其余决策、ADR-0022 热替换决策均沿用）
+
+> 「`http` / `https` / `all` 三键并存、设置页每代理三字段拆分」的配置形态被 ADR-0042 取代（收敛为单键 `url` 单槽位）；SOCKS5 支持（reqwest `socks` 特性 + `Proxy::all` 注入）、「用户名回显、密码三态不回显」凭据模型仍有效并由 ADR-0042 沿用。本 ADR 的「代理凭据不入 DB、重启回落配置/env」条款已被 [ADR-0030](0030-encrypted-proxy-credentials-at-rest.md) 取代；现行密码加密落库。
 
 ## 背景
 

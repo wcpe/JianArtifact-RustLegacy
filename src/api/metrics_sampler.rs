@@ -375,20 +375,26 @@ mod tests {
             1, // 1 秒一拍：interval 首拍立即触发，随后每秒一拍
         );
 
-        // 真实等待约 2.2 秒：首拍（t≈0）+ 之后两拍（t≈1、2），应至少落 2 拍
-        tokio::time::sleep(Duration::from_millis(2200)).await;
-        handle.abort();
+        // 轮询真实落库结果，避免并行测试压力下主机采集耗时导致固定等待误报。
+        let rows = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let rows = meta
+                    .query_metric_samples(KEY_CPU_PERCENT, 0, i64::MAX)
+                    .await
+                    .unwrap();
+                if rows.len() >= 2 {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("后台采样应在超时前累积出多拍样本");
 
-        // CPU 指标每拍一条，应累计出多条（≥2，宽松断言避免调度抖动误报）
-        let rows = meta
-            .query_metric_samples(KEY_CPU_PERCENT, 0, i64::MAX)
-            .await
-            .unwrap();
-        assert!(
-            rows.len() >= 2,
-            "后台采样应随时间累积出多拍样本，实得 {}",
-            rows.len()
-        );
+        // 先完成查询再终止任务，避免取消正在使用唯一内存连接的事务而销毁内存库。
+        handle.abort();
+        let _ = handle.await;
+        assert!(rows.len() >= 2);
     }
 
     /// 集成：采样落库后用真实 meta 清理，断言保留期滚动只删旧样本、新样本保留。

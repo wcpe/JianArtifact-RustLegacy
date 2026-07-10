@@ -105,6 +105,44 @@ describe('request 行为', () => {
     expect(handler).toHaveBeenCalledTimes(1);
   });
 
+  it('F-06：外部 abort 会把真实 signal 传给 fetch 并中断底层请求', async () => {
+    let fetchSignal: AbortSignal | null | undefined;
+    vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => {
+      fetchSignal = init?.signal;
+      return new Promise<Response>(() => {});
+    });
+    const controller = new AbortController();
+
+    const pending = request('/slow', { signal: controller.signal });
+    const rejection = expect(pending).rejects.toMatchObject({ status: 0, code: 'aborted' });
+    controller.abort();
+
+    await rejection;
+    expect(fetchSignal).toBeInstanceOf(AbortSignal);
+    expect(fetchSignal?.aborted).toBe(true);
+  });
+
+  it('F-06：timeout 会中断传给 fetch 的真实 signal', async () => {
+    vi.useFakeTimers();
+    try {
+      let fetchSignal: AbortSignal | null | undefined;
+      vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => {
+        fetchSignal = init?.signal;
+        return new Promise<Response>(() => {});
+      });
+
+      const pending = request('/slow', { timeoutMs: 25 });
+      const rejection = expect(pending).rejects.toMatchObject({ status: 408, code: 'timeout' });
+      await vi.advanceTimersByTimeAsync(25);
+
+      await rejection;
+      expect(fetchSignal).toBeInstanceOf(AbortSignal);
+      expect(fetchSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('204 返回 undefined', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(mockResponse(204, undefined));
     const result = await request('/auth/logout', { method: 'POST' });

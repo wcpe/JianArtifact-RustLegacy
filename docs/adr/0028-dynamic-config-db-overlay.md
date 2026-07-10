@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受　·　扩展 ADR-0022、ADR-0018；不触动 ADR-0001 技术栈
+已接受　·　扩展 ADR-0022、ADR-0018；不触动 ADR-0001 技术栈；代理「不入库」边界已被 [ADR-0030](0030-encrypted-proxy-credentials-at-rest.md) 取代
 
 ## 背景
 

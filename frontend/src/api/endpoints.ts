@@ -42,6 +42,7 @@ import type {
   Permission,
   ProtectionAlertDto,
   ProtectionStatusDto,
+  ProxyEntryPatch,
   ProxyTestRequest,
   ProxyTestResult,
   RepoFormat,
@@ -610,14 +611,18 @@ export interface ProxyTestOptions {
    */
   timeoutMs?: number;
   /**
+   * 表单当前填写的代理；缺省时兼容旧行为，测试已保存生效代理。
+   */
+  proxy?: ProxyEntryPatch;
+  /**
    * 外部 AbortSignal：调用方主动中断时立即取消（常用于模态框关闭 / URL 改动作废旧请求）。
    */
   signal?: AbortSignal;
 }
 
-/** 出站代理连通性测试（FR-128，仅管理员）：经当前生效出站代理对给定 URL 发 GET，返回连通性。 */
+/** 出站代理连通性测试（FR-128/147，仅管理员）：对给定 URL 发 GET，返回连通性。 */
 export function testProxy(url: string, options: ProxyTestOptions = {}): Promise<ProxyTestResult> {
-  const body: ProxyTestRequest = { url };
+  const body: ProxyTestRequest = { url, proxy: options.proxy };
   return request<ProxyTestResult>('/settings/proxy-test', {
     method: 'POST',
     body,

@@ -700,11 +700,9 @@ export interface ProxyEntryView {
   has_password: boolean;
 }
 
-/** 网络代理视图（http / https / all 三槽，均脱敏不回显密码，FR-100）。 */
+/** 网络代理视图（FR-146 收敛为单一通用代理槽，脱敏不回显密码）。 */
 export interface NetworkProxyView {
-  http: ProxyEntryView;
-  https: ProxyEntryView;
-  all: ProxyEntryView;
+  proxy: ProxyEntryView;
   no_proxy: string | null;
 }
 
@@ -737,11 +735,9 @@ export interface ProxyEntryPatch {
   password?: string;
 }
 
-/** 网络代理编辑项（http / https / all 三槽 + no_proxy；凭据只入内存槽不回显，FR-100）。 */
+/** 网络代理编辑项（FR-146 单一通用代理槽 + no_proxy；密码加密落库且不回显）。 */
 export interface NetworkProxyPatch {
-  http: ProxyEntryPatch;
-  https: ProxyEntryPatch;
-  all: ProxyEntryPatch;
+  proxy: ProxyEntryPatch;
   no_proxy?: string;
 }
 
@@ -771,6 +767,8 @@ export interface SettingsPatch {
 export interface ProxyTestRequest {
   /** 目标测试 URL（仅接受 http/https scheme）。 */
   url: string;
+  /** 表单当前填写的代理；缺省表示沿用已保存生效代理。 */
+  proxy?: ProxyEntryPatch;
 }
 
 /** 出站代理连通性测试结果。 */

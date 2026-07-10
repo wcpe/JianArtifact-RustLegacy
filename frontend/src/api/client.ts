@@ -64,9 +64,7 @@ interface RequestOptions {
    * 留 `undefined` 表示走默认（30s，足够包住绝大多数管理 API；后端 `proxy_test` 等专用端点
    * 由调用方传较短值（如 10s）实现 UI 不卡死——见 `testProxy`）。
    *
-   * 超时通过 `Promise.race` 实现而不污染 fetch signal，避免在 MSW（mock Service Worker 1.x）
-   * 这类仅校验 RequestInit.signal 类型的测试环境下抛"Expected signal to be AbortSignal"。
-   * 真正取消进行中的请求需要外部传入 `AbortSignal`（见 `TestProxy` 用法）。
+   * 超时会中断传给 fetch 的真实 `AbortSignal`，避免底层请求继续占用连接。
    */
   timeoutMs?: number;
   /**
@@ -105,8 +103,7 @@ function buildQuery(query?: Record<string, string | number | undefined>): string
  * - 支持 `timeoutMs` 超时：到达后抛 `ApiError(408, 'timeout', '请求超时')`，UI 层据此判定超时。
  * - 支持外部 `AbortSignal`：外部 abort 时抛 `ApiError(0, 'aborted')`，供 UI 主动取消请求。
  *
- * 注意：内部用 `Promise.race` 包超时 / 外部信号，不直接传 fetch 的 `signal`，
- * 避免在 MSW（mock Service Worker 1.x）等会对 RequestInit.signal 做精确类型校验的环境炸错。
+ * 内部统一桥接到真实传给 fetch 的 `AbortSignal`，并保留外部取消与请求超时两种错误语义。
  */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, query, timeoutMs, signal: externalSignal } = options;
@@ -121,78 +118,68 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     payload = JSON.stringify(body);
   }
 
-  // 真实请求：fetch 不带 signal（避免 MSW/老 fetch 实现的类型校验）。
-  // 超时与外部 abort 都用 Promise.race 兜底。
-  const fetchPromise = (async (): Promise<Response> => {
-    try {
-      return await fetch(`${API_BASE}${path}${buildQuery(query)}`, {
-        method,
-        headers,
-        body: payload,
-      });
-    } catch (err) {
-      throw new ApiError(0, 'network_error', err instanceof Error ? err.message : '网络错误');
-    }
-  })();
+  if (externalSignal?.aborted) {
+    throw new ApiError(0, 'aborted', '已取消');
+  }
 
+  const controller = new AbortController();
   const effectiveTimeout = timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const cleanup = () => {
-    if (timeoutTimer !== null) {
-      clearTimeout(timeoutTimer);
-      timeoutTimer = null;
+  let abortKind: 'external' | 'timeout' | null = null;
+  let rejectAbort: ((error: ApiError) => void) | null = null;
+  const abortError = () => {
+    if (abortKind === 'timeout') {
+      return new ApiError(408, 'timeout', '请求超时');
     }
+    const message =
+      externalSignal?.reason instanceof Error ? externalSignal.reason.message : '已取消';
+    return new ApiError(0, 'aborted', message);
   };
+  const abortRequest = (kind: 'external' | 'timeout') => {
+    if (abortKind) return;
+    abortKind = kind;
+    controller.abort();
+    rejectAbort?.(abortError());
+  };
+  const abortPromise = new Promise<never>((_, reject) => {
+    rejectAbort = reject;
+  });
+  const onExternalAbort = () => abortRequest('external');
+  externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
-  // 三路竞速：fetch / 超时 / 外部 abort，任一达成即 resolve / reject 并清理监听。
+  const timeoutTimer = setTimeout(() => abortRequest('timeout'), effectiveTimeout);
+  const requestInit: RequestInit = {
+    method,
+    headers,
+    body: payload,
+    signal: controller.signal,
+  };
+  const fetchPromise = (async () => {
+    try {
+      return await fetch(`${API_BASE}${path}${buildQuery(query)}`, requestInit);
+    } catch (err) {
+      // jsdom 与 Node fetch/MSW 可能来自不同 realm，后者会在真正发请求前拒绝前者的 signal。
+      // 仅对此兼容性错误重试无 signal；真实浏览器始终走上面的可取消请求。
+      const message = err instanceof Error ? err.message : '';
+      if (message.includes('Expected signal') && message.includes('instance of AbortSignal')) {
+        return fetch(`${API_BASE}${path}${buildQuery(query)}`, {
+          method,
+          headers,
+          body: payload,
+        });
+      }
+      throw err;
+    }
+  })().catch((err) => {
+    if (abortKind || controller.signal.aborted) throw abortError();
+    throw new ApiError(0, 'network_error', err instanceof Error ? err.message : '网络错误');
+  });
+
   let response: Response;
   try {
-    response = await new Promise<Response>((resolve, reject) => {
-      let settled = false;
-      const settle = (err: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (externalSignal) {
-          externalSignal.removeEventListener('abort', onExternalAbort);
-        }
-        reject(err);
-      };
-      const onExternalAbort = () => {
-        settle(
-          new ApiError(
-            0,
-            'aborted',
-            externalSignal?.reason instanceof Error ? externalSignal.reason.message : '已取消',
-          ),
-        );
-      };
-      if (externalSignal?.aborted) {
-        settle(new ApiError(0, 'aborted', '已取消'));
-        return;
-      }
-      if (externalSignal) {
-        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
-      }
-      timeoutTimer = setTimeout(() => {
-        settle(new ApiError(408, 'timeout', '请求超时'));
-      }, effectiveTimeout);
-      fetchPromise.then(
-        (v) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          if (externalSignal) {
-            externalSignal.removeEventListener('abort', onExternalAbort);
-          }
-          resolve(v);
-        },
-        (e) => settle(e),
-      );
-    });
-  } catch (err) {
-    cleanup();
-    throw err;
+    response = await Promise.race([fetchPromise, abortPromise]);
+  } finally {
+    clearTimeout(timeoutTimer);
+    externalSignal?.removeEventListener('abort', onExternalAbort);
   }
 
   if (response.status === 401) {

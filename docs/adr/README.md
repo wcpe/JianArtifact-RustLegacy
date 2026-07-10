@@ -25,9 +25,9 @@
 | 0019 | 迁移执行异步化为进程内任务：在线拉取迁移立即返回 `job_id`、后台 tokio 任务跑，进度存进程内有界注册表（不落库）+ 轮询查询端点 + 客户端重连；保留 ADR-0006「无须持久化迁移任务表」，扩展 ADR-0006（P2） | 部分被 ADR-0038 修订；「不落库」被 ADR-0040 取代 |
 | 0020 | 统一出站网络代理与共享出站客户端：`[network.proxy]`（http/https/no_proxy + env）为出站代理唯一真源，`config` 层抽 `build_outbound_client` 统一注入全部出站 reqwest 客户端（rustls 保持、凭据脱敏），配置给值即真源、不配置保留系统 env（P2） | 部分被 ADR-0022、ADR-0024 取代 |
 | 0021 | 在线更新（自更新）机制：管理员手动触发查 GitHub 最新 Release → 按本机 target 下载 → 校验 sha256 → 原子替换二进制 → graceful-shutdown 后自动重启（restart_mode self/exit）；出站默认关闭、只拉公开数据不外发、复用 ADR-0020 helper、仅 sha256 不签名（P2） | 已接受（回滚增强见 ADR-0026、重启增强见 ADR-0032） |
-| 0022 | 运行时可编辑设置与出站客户端热替换（取代 ADR-0020）：网络代理与在线更新可调字段经 Admin 在线 PATCH 即时生效、无须重启；`config` 层 `NetworkState`（std `RwLock<Arc<NetworkSnapshot>>` 含代理配置 + reqwest::Client），出站点按需取 client、PATCH 锁外重建后原子换槽；沿用 ADR-0020 真源/helper/rustls/脱敏，凭据只入内存槽不落库不回显，设置页改可编辑（P2） | 已接受 |
+| 0022 | 运行时可编辑设置与出站客户端热替换（取代 ADR-0020）：网络代理与在线更新可调字段经 Admin 在线 PATCH 即时生效、无须重启；`config` 层 `NetworkState`（std `RwLock<Arc<NetworkSnapshot>>` 含代理配置 + reqwest::Client），出站点按需取 client、PATCH 锁外重建后原子换槽；沿用 ADR-0020 真源/helper/rustls/脱敏，设置页改可编辑（P2） | 已接受；代理“不落库”条款被 ADR-0030 取代 |
 | 0023 | 主机/系统监控采集：经 sysinfo 跨平台按请求采样本机 CPU/内存/磁盘/uptime，仅 Admin `GET /api/v1/monitor/host`，本机内部不外发（P2） | 已接受（「不留历史时序」一条被 ADR-0027 取代，其余仍有效） |
-| 0024 | SOCKS5 出站代理与网页代理凭据管理（取代 ADR-0020「不支持 SOCKS」条目）：启 reqwest `socks` 特性，`[network.proxy]` 新增 `all` 键经 `reqwest::Proxy::all` 支持 `socks5://` 全 scheme 兜底代理（注入序 http→https→all）；设置页每代理拆 URL/用户名/密码三字段，用户名回显、密码三态不回显，纯函数 `rebuild_proxy_url` 据三字段 + 当前存储值重建含凭据 URL（userinfo RFC3986 编码），凭据只入内存槽不落库 / 不回显（P2） | 已接受 |
+| 0024 | SOCKS5 出站代理与网页代理凭据管理（取代 ADR-0020「不支持 SOCKS」条目）：启 reqwest `socks` 特性，`[network.proxy]` 新增 `all` 键经 `reqwest::Proxy::all` 支持 `socks5://` 全 scheme 兜底代理（注入序 http→https→all）；设置页每代理拆 URL/用户名/密码三字段，用户名回显、密码三态不回显，纯函数 `rebuild_proxy_url` 据三字段 + 当前存储值重建含凭据 URL（userinfo RFC3986 编码）（P2） | 三键形态被 ADR-0042 取代；代理“不落库”被 ADR-0030 取代 |
 | 0025 | 开源许可清单构建期扫描 + 数据嵌入二进制 + 公开页：构建期由 `cargo-about`（Rust，按 `about.toml` accepted 清单）+ `pnpm licenses list`（前端）扫描运行时 + 开发依赖许可，`scripts/gen-licenses.mjs` 合并为 JSON 嵌入二进制（`include_str!` + 占位降级），公开端点 `GET /api/v1/licenses` 与页 `/licenses` 匿名只读；运行时不外联、守数据不外发（P2） | 已接受 |
 | 0026 | 自更新回滚（增强 ADR-0021）：升级时把当前二进制持久备份为跨平台一致的 `{exe}.rollback.bak`（单备份、不被启动清理，独立于 ADR-0021 临时 `.bak`/`.old`）→ `POST /api/v1/update/rollback`（仅 Admin）复用 execute_replace 原子换回 + 走既有重启链路 → 无备份返 409，回滚与升级共用 apply 单飞 guard，设置视图增 `rollback_available`（P2） | 已接受 |
 | 0027 | 统一指标时序采集与查询（取代 ADR-0023「不留时序」）：通用扁平表 `metric_samples(metric_key,ts,value)` 经 `meta` 落库，后台定时按可配间隔采样主机/存储仓库/防护/使用分析各域 gauge + 可配保留期滚动清理 + 行数兜底，仅 Admin `GET /api/v1/monitor/metrics` 降采样查询；保留 FR-98 实时快照，缓存命中率本期降级不采，本机内部不外发（P2） | 已接受 |
@@ -45,6 +45,7 @@
 | 0039 | group / 虚拟聚合仓库（FR-136）：新增第三种仓库类型 group——自身不存 blob，聚合有序成员仓库，GET 按 position 逐成员施加读判定、首个「有权且存在」命中即返回、只读（写删 405）；推翻 scope-discipline 对 group 的排除（用户已授权范围扩张），取代 ADR-0005「group 顺延第三期」。限制：不做跨成员 metadata 合并、Docker group 不在范围（属后续 FR） | 已接受 |
 | 0040 | 迁移任务与报告持久化（FR-140，取代 ADR-0019/0038「迁移不落库」条款）：迁移任务记录 / 节流进度快照 / 分仓库报告经 `meta` 落 SQLite，启动时残留 running/paused 归「已中断」、一键幂等重跑续传（sha256 一致跳过）；不持久化枚举游标、不做自动断点续跑；内存注册表仍是运行态真源、DB 为历史与恢复视图；范围仅迁移，凭据只存 `auth_ref` 引用不入库（P2） | 已接受 |
 | 0041 | 离线迁移仓库索引双通道（FR-141，扩展 ADR-0006）：可选填源 Nexus REST 地址——可达则取权威仓库配置（格式/类型/上游）与扫描结果按仓库名合并；否则纯离线扫 blob store 按内容路径启发式推断格式（标注「推断」来源，类型/上游由管理员补填）；两通道输出统一仓库索引；明确不解析 OrientDB/H2 数据库文件（P2） | 已接受 |
+| 0042 | 单一通用出站代理（FR-146，取代 ADR-0024「三键并存」决策）：`[network.proxy]` 收敛为单键 `url`（用户自填 `http://`/`https://`/`socks5://`/`socks5h://` 前缀，经 `Proxy::all` 注入全 scheme）+ `no_proxy`；旧 `http`/`https`/`all` 键自动映射（优先 `all > https > http`）+ 启动 WARN 废弃；凭据仍三字段「用户名回显、密码三态不回显」、加密落库收敛单项且旧落库折叠不丢凭据；`GET`/`PATCH /settings` 契约收敛为 `{proxy,no_proxy}`（P2） | 已接受 |
 
 > 模板：状态 / 背景 / 决策 / 理由 / 后果 / 备选方案。
 

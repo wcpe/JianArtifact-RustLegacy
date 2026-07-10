@@ -18,21 +18,24 @@ export default {
   // 网络代理节
   proxy: {
     title: '网络代理',
-    desc: '统一出站代理（回源 / 迁移 / 漏洞库 / OIDC / 在线更新共用）。每代理可填用户名 + 密码；用户名回显、密码不回显（留空保留现有），URL 留空表示不配置该代理。保存后**即时生效、无须重启**。',
-    httpTitle: 'HTTP 代理',
-    httpsTitle: 'HTTPS 代理',
-    socks5Title: 'SOCKS5 代理（all，兜底全 scheme）',
+    desc: '统一出站代理（回源 / 迁移 / 漏洞库 / OIDC / 在线更新共用）。单一通用代理对全部出站请求生效；可填用户名 + 密码，用户名回显、密码不回显（留空保留现有），URL 留空表示不配置代理。保存后**即时生效、无须重启**。',
+    // 单一通用代理槽（FR-146）
+    generalTitle: '通用网络代理',
+    // 支持的 URL scheme 说明（socks5h 由代理端解析域名，受污染网络推荐）
+    schemeHint:
+      '支持 http:// / https:// / socks5:// / socks5h://（socks5h 由代理端解析域名，受污染网络推荐）',
     noProxyLabel: '直连绕过（no_proxy）',
-    // 每代理独立测试按钮（FR-128 回流 UX 改造）
+    // 槽位「测试」按钮（FR-128 回流 UX 改造）
     testButton: '测试',
-    // 「清除代理」按钮：清空该槽位的 URL / 用户名 / 密码 — 仅影响该代理，不动其它代理。
+    // 「清除代理」按钮：清空槽位的 URL / 用户名 / 密码，不动 no_proxy。
     clearProxy: '清除代理',
     proxyWillClear: '保存后清除该代理',
-    // 模态框（每代理各一个「测试」按钮 → 弹出模态框 → 输入 URL → 测试 → 显示结果）
+    // 模态框（槽位「测试」按钮 → 弹出模态框 → 输入 URL → 测试 → 显示结果）
     testModalTitle: '连通性测试',
-    testModalDesc: '经当前生效出站代理访问目标 URL，验证代理是否可达。默认 10 秒超时。',
+    closeTestModal: '关闭连通性测试',
+    testModalDesc: '测试将使用表单中当前填写的代理配置（无需先保存）访问目标 URL。默认 10 秒超时。',
     testUrlLabel: '目标 URL',
-    testUrlPlaceholder: 'https://example.com',
+    testUrlPlaceholder: 'https://www.google.com',
     testRunButton: '测试',
     testTesting: '测试中…',
     // 测试按钮旁的辅助按钮（UX 完善：避免用户手敲默认 URL）

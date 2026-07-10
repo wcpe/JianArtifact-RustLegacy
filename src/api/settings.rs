@@ -8,10 +8,13 @@
 //! - **校验失败不改状态**：校验未过返回 400 且**不替换**现有生效值（GET 仍返回旧值）。
 //! - **脱敏红线**：响应**绝不含任何凭据**——代理 URL 经 [`sanitize_proxy_url`] 去 `user:pass@`；
 //!   更新 token 只回 `has_token: bool`，绝不回显 token 本体。
-//! - **凭据只入内存槽**：PATCH 接受的代理凭据与 update token 只入热替换槽、**不写回 TOML / 不入 DB /
-//!   不进日志**；重启回落文件 + env 配置（与 ADR-0018 一致）。
+//! - **凭据持久化边界**：代理密码经 ADR-0030 专用通道加密落库，update token 只入热替换槽；二者均
+//!   **不写回 TOML / 不进日志 / 不回显**。
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{rejection::JsonRejection, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{EditableUpdate, NetworkProxyConfig};
@@ -200,14 +203,23 @@ pub struct PersistedProxyEntry {
     pub password_enc: Option<String>,
 }
 
-/// 网络代理整体落库形态（ADR-0030）：三代理拆分形态 + 直连绕过列表（明文）。
+/// 网络代理整体落库形态（ADR-0030；FR-146 / ADR-0042 收敛单代理）。
+///
+/// 新写入只落 `proxy` + `no_proxy`；旧 `http` / `https` / `all` 三项仅为历史落库 JSON 的
+/// 读取兼容保留（恢复时按 `proxy > all > https > http` 折叠，见 [`from_persisted`]）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PersistedProxy {
-    /// HTTP 代理拆分形态。
+    /// 通用代理拆分形态（FR-146 单代理）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<PersistedProxyEntry>,
+    /// 已废弃：旧 HTTP 代理拆分形态（仅读取兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<PersistedProxyEntry>,
-    /// HTTPS 代理拆分形态。
+    /// 已废弃：旧 HTTPS 代理拆分形态（仅读取兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https: Option<PersistedProxyEntry>,
-    /// 全 scheme 兜底代理拆分形态。
+    /// 已废弃：旧全 scheme 兜底代理拆分形态（仅读取兼容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub all: Option<PersistedProxyEntry>,
     /// 直连绕过列表（无凭据，明文）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,9 +227,13 @@ pub struct PersistedProxy {
 }
 
 impl PersistedProxy {
-    /// 判断是否「空代理」（四项全空）——空则启动恢复时不覆盖文件默认、PATCH 时删键。
+    /// 判断是否「空代理」（各项全空）——空则启动恢复时不覆盖文件默认、PATCH 时删键。
     fn is_empty(&self) -> bool {
-        self.http.is_none() && self.https.is_none() && self.all.is_none() && self.no_proxy.is_none()
+        self.proxy.is_none()
+            && self.http.is_none()
+            && self.https.is_none()
+            && self.all.is_none()
+            && self.no_proxy.is_none()
     }
 }
 
@@ -237,14 +253,16 @@ fn split_proxy_entry(stored: Option<&str>, key: &[u8; 32]) -> Option<PersistedPr
     })
 }
 
-/// 把当前生效的内存态代理配置拆分为加密落库形态（ADR-0030）。
+/// 把当前生效的内存态代理配置拆分为加密落库形态（ADR-0030；FR-146 单代理）。
 ///
 /// 纯函数：URL 脱敏、用户名明文、密码加密；`no_proxy` 原样。密码绝不以明文出现在产物里。
+/// 只写新形态 `proxy` 项，旧三项一律不再写出。
 pub fn to_persisted(proxy: &NetworkProxyConfig, key: &[u8; 32]) -> PersistedProxy {
     PersistedProxy {
-        http: split_proxy_entry(proxy.http.as_deref(), key),
-        https: split_proxy_entry(proxy.https.as_deref(), key),
-        all: split_proxy_entry(proxy.all.as_deref(), key),
+        proxy: split_proxy_entry(proxy.effective_url(), key),
+        http: None,
+        https: None,
+        all: None,
         no_proxy: proxy.no_proxy.clone(),
     }
 }
@@ -272,29 +290,34 @@ fn rebuild_persisted_entry(entry: &PersistedProxyEntry, key: &[u8; 32]) -> (Opti
     (rebuild_proxy_url(&patch, None), degraded)
 }
 
-/// 把落库形态解密重建为内存态 [`NetworkProxyConfig`]（启动恢复，ADR-0030）。
+/// 把落库形态解密重建为内存态 [`NetworkProxyConfig`]（启动恢复，ADR-0030；FR-146 单代理）。
 ///
-/// 任一代理项解密失败即降级为该项无密码并记一条 WARN（不泄露密文 / 密钥），不阻断启动。
+/// 旧三项落库 JSON 按优先级 `proxy > all > https > http` 折叠为单代理（与 ADR-0042 配置折叠
+/// 同序），凭据不丢。解密失败即降级为无密码并记一条 WARN（不泄露密文 / 密钥），不阻断启动。
 pub fn from_persisted(persisted: &PersistedProxy, key: &[u8; 32]) -> NetworkProxyConfig {
-    let mut any_degraded = false;
-    let mut rebuild = |entry: &Option<PersistedProxyEntry>| -> Option<String> {
-        let e = entry.as_ref()?;
-        let (url, degraded) = rebuild_persisted_entry(e, key);
-        any_degraded |= degraded;
-        url
+    // 折叠优先级与配置旧键一致：新形态 proxy 为真源，旧三项按 all > https > http 兜底
+    let entry = persisted
+        .proxy
+        .as_ref()
+        .or(persisted.all.as_ref())
+        .or(persisted.https.as_ref())
+        .or(persisted.http.as_ref());
+    let (url, degraded) = match entry {
+        Some(e) => rebuild_persisted_entry(e, key),
+        None => (None, false),
     };
-    let cfg = NetworkProxyConfig {
-        http: rebuild(&persisted.http),
-        https: rebuild(&persisted.https),
-        all: rebuild(&persisted.all),
-        no_proxy: persisted.no_proxy.clone(),
-    };
-    if any_degraded {
+    if degraded {
         tracing::warn!(
-            "已落库的网络代理密码解密失败（.jwt_secret 可能已轮换），相应代理降级为无密码，请在设置页重填"
+            "已落库的网络代理密码解密失败（.jwt_secret 可能已轮换），代理降级为无密码，请在设置页重填"
         );
     }
-    cfg
+    NetworkProxyConfig {
+        url,
+        http: None,
+        https: None,
+        all: None,
+        no_proxy: persisted.no_proxy.clone(),
+    }
 }
 
 /// 从 `app_settings` 读出的网络代理 JSON 解密重建内存态代理配置（启动恢复入口，ADR-0030）。
@@ -328,15 +351,11 @@ pub struct ProxyEntryView {
     pub has_password: bool,
 }
 
-/// 网络代理视图（脱敏后，FR-100）：每代理拆为 URL + 用户名 + has_password 三字段。
+/// 网络代理视图（脱敏后，FR-146 单代理）：URL + 用户名 + has_password 三字段。
 #[derive(Debug, Serialize)]
 pub struct NetworkProxyView {
-    /// HTTP 出站代理（scheme 专属）。
-    pub http: ProxyEntryView,
-    /// HTTPS 出站代理（scheme 专属）。
-    pub https: ProxyEntryView,
-    /// 全 scheme 兜底代理（FR-100，接受 `socks5://` 等）。
-    pub all: ProxyEntryView,
+    /// 通用出站代理（接受 `http://` / `https://` / `socks5://` / `socks5h://`）。
+    pub proxy: ProxyEntryView,
     /// 直连绕过列表（无凭据，原样）。
     pub no_proxy: Option<String>,
 }
@@ -433,9 +452,7 @@ fn current_view(state: &AppState) -> SettingsView {
     SettingsView {
         current_version: crate::version::build_version().to_string(),
         network_proxy: NetworkProxyView {
-            http: proxy_entry_view(proxy.http.as_deref()),
-            https: proxy_entry_view(proxy.https.as_deref()),
-            all: proxy_entry_view(proxy.all.as_deref()),
+            proxy: proxy_entry_view(proxy.effective_url()),
             no_proxy: proxy.no_proxy.clone(),
         },
         update: UpdateView {
@@ -483,18 +500,13 @@ pub struct ProxyEntryPatch {
     pub password: Option<String>,
 }
 
-/// 网络代理编辑请求（FR-100）：每代理三字段 + 直连绕过列表。
+/// 网络代理编辑请求（FR-146 单代理）：三字段 + 直连绕过列表。
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkProxyPatch {
-    /// HTTP 出站代理（scheme 专属）。
+    /// 通用出站代理（接受 `http://` / `https://` / `socks5://` / `socks5h://`）。
     #[serde(default)]
-    pub http: ProxyEntryPatch,
-    /// HTTPS 出站代理（scheme 专属）。
-    #[serde(default)]
-    pub https: ProxyEntryPatch,
-    /// 全 scheme 兜底代理（FR-100，接受 `socks5://` 等）。
-    #[serde(default)]
-    pub all: ProxyEntryPatch,
+    pub proxy: ProxyEntryPatch,
     /// 直连绕过列表。
     #[serde(default)]
     pub no_proxy: Option<String>,
@@ -567,14 +579,17 @@ async fn persist_proxy(state: &AppState, proxy: &NetworkProxyConfig) {
 /// 编辑网络代理 + 在线更新配置（仅 Admin），校验通过即时生效、无须重启。
 ///
 /// 校验失败返回 400 且**不改变**现有生效值（GET 仍返回旧值）；成功后锁外重建出站 client、原子换槽，
-/// 下个出站请求即用新代理 / 新更新开关。代理凭据与 token 只入内存槽、不写回 TOML / 不入 DB / 不回显。
+/// 下个出站请求即用新代理 / 新更新开关。代理密码加密落库，update token 只入内存；均不写 TOML / 不回显。
 /// 未认证 401、非管理员 403。
 pub async fn patch_settings(
     State(state): State<AppState>,
     identity: Identity,
-    Json(patch): Json<SettingsPatch>,
+    body: Result<Json<SettingsPatch>, JsonRejection>,
 ) -> Result<Json<SettingsView>, ApiError> {
     identity.require_admin()?;
+    let Json(patch) = body.map_err(|_| ApiError::BadRequest("请求体 JSON 格式非法".to_string()))?;
+    // 同一进程内串行完成「读取当前值 → 换槽 → DB 持久化」，避免并发 PATCH 使内存与 DB 最终顺序倒置。
+    let _patch_guard = state.settings.lock_patch().await;
 
     // 预校验在线更新（若提供）：token 三态——缺省保留、空串清空、非空设置；非法即拒、不触碰任何现有生效值。
     let new_update = match &patch.update {
@@ -602,15 +617,16 @@ pub async fn patch_settings(
         None => None,
     };
 
-    // 应用网络代理（若提供）：每代理经 rebuild_proxy_url 据三字段 + 当前存储值重建含凭据的存储 URL；
+    // 应用网络代理（若提供）：经 rebuild_proxy_url 据三字段 + 当前存储值重建含凭据的存储 URL；
     // no_proxy 空白归一为不配置。锁外重建 client，失败即拒（现有 client 仍生效）。凭据只入内存槽、
-    // 不回显、不写回 TOML / 不入 DB / 不进日志。
+    // 不回显、不写回 TOML / 不进日志（加密落库见 ADR-0030）。
     if let Some(np) = &patch.network_proxy {
         let current_proxy = state.settings.network.snapshot().proxy.clone();
         let new_proxy = NetworkProxyConfig {
-            http: rebuild_proxy_url(&np.http, current_proxy.http.as_deref()),
-            https: rebuild_proxy_url(&np.https, current_proxy.https.as_deref()),
-            all: rebuild_proxy_url(&np.all, current_proxy.all.as_deref()),
+            url: rebuild_proxy_url(&np.proxy, current_proxy.effective_url()),
+            http: None,
+            https: None,
+            all: None,
             no_proxy: normalize_blank(np.no_proxy.clone()),
         };
         // replace_proxy 取走所有权，故先 clone 一份留作落库（代理配置小、clone 廉价）。
@@ -649,11 +665,16 @@ pub async fn patch_settings(
     Ok(Json(current_view(&state)))
 }
 
-/// 出站代理连通性测试请求体（FR-128）。
+/// 出站代理连通性测试请求体（FR-128；FR-147 增可选表单代理）。
 #[derive(Debug, Deserialize)]
 pub struct ProxyTestRequest {
     /// 目标测试 URL（仅接受 http/https scheme）。
     pub url: String,
+    /// 可选：表单当前填写的代理（FR-147）。给出即用其临时构造 client 测试（无需先保存）；
+    /// 密码缺省时回落已存凭据（同用户名才沿用，复用 PATCH 三态）；`url` 空白 = 测直连。
+    /// 缺省整个字段则测当前已生效代理（兼容旧调用）。
+    #[serde(default)]
+    pub proxy: Option<ProxyEntryPatch>,
 }
 
 /// 出站代理连通性测试响应（FR-128）。
@@ -671,9 +692,10 @@ pub struct ProxyTestResult {
     pub error: Option<String>,
 }
 
-/// 出站代理连通性测试（FR-128，仅 Admin）。
+/// 出站代理连通性测试（FR-128，仅 Admin；FR-147 支持测表单当前填写的代理）。
 ///
-/// 取当前生效出站 client（含代理配置）对用户给定 URL 发 GET，返回连通性。
+/// 请求体给出 `proxy` 时据其临时构造 client（密码缺省回落已存凭据），否则取当前生效出站
+/// client（含代理配置），对用户给定 URL 发 GET，返回连通性。
 /// 仅接受 http/https scheme（防 SSRF file/ftp 等）；仅访问用户给定 URL，不外发任何使用数据（ADR-0009）。
 pub async fn proxy_test(
     State(state): State<AppState>,
@@ -682,27 +704,51 @@ pub async fn proxy_test(
 ) -> Result<Json<ProxyTestResult>, ApiError> {
     identity.require_admin()?;
 
-    let url = req.url.trim().to_string();
+    let url = reqwest::Url::parse(req.url.trim())
+        .map_err(|_| ApiError::BadRequest("URL 格式非法".to_string()))?;
 
-    // 校验 URL：仅接受 http/https scheme（防 SSRF file/ftp 等非出站协议）
-    let lower = url.to_lowercase();
-    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+    // 校验 URL：仅接受 http/https scheme 且必须含 host（防 SSRF file/ftp 等非出站协议）
+    if !matches!(url.scheme(), "http" | "https") {
         return Err(ApiError::BadRequest(
             "仅支持 http:// 或 https:// 开头的 URL".to_string(),
         ));
     }
-    // 进一步校验：URL 不能过短（至少 scheme + "://" + 一个字符）
-    if url.len() < 8 {
+    if url.host().is_none() {
         return Err(ApiError::BadRequest("URL 格式非法".to_string()));
     }
 
-    // 取当前生效出站 client（含出站代理），读锁极短、锁外发请求
-    let client = state.settings.network.client();
+    // FR-147：给出表单代理即临时构造 client 测表单值（无需先保存）；否则取当前生效 client
+    let client = match &req.proxy {
+        Some(patch) if patch.url.as_deref().map(str::trim).unwrap_or("").is_empty() => {
+            // 显式空代理表示测直连，需关闭 reqwest 自动系统代理探测
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .no_proxy()
+                .build()
+                .map_err(|_| ApiError::BadRequest("代理配置非法：无法构造直连客户端".to_string()))?
+        }
+        Some(patch) => {
+            // 密码缺省回落已存凭据（同用户名才沿用），与 PATCH 三态同一纯函数
+            let current = state.settings.network.snapshot().proxy.clone();
+            let temp = crate::config::NetworkProxyConfig {
+                url: rebuild_proxy_url(patch, current.effective_url()),
+                http: None,
+                https: None,
+                all: None,
+                no_proxy: None,
+            };
+            // 临时 client 仅本次测试用；构造失败即 400（错误信息不含凭据）
+            crate::config::build_outbound_client(std::time::Duration::from_secs(10), &temp)
+                .map_err(|reason| ApiError::BadRequest(format!("代理配置非法：{reason}")))?
+        }
+        // 兼容缺省 proxy 的旧调用：取当前生效出站 client，读锁极短、锁外发请求
+        None => state.settings.network.client(),
+    };
 
     let start = std::time::Instant::now();
     // 带 10s 超时的 GET 请求（覆盖 client 默认超时，专用测试超时）
     let result = client
-        .get(&url)
+        .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await;
@@ -758,7 +804,9 @@ mod tests {
     use crate::meta::Role;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::sync::Arc;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     // ===== sanitize_proxy_url 纯函数穷举 =====
@@ -846,6 +894,15 @@ mod tests {
         令牌: Option<&str>,
         body: serde_json::Value,
     ) -> axum::response::Response {
+        请求_patch_原文(state, 令牌, &body.to_string()).await
+    }
+
+    /// 便捷：发送原始 JSON 文本，用于覆盖语法错误与反序列化拒绝。
+    async fn 请求_patch_原文(
+        state: AppState,
+        令牌: Option<&str>,
+        body: &str,
+    ) -> axum::response::Response {
         let app = super::super::build_router(state);
         let mut builder = Request::builder()
             .method("PATCH")
@@ -871,6 +928,73 @@ mod tests {
         );
     }
 
+    /// 起一个最小 HTTP 正向代理：记录首个请求行并返回 200。
+    async fn 启动_mock_代理() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen_conn = seen_task.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n > 0 {
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        if let Some(line) = text.lines().next() {
+                            seen_conn.lock().unwrap().push(line.to_string());
+                        }
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        等待端口就绪(&addr).await;
+        (addr, seen)
+    }
+
+    /// 起一个最小源站：记录是否被直连访问并返回 200。
+    async fn 启动_mock_源站() -> (SocketAddr, Arc<Mutex<bool>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hit = Arc::new(Mutex::new(false));
+        let hit_task = hit.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 512];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n > 0 {
+                    *hit_task.lock().unwrap() = true;
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        (addr, hit)
+    }
+
+    async fn 等待端口就绪(addr: &SocketAddr) {
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("mock 服务未就绪");
+    }
+
     #[tokio::test]
     async fn settings_匿名被拒_401() {
         let (state, _dir) = 测试用状态().await;
@@ -891,9 +1015,10 @@ mod tests {
         let (mut state, _dir) = 测试用状态().await;
         // 注入含凭据的代理与更新 token（入热替换槽），断言响应中均不回显凭据
         let proxy = crate::config::NetworkProxyConfig {
-            http: Some("http://user:pass@proxy.internal:8080".to_string()),
-            https: Some("https://secret:tok@proxy.internal:8443".to_string()),
-            all: Some("socks5://sockuser:sockpass@socks.internal:1080".to_string()),
+            url: Some("socks5://sockuser:sockpass@socks.internal:1080".to_string()),
+            http: None,
+            https: None,
+            all: None,
             no_proxy: Some("localhost,127.0.0.1".to_string()),
         };
         let update = crate::config::UpdateConfig {
@@ -911,26 +1036,13 @@ mod tests {
         let body = 读_json(resp).await;
         // 当前版本回显：经 build_version()（测试构建未注入环境，回退 CARGO_PKG_VERSION）
         assert_eq!(body["current_version"], crate::version::build_version());
-        // 代理 URL 已脱敏：不含凭据、保留 host:port；用户名回显、has_password=true
+        // 代理 URL 已脱敏：不含凭据、保留 host:port；用户名回显、has_password=true（FR-146 单代理）
         assert_eq!(
-            body["network_proxy"]["http"]["url"],
-            "http://proxy.internal:8080"
-        );
-        assert_eq!(body["network_proxy"]["http"]["username"], "user");
-        assert_eq!(body["network_proxy"]["http"]["has_password"], true);
-        assert_eq!(
-            body["network_proxy"]["https"]["url"],
-            "https://proxy.internal:8443"
-        );
-        assert_eq!(body["network_proxy"]["https"]["username"], "secret");
-        assert_eq!(body["network_proxy"]["https"]["has_password"], true);
-        // FR-100：all（SOCKS5）同样脱敏 + 用户名回显 + has_password
-        assert_eq!(
-            body["network_proxy"]["all"]["url"],
+            body["network_proxy"]["proxy"]["url"],
             "socks5://socks.internal:1080"
         );
-        assert_eq!(body["network_proxy"]["all"]["username"], "sockuser");
-        assert_eq!(body["network_proxy"]["all"]["has_password"], true);
+        assert_eq!(body["network_proxy"]["proxy"]["username"], "sockuser");
+        assert_eq!(body["network_proxy"]["proxy"]["has_password"], true);
         assert_eq!(body["network_proxy"]["no_proxy"], "localhost,127.0.0.1");
         // 更新区：仅 has_token 布尔，绝不回显 token 本体
         assert_eq!(body["update"]["enabled"], true);
@@ -939,10 +1051,8 @@ mod tests {
 
         // 关键脱敏断言：响应不得含任何口令明文（用户名可回显、has_password 字段名豁免）
         let text = body.to_string();
-        assert!(!text.contains("user:pass"), "http 口令不得回显：{text}");
-        assert!(!text.contains(":pass@"), "http 口令不得回显：{text}");
-        assert!(!text.contains("secret:tok"), "https 口令不得回显：{text}");
         assert!(!text.contains("sockpass"), "socks 口令不得回显：{text}");
+        assert!(!text.contains(":sockpass@"), "socks 口令不得回显：{text}");
         assert!(
             !text.contains("ghp_supersecrettoken"),
             "更新 token 本体不得回显：{text}"
@@ -966,9 +1076,7 @@ mod tests {
     fn 合法编辑体() -> serde_json::Value {
         serde_json::json!({
             "network_proxy": {
-                "http": { "url": "http://new-proxy.internal:3128", "username": "user", "password": "pass" },
-                "https": { "url": null },
-                "all": { "url": null },
+                "proxy": { "url": "http://new-proxy.internal:3128", "username": "user", "password": "pass" },
                 "no_proxy": "localhost"
             },
             "update": {
@@ -998,6 +1106,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_json_反序列化失败稳定返回中文_400() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let resp = 请求_patch_原文(state, Some(&token), r#"{"network_proxy":"#).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = 读_json(resp).await;
+        assert_eq!(body["error"]["message"], "请求体 JSON 格式非法");
+    }
+
+    #[tokio::test]
+    async fn patch_json_失败时仍优先执行鉴权() {
+        let (state, _dir) = 测试用状态().await;
+        let anonymous = 请求_patch_原文(state.clone(), None, "{").await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token = 签发令牌(&state, "u", Role::User).await;
+        let user = 请求_patch_原文(state, Some(&token), "{").await;
+        assert_eq!(user.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn patch_network_proxy_未知字段返回中文_400() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let body = serde_json::json!({
+            "network_proxy": { "proxy": {}, "unknown": true }
+        });
+        let resp = 请求_patch(state, Some(&token), body).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = 读_json(resp).await;
+        assert_eq!(body["error"]["message"], "请求体 JSON 格式非法");
+    }
+
+    #[tokio::test]
     async fn patch_管理员成功_即时生效_并脱敏() {
         let (state, _dir) = 测试用状态().await;
         let token = 签发令牌(&state, "admin", Role::Admin).await;
@@ -1009,11 +1153,11 @@ mod tests {
         let body = 读_json(resp).await;
         // 响应回显脱敏后的当前值：代理去口令、用户名回显、token 仅 has_token
         assert_eq!(
-            body["network_proxy"]["http"]["url"],
+            body["network_proxy"]["proxy"]["url"],
             "http://new-proxy.internal:3128"
         );
-        assert_eq!(body["network_proxy"]["http"]["username"], "user");
-        assert_eq!(body["network_proxy"]["http"]["has_password"], true);
+        assert_eq!(body["network_proxy"]["proxy"]["username"], "user");
+        assert_eq!(body["network_proxy"]["proxy"]["has_password"], true);
         assert_eq!(body["update"]["enabled"], true);
         assert_eq!(body["update"]["restart_mode"], "exit");
         assert_eq!(body["update"]["channel"], "prerelease");
@@ -1027,7 +1171,7 @@ mod tests {
         // 热槽当前值已即时生效（PATCH 锁外重建后原子换槽）：存储 URL 含百分号编码凭据
         let snap = settings.network.snapshot();
         assert_eq!(
-            snap.proxy.http.as_deref(),
+            snap.proxy.url.as_deref(),
             Some("http://user:pass@new-proxy.internal:3128"),
             "代理热槽应已换为新值（凭据仅入内存槽，不回显）"
         );
@@ -1065,7 +1209,7 @@ mod tests {
         let settings = state.settings.clone();
 
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": {
                 "enabled": true,
                 "repo": "wcpe/JianArtifact",
@@ -1114,7 +1258,7 @@ mod tests {
         let _ = meta;
         let _ = jwt;
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": {
                 "enabled": true,
                 "repo": "wcpe/JianArtifact",
@@ -1169,7 +1313,7 @@ mod tests {
         let (mut state, _dir) = 测试用状态().await;
         // 先注入一份已知生效值
         let proxy = crate::config::NetworkProxyConfig {
-            http: Some("http://old-proxy.internal:8080".to_string()),
+            url: Some("http://old-proxy.internal:8080".to_string()),
             ..Default::default()
         };
         注入设置(&mut state, proxy, &crate::config::UpdateConfig::default());
@@ -1177,7 +1321,7 @@ mod tests {
         let settings = state.settings.clone();
 
         let body = serde_json::json!({
-            "network_proxy": { "http": { "url": "http://new-proxy.internal:9999" }, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": { "url": "http://new-proxy.internal:9999" }, "no_proxy": null },
             "update": {
                 "enabled": true,
                 "repo": "wcpe/JianArtifact",
@@ -1193,7 +1337,7 @@ mod tests {
         // 非法校验先于代理换槽：现有代理与更新生效值均不变
         let snap = settings.network.snapshot();
         assert_eq!(
-            snap.proxy.http.as_deref(),
+            snap.proxy.url.as_deref(),
             Some("http://old-proxy.internal:8080"),
             "非法配置不得改动现有生效代理"
         );
@@ -1222,7 +1366,7 @@ mod tests {
 
         // ① token 缺省：保留现有
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": { "enabled": false, "repo": "wcpe/JianArtifact", "api_base_url": "https://api.github.com", "restart_mode": "self", "channel": "stable" }
         });
         let resp = app
@@ -1247,7 +1391,7 @@ mod tests {
 
         // ② token 空串：清空
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": { "enabled": false, "repo": "wcpe/JianArtifact", "api_base_url": "https://api.github.com", "restart_mode": "self", "channel": "stable", "token": "" }
         });
         let resp = app
@@ -1310,7 +1454,7 @@ mod tests {
         let app = super::super::build_router(state);
 
         let body = serde_json::json!({
-            "network_proxy": { "http": { "url": "http://proxy.local:8080" }, "https": {}, "all": {}, "no_proxy": null }
+            "network_proxy": { "proxy": { "url": "http://proxy.local:8080" }, "no_proxy": null }
         });
         let resp = app
             .oneshot(
@@ -1331,8 +1475,117 @@ mod tests {
             "在线更新未提供应保持不动"
         );
         assert!(
-            settings.network.snapshot().proxy.http.is_some(),
+            settings.network.snapshot().proxy.url.is_some(),
             "代理应已更新"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_旧三键契约返回_400_且内存与数据库不变() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let settings = state.settings.clone();
+        let meta = state.meta.clone();
+
+        let seed = serde_json::json!({
+            "network_proxy": {
+                "proxy": { "url": "http://saved-proxy.internal:3128" },
+                "no_proxy": "localhost"
+            }
+        });
+        let resp = 请求_patch(state.clone(), Some(&token), seed).await;
+        assert_eq!(resp.status(), StatusCode::OK, "新契约代理应先成功保存");
+        let memory_before = {
+            let proxy = settings.network.snapshot().proxy.clone();
+            (
+                proxy.url,
+                proxy.http,
+                proxy.https,
+                proxy.all,
+                proxy.no_proxy,
+            )
+        };
+        let db_before = meta.load_settings().await.unwrap();
+        assert!(
+            db_before.iter().any(|(key, _)| key == PROXY_SETTING_KEY),
+            "测试前应已有非空代理落库"
+        );
+
+        let legacy = serde_json::json!({
+            "network_proxy": {
+                "http": { "url": "http://legacy-http.internal:8080" },
+                "https": { "url": "http://legacy-https.internal:8443" },
+                "all": { "url": "socks5://legacy-all.internal:1080" },
+                "no_proxy": "example.invalid"
+            }
+        });
+        let resp = 请求_patch(state, Some(&token), legacy).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "旧三键 PATCH 契约必须明确拒绝"
+        );
+        let memory_after = {
+            let proxy = settings.network.snapshot().proxy.clone();
+            (
+                proxy.url,
+                proxy.http,
+                proxy.https,
+                proxy.all,
+                proxy.no_proxy,
+            )
+        };
+        assert_eq!(memory_after, memory_before, "拒绝旧契约后内存代理不得变化");
+        assert_eq!(
+            meta.load_settings().await.unwrap(),
+            db_before,
+            "拒绝旧契约后数据库代理记录不得变化"
+        );
+    }
+
+    #[tokio::test]
+    async fn 并发patch结束后内存代理与数据库持久值一致() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let settings = Arc::clone(&state.settings);
+        let meta = state.meta.clone();
+
+        let mut tasks = Vec::new();
+        for i in 0..24 {
+            let state = state.clone();
+            let token = token.clone();
+            tasks.push(tokio::spawn(async move {
+                let body = serde_json::json!({
+                    "network_proxy": {
+                        "proxy": { "url": format!("http://proxy-{i}.internal:3128") },
+                        "no_proxy": format!("bypass-{i}.internal")
+                    }
+                });
+                请求_patch(state, Some(&token), body).await.status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+
+        let memory = settings.network.snapshot().proxy.clone();
+        let (_, json) = meta
+            .load_settings()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| key == PROXY_SETTING_KEY)
+            .expect("并发 PATCH 后应有代理持久值");
+        let key = state.jwt.derive_key(crate::crypto_box::PROXY_KEY_DOMAIN);
+        let persisted = restore_proxy_from_db(&json, &key).expect("持久值应可恢复");
+        assert_eq!(
+            persisted.effective_url(),
+            memory.effective_url(),
+            "并发 PATCH 完成后 DB 代理必须与运行时代理一致"
+        );
+        assert_eq!(
+            persisted.no_proxy, memory.no_proxy,
+            "并发 PATCH 完成后 DB no_proxy 必须与运行时一致"
         );
     }
 
@@ -1522,7 +1775,7 @@ mod tests {
         let meta = state.meta.clone();
 
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": {
                 "enabled": true,
                 "repo": "acme/app",
@@ -1571,9 +1824,7 @@ mod tests {
 
         let body = serde_json::json!({
             "network_proxy": {
-                "http": { "url": "http://proxy.internal:3128", "username": "alice", "password": "supersecretpw" },
-                "https": {},
-                "all": {},
+                "proxy": { "url": "http://proxy.internal:3128", "username": "alice", "password": "supersecretpw" },
                 "no_proxy": null
             },
             "update": {
@@ -1607,12 +1858,13 @@ mod tests {
             .find(|(k, _)| k == PROXY_SETTING_KEY)
             .expect("network.proxy 应已落库");
         let persisted: PersistedProxy = serde_json::from_str(&proxy_row.1).unwrap();
-        let http = persisted.http.expect("http 代理应已落库");
+        let entry = persisted.proxy.expect("代理应已按单项形态落库（FR-146）");
+        assert!(persisted.http.is_none(), "新写入不得再落旧 http 项");
         // URL 脱敏 host + 用户名明文落库（均非密钥）
-        assert_eq!(http.url.as_deref(), Some("http://proxy.internal:3128"));
-        assert_eq!(http.username.as_deref(), Some("alice"));
+        assert_eq!(entry.url.as_deref(), Some("http://proxy.internal:3128"));
+        assert_eq!(entry.username.as_deref(), Some("alice"));
         // 密码以密文落库（password_enc 非空、且不等于明文）
-        let enc = http.password_enc.expect("密码应以密文落库");
+        let enc = entry.password_enc.expect("密码应以密文落库");
         assert_ne!(enc, "supersecretpw", "落库密码不得为明文");
         assert!(!enc.contains("supersecretpw"), "密文不得含明文子串：{enc}");
         // 用派生子密钥能解密回明文（重启恢复的等价路径）
@@ -1634,9 +1886,7 @@ mod tests {
 
         let body = serde_json::json!({
             "network_proxy": {
-                "http": { "url": "http://proxy.internal:3128", "username": "alice", "password": "supersecretpw" },
-                "https": {},
-                "all": { "url": "socks5://socks.internal:1080", "username": "su", "password": "sp" },
+                "proxy": { "url": "socks5://socks.internal:1080", "username": "su", "password": "sp" },
                 "no_proxy": "localhost,127.0.0.1"
             },
             "update": {
@@ -1661,15 +1911,33 @@ mod tests {
         let restored = restore_proxy_from_db(json, &key).expect("应恢复出代理");
         // 恢复出的代理 URL 含解密后的凭据（与 PATCH 时一致），密码仍在
         assert_eq!(
-            restored.http.as_deref(),
-            Some("http://alice:supersecretpw@proxy.internal:3128")
-        );
-        assert_eq!(
-            restored.all.as_deref(),
+            restored.url.as_deref(),
             Some("socks5://su:sp@socks.internal:1080")
         );
-        assert_eq!(restored.https, None);
         assert_eq!(restored.no_proxy.as_deref(), Some("localhost,127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn 旧三项落库_json_恢复时按优先级折叠为单代理() {
+        // FR-146 向后兼容：升级前落库的旧三项形态（http/https/all）恢复时按 all > https > http
+        // 折叠为单代理，凭据不丢（用真实加密密文构造旧形态 JSON）。
+        let (state, _dir) = 测试用状态().await;
+        let key = state.jwt.derive_key(crate::crypto_box::PROXY_KEY_DOMAIN);
+        let http_enc = crate::crypto_box::encrypt_secret(&key, "hp");
+        let all_enc = crate::crypto_box::encrypt_secret(&key, "sp");
+        let legacy_json = serde_json::json!({
+            "http": { "url": "http://proxy.internal:3128", "username": "alice", "password_enc": http_enc },
+            "all": { "url": "socks5://socks.internal:1080", "username": "su", "password_enc": all_enc },
+            "no_proxy": "localhost"
+        })
+        .to_string();
+        let restored = restore_proxy_from_db(&legacy_json, &key).expect("旧形态应能恢复");
+        // all 优先于 http：单代理取 all 项，凭据解密回明文
+        assert_eq!(
+            restored.url.as_deref(),
+            Some("socks5://su:sp@socks.internal:1080")
+        );
+        assert_eq!(restored.no_proxy.as_deref(), Some("localhost"));
     }
 
     #[tokio::test]
@@ -1680,7 +1948,7 @@ mod tests {
         let meta = state.meta.clone();
 
         let 带代理 = serde_json::json!({
-            "network_proxy": { "http": { "url": "http://p.internal:3128" }, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": { "url": "http://p.internal:3128" }, "no_proxy": null },
             "update": { "enabled": false, "repo": "wcpe/JianArtifact", "api_base_url": "https://api.github.com", "restart_mode": "self", "channel": "stable", "token": null }
         });
         let resp = 请求_patch(state.clone(), Some(&token), 带代理).await;
@@ -1695,7 +1963,7 @@ mod tests {
         );
 
         let 空代理 = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": { "enabled": false, "repo": "wcpe/JianArtifact", "api_base_url": "https://api.github.com", "restart_mode": "self", "channel": "stable", "token": null }
         });
         let resp = 请求_patch(state, Some(&token), 空代理).await;
@@ -1718,7 +1986,7 @@ mod tests {
         let token = 签发令牌(&state, "admin", Role::Admin).await;
         let meta = state.meta.clone();
         let body = serde_json::json!({
-            "network_proxy": { "http": {}, "https": {}, "all": {}, "no_proxy": null },
+            "network_proxy": { "proxy": {}, "no_proxy": null },
             "update": {
                 "enabled": true,
                 "repo": "wcpe/JianArtifact",
@@ -1853,5 +2121,179 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = 读_json(resp).await;
         assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn proxy_test_malformed_http_https_url_返回_400() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+
+        for url in ["http://", "https://"] {
+            let resp =
+                请求_proxy_test(state.clone(), Some(&token), serde_json::json!({"url": url})).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "格式损坏的目标 URL 必须返回 400：{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_test_表单代理临时生效_无需保存() {
+        let (proxy_addr, seen) = 启动_mock_代理().await;
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+
+        let resp = 请求_proxy_test(
+            state,
+            Some(&token),
+            serde_json::json!({
+                "url": "http://example.invalid/probe",
+                "proxy": { "url": format!("http://{proxy_addr}") }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = 读_json(resp).await;
+        assert_eq!(body["ok"], true, "mock 代理返回 200，测试应成功：{body}");
+        assert_eq!(body["status"], 200);
+        let lines = seen.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://example.invalid/probe")),
+            "表单代理应收到目标 URL 的 absolute-form 请求行，实际：{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_test_显式表单代理不继承已保存_no_proxy() {
+        let (form_proxy_addr, form_seen) = 启动_mock_代理().await;
+        let (origin_addr, origin_hit) = 启动_mock_源站().await;
+        let (mut state, _dir) = 测试用状态().await;
+        let saved = crate::config::NetworkProxyConfig {
+            url: Some("http://127.0.0.1:1".to_string()),
+            no_proxy: Some(origin_addr.ip().to_string()),
+            ..Default::default()
+        };
+        注入设置(&mut state, saved, &crate::config::UpdateConfig::default());
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+        let target = format!("http://{origin_addr}/must-use-form-proxy");
+
+        let resp = 请求_proxy_test(
+            state,
+            Some(&token),
+            serde_json::json!({
+                "url": target,
+                "proxy": { "url": format!("http://{form_proxy_addr}") }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = 读_json(resp).await;
+        assert_eq!(
+            body["ok"], true,
+            "显式表单代理返回 200 时测试应成功：{body}"
+        );
+        let lines = form_seen.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| line.contains(&target)),
+            "显式表单代理必须收到请求，不得继承已保存 no_proxy：{lines:?}"
+        );
+        assert!(
+            !*origin_hit.lock().unwrap(),
+            "显式表单代理存在时不应因已保存 no_proxy 直连源站"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_test_缺省_proxy_仍使用已保存代理() {
+        let (proxy_addr, seen) = 启动_mock_代理().await;
+        let (mut state, _dir) = 测试用状态().await;
+        let proxy = crate::config::NetworkProxyConfig {
+            url: Some(format!("http://{proxy_addr}")),
+            ..Default::default()
+        };
+        注入设置(&mut state, proxy, &crate::config::UpdateConfig::default());
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+
+        let resp = 请求_proxy_test(
+            state,
+            Some(&token),
+            serde_json::json!({"url": "http://example.invalid/saved"}),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = 读_json(resp).await;
+        assert_eq!(body["ok"], true, "缺省 proxy 应沿用已保存代理：{body}");
+        let lines = seen.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http://example.invalid/saved")),
+            "缺省 proxy 字段时已保存代理应继续生效，实际：{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_test_空表单代理强制直连_不走已保存代理() {
+        let (proxy_addr, seen) = 启动_mock_代理().await;
+        let (origin_addr, origin_hit) = 启动_mock_源站().await;
+        let (mut state, _dir) = 测试用状态().await;
+        let proxy = crate::config::NetworkProxyConfig {
+            url: Some(format!("http://{proxy_addr}")),
+            ..Default::default()
+        };
+        注入设置(&mut state, proxy, &crate::config::UpdateConfig::default());
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+
+        let resp = 请求_proxy_test(
+            state,
+            Some(&token),
+            serde_json::json!({
+                "url": format!("http://{origin_addr}/direct"),
+                "proxy": { "url": "" }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = 读_json(resp).await;
+        assert_eq!(body["ok"], true, "显式空代理应直连源站：{body}");
+        assert!(*origin_hit.lock().unwrap(), "显式空代理应直连命中源站");
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines.is_empty(), "显式空代理不应走已保存代理：{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn proxy_test_表单代理非法_scheme_返回_400_且不泄露凭据() {
+        let (state, _dir) = 测试用状态().await;
+        let token = 签发令牌(&state, "admin", Role::Admin).await;
+
+        let resp = 请求_proxy_test(
+            state,
+            Some(&token),
+            serde_json::json!({
+                "url": "http://example.invalid/probe",
+                "proxy": { "url": "ftp://secretuser:secretpass@proxy.internal:21" }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = 读_json(resp).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("代理配置非法"),
+            "应返回中文代理配置错误：{body}"
+        );
+        assert!(
+            !message.contains("secretuser") && !message.contains("secretpass"),
+            "错误信息不得泄露代理凭据：{message}"
+        );
     }
 }

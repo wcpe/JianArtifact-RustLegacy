@@ -165,6 +165,11 @@ fn section_pinned_by_env(section: &str, env_keys: &BTreeSet<String>) -> bool {
         .any(|k| k == section || k.starts_with(&prefix))
 }
 
+/// 判断网络代理节是否被 env 显式钉住，供专用 DB 恢复路径复用通用点分节判定。
+pub fn proxy_section_pinned_by_env(env_keys: &BTreeSet<String>) -> bool {
+    section_pinned_by_env(PROXY_PERSIST_KEY, env_keys)
+}
+
 /// 把单个白名单节的 DB JSON 覆盖应用到生效 `Config`（解析失败只 WARN、保留文件默认）。
 ///
 /// 每节反序列化为对应强类型再整体替换该子树；类型不符 / JSON 损坏即记 WARN 跳过该节、不动现值。
@@ -328,6 +333,29 @@ mod tests {
     fn 节被_env_钉住_整节精确匹配() {
         let env = env_set(&["limits"]);
         assert!(section_pinned_by_env("limits", &env));
+    }
+
+    #[test]
+    fn 代理节被新旧代理键或_no_proxy_env_钉住() {
+        for env_key in [
+            "network_proxy_url",
+            "network_proxy_http",
+            "network_proxy_https",
+            "network_proxy_all",
+            "network_proxy_no_proxy",
+        ] {
+            let dotted = env_key_to_dotted(env_key);
+            assert!(
+                proxy_section_pinned_by_env(&env_set(&[&dotted])),
+                "{env_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn 代理节无_env_时不钉住() {
+        assert!(!proxy_section_pinned_by_env(&env_set(&[])));
+        assert!(!proxy_section_pinned_by_env(&env_set(&["update.enabled",])));
     }
 
     // ===== 三层优先级穷举 =====

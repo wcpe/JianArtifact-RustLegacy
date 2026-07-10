@@ -647,10 +647,11 @@ export const handlers = [
     return HttpResponse.json(state.settings);
   }),
 
-  // —— 出站代理连通性测试（仅管理员，FR-128）：mock 下固定返回不可达结果（无真实出站代理）—— //
-  http.post(`${API}/settings/proxy-test`, ({ request }) => {
+  // —— 出站代理连通性测试（仅管理员，FR-128/147）：mock 下容忍表单 proxy 字段并固定返回不可达结果。—— //
+  http.post(`${API}/settings/proxy-test`, async ({ request }) => {
     const guard = requireUser(request, { admin: true });
     if (isResponse(guard)) return guard;
+    await request.json().catch(() => ({}));
     return HttpResponse.json({ ok: false, elapsed_ms: 0, error: '连接失败（Mock 模式）' });
   }),
 

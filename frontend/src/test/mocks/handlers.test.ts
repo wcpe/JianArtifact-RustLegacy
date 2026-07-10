@@ -6,14 +6,44 @@
 // 每用例前 reset + 经 loginAs 取管理员会话。
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import { http, HttpResponse } from 'msw';
 import { seed } from './store';
 import { loginAs } from './auth';
+import { server } from './server';
 import * as api from '../../api/endpoints';
 
 describe('新增 MSW handlers（管理员端点不返 401）', () => {
   beforeEach(async () => {
     seed();
     await loginAs('admin', 'admin123');
+  });
+
+  it('F-09：真实 testProxy 传输 JSON 省略缺省 proxy/password 并保留空 password', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    server.use(
+      http.post('/api/v1/settings/proxy-test', async ({ request }) => {
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ok: true, status: 200, elapsed_ms: 1 });
+      }),
+    );
+
+    await api.testProxy('https://direct.example');
+    await api.testProxy('https://saved-password.example', {
+      proxy: { url: 'http://proxy.example:3128', username: 'alice' },
+    });
+    await api.testProxy('https://cleared-password.example', {
+      proxy: { url: 'http://proxy.example:3128', username: 'alice', password: '' },
+    });
+
+    expect(bodies[0]).toEqual({ url: 'https://direct.example' });
+    expect(bodies[1]).toEqual({
+      url: 'https://saved-password.example',
+      proxy: { url: 'http://proxy.example:3128', username: 'alice' },
+    });
+    expect(bodies[2]).toEqual({
+      url: 'https://cleared-password.example',
+      proxy: { url: 'http://proxy.example:3128', username: 'alice', password: '' },
+    });
   });
 
   it('GET /settings/dynamic 返 200 带各节结构', async () => {

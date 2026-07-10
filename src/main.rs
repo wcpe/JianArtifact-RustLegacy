@@ -150,9 +150,11 @@ async fn main() -> anyhow::Result<()> {
     info!("JWT 会话签名器就绪");
 
     // 网络代理加密落库恢复（ADR-0030）：JWT 就绪后、装配可编辑设置槽前，从 app_settings 读
-    // `network.proxy`（专用加密通道，不并入 config_overlay 白名单），用派生子密钥解密密码、重建
-    // 内存态代理覆盖 cfg.network.proxy。解密失败该代理降级无密码 + WARN，不阻断启动。代理重启不丢。
-    if let Some((_, json)) = db_overlay
+    // `network.proxy`（专用加密通道，不并入 config_overlay 白名单）。任一代理子键由 env 显式给值时，
+    // 整节以 env 为准并跳过 DB；否则用派生子密钥解密密码、重建内存态代理。解密失败降级无密码。
+    if jianartifact::config_overlay::proxy_section_pinned_by_env(&env_keys) {
+        info!("检测到显式网络代理环境变量，已跳过 DB 代理恢复");
+    } else if let Some((_, json)) = db_overlay
         .iter()
         .find(|(k, _)| k == jianartifact::api::settings::PROXY_SETTING_KEY)
     {

@@ -39,20 +39,17 @@ login_lockout_secs = 900
 # proxy 仓库回源上游的整体请求超时（秒），避免慢速上游拖垮代理。
 upstream_timeout_secs = 60
 
-# 出站网络代理（FR-84 / FR-100 / ADR-0020 / ADR-0024）。统一注入全部出站 reqwest 客户端
-# （proxy 回源 / 漏洞库镜像 / OIDC / 在线更新等）。四键默认全空：不显式注入代理，保持
+# 出站网络代理（FR-146 / ADR-0042 单键通用代理）。统一注入全部出站 reqwest 客户端
+# （proxy 回源 / 漏洞库镜像 / OIDC / 在线更新等）。默认全空：不显式注入代理，保持
 # reqwest 既有行为（含 honor 系统 HTTP_PROXY / HTTPS_PROXY / NO_PROXY 环境变量）。
-# 任一键给值即以本配置为真源。代理 URL 可含 user:pass@ 凭据——凭据不入库、不进日志 /
-# 错误信息，建议含凭据的代理 URL 仅经环境变量提供，不写入本文件。
+# 给值即以本配置为真源。代理 URL 可含 user:pass@ 凭据——凭据不进日志 / 错误信息，
+# 建议含凭据的代理 URL 仅经环境变量提供，不写入本文件。
 # 运行时可经控制台「设置」页或 PATCH /api/v1/settings 在线改、即时生效、无须重启（FR-88）。
+# 旧键 http / https / all 已废弃：自动映射为 url（优先 all > https > http）并打启动 WARN。
 # [network.proxy]
-# # HTTP 出站代理（scheme 专属）。
-# http = "http://user:pass@host:3128"
-# # HTTPS 出站代理（scheme 专属）。
-# https = "http://user:pass@host:3128"
-# # 全 scheme 兜底代理（FR-100）：接受 socks5:// / socks5h:// / http(s)://，可含 user:pass@。
-# # http / https 各自优先，all 兜底其余；仅配 all 即覆盖 http+https（SOCKS5 单代理常见用法）。
-# all = "socks5://user:pass@host:1080"
+# # 通用出站代理：接受 http:// / https:// / socks5:// / socks5h:// 前缀，可含 user:pass@。
+# # 受 DNS 污染的网络建议 socks5h://（域名交代理端解析）。
+# url = "socks5://user:pass@host:1080"
 # # 直连绕过列表（逗号分隔的主机 / 域 / CIDR），命中者不经代理。
 # no_proxy = "localhost,127.0.0.1"
 

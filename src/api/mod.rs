@@ -169,7 +169,7 @@ pub struct AppState {
     /// 运行时可编辑设置热替换槽（FR-88，ADR-0022）：收拢出站网络代理（含据其构造的 reqwest::Client）
     /// 与在线更新可调字段（enabled/repo/api_base_url/restart_mode/token）。出站点经
     /// `settings.network.client()` 取当前 client；管理端 `PATCH /api/v1/settings` 校验后锁外重建、原子
-    /// 换槽即时生效、无须重启。凭据只入本内存槽，不写回 TOML / 不入 DB / 不回显。
+    /// 换槽即时生效、无须重启。代理密码由专用通道加密落库，token 只入内存；均不写 TOML / 不回显。
     pub settings: Arc<crate::config::EditableSettings>,
     /// 主机 / 系统监控采样器（FR-98，ADR-0023）：单进程共享一份 `sysinfo::System`（refresh 需 `&mut`），
     /// 经 `Mutex` 串行化按请求采样 CPU / 内存 / 磁盘 / uptime。仅 Admin 端点 `GET /api/v1/monitor/host`

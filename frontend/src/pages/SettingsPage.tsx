@@ -142,36 +142,24 @@ export function SettingsPage() {
   // 当前激活的顶部 Tab（FR-129）：仅驱动分页显示，不与滚动联动（根因消除锚点高亮 / hover 错位）。
   const [activeTab, setActiveTab] = useState<string>('proxy');
 
-  // —— 可编辑表单态（FR-88 + FR-100）——
-  // 每代理（http / https / all）拆三字段：URL（脱敏 host，无凭据）、用户名（回显）、密码（不回显）。
+  // —— 可编辑表单态（FR-88 + FR-100 + FR-146 单槽收敛）——
+  // 单一通用代理拆三字段：URL（脱敏 host，无凭据）、用户名（回显）、密码（不回显）。
   // 密码框始终空：留空保存=省略 password 字段（保留现有）；填值=设置；另有「清除密码」动作发空串清空。
-  const [httpUrl, setHttpUrl] = useState('');
-  const [httpUser, setHttpUser] = useState('');
-  const [httpPass, setHttpPass] = useState('');
-  const [httpHasPass, setHttpHasPass] = useState(false);
-  const [httpsUrl, setHttpsUrl] = useState('');
-  const [httpsUser, setHttpsUser] = useState('');
-  const [httpsPass, setHttpsPass] = useState('');
-  const [httpsHasPass, setHttpsHasPass] = useState(false);
-  const [allUrl, setAllUrl] = useState('');
-  const [allUser, setAllUser] = useState('');
-  const [allPass, setAllPass] = useState('');
-  const [allHasPass, setAllHasPass] = useState(false);
-  // 三个「清除密码」动作的标记：点了清除即在本次 PATCH 发 password: "" 清空对应代理密码。
-  const [httpClearPass, setHttpClearPass] = useState(false);
-  const [httpsClearPass, setHttpsClearPass] = useState(false);
-  const [allClearPass, setAllClearPass] = useState(false);
-  // 三个「清除代理」动作的标记（清空该槽位的 URL / 用户名 / 密码并清除 has_password），
-  // 与「清除密码」互斥：点过任意一个后在保存时构造 PATCH 载荷跳过另一项。
-  const [httpClearProxy, setHttpClearProxy] = useState(false);
-  const [httpsClearProxy, setHttpsClearProxy] = useState(false);
-  const [allClearProxy, setAllClearProxy] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [proxyUser, setProxyUser] = useState('');
+  const [proxyPass, setProxyPass] = useState('');
+  const [proxyHasPass, setProxyHasPass] = useState(false);
+  // 「清除密码」动作的标记：点了清除即在本次 PATCH 发 password: "" 清空代理密码。
+  const [proxyClearPass, setProxyClearPass] = useState(false);
+  // 「清除代理」动作的标记（清空槽位的 URL / 用户名 / 密码并清除 has_password），
+  // 与「清除密码」互斥：点过之后在保存时构造 PATCH 载荷跳过另一项。
+  const [proxyClearProxy, setProxyClearProxy] = useState(false);
   const [noProxy, setNoProxy] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
-  // —— 代理连通性测试（FR-128 回流 UX：每代理各一个按钮 → 共用模态框）——
+  // —— 代理连通性测试（FR-128 回流 UX：单槽「测试」按钮 → 模态框）——
   const [testModalOpen, setTestModalOpen] = useState(false);
   const [testUrl, setTestUrl] = useState('');
   const [testing, setTesting] = useState(false);
@@ -200,25 +188,13 @@ export function SettingsPage() {
   // 用一份设置填充表单态。
   function fillForm(s: SettingsView) {
     setSettings(s);
-    // 网络代理三槽：URL / 用户名回显预填，密码框始终空、仅以 has_password 标识是否已配置（FR-100）。
-    setHttpUrl(s.network_proxy.http.url ?? '');
-    setHttpUser(s.network_proxy.http.username ?? '');
-    setHttpPass('');
-    setHttpHasPass(s.network_proxy.http.has_password);
-    setHttpClearPass(false);
-    setHttpClearProxy(false);
-    setHttpsUrl(s.network_proxy.https.url ?? '');
-    setHttpsUser(s.network_proxy.https.username ?? '');
-    setHttpsPass('');
-    setHttpsHasPass(s.network_proxy.https.has_password);
-    setHttpsClearPass(false);
-    setHttpsClearProxy(false);
-    setAllUrl(s.network_proxy.all.url ?? '');
-    setAllUser(s.network_proxy.all.username ?? '');
-    setAllPass('');
-    setAllHasPass(s.network_proxy.all.has_password);
-    setAllClearPass(false);
-    setAllClearProxy(false);
+    // 通用代理单槽（FR-146）：URL / 用户名回显预填，密码框始终空、仅以 has_password 标识是否已配置（FR-100）。
+    setProxyUrl(s.network_proxy.proxy.url ?? '');
+    setProxyUser(s.network_proxy.proxy.username ?? '');
+    setProxyPass('');
+    setProxyHasPass(s.network_proxy.proxy.has_password);
+    setProxyClearPass(false);
+    setProxyClearProxy(false);
     setNoProxy(s.network_proxy.no_proxy ?? '');
   }
 
@@ -286,33 +262,36 @@ export function SettingsPage() {
     );
   }
 
-  // 组装单代理 PATCH 项（FR-100）：url / username 照填；
+  // 组装通用代理 PATCH 项（FR-100 + FR-146 单槽）：url / username 照填；
   // 密码三态——填了新密码 → 带 password（设置）；点了「清除密码」→ 带 password: ""（清空）；
   // 否则省略 password 字段（保留现有）。
-  // 「清除代理」语义：保留 entry 但 url 置为空字符串——后端 `rebuild_proxy_url` 会把它归一为 None、清空该代理槽。
-  function buildProxyPatch(
-    url: string,
-    username: string,
-    password: string,
-    clearPass: boolean,
-  ): ProxyEntryPatch {
-    const entry: ProxyEntryPatch = { url: url.trim(), username: username.trim() };
-    if (password) {
-      entry.password = password;
-    } else if (clearPass) {
+  // 「清除代理」语义：保留 entry 但 url 置为空字符串——后端 `rebuild_proxy_url` 会把它归一为 None、清空代理槽；
+  // 此时 password 字段省略，避免与空 password 同时出现歧义（「清除代理」覆盖「清除密码」）。
+  function buildProxyPatchForSave(): ProxyEntryPatch {
+    if (proxyClearProxy) {
+      return { url: '', username: '' };
+    }
+    const entry: ProxyEntryPatch = { url: proxyUrl.trim(), username: proxyUser.trim() };
+    if (proxyPass) {
+      entry.password = proxyPass;
+    } else if (proxyClearPass) {
       entry.password = '';
     }
     return entry;
   }
 
-  // HTTP 代理 PATCH 构造：单独抽出以便根据 `httpClearProxy` 走「清空代理」语义。
-  // 其它两槽（https / all）仍走统一 buildProxyPatch，但允许把"清除代理"也归结为同样的「URL 空」标记。
-  function buildHttpPatchForSave(): ProxyEntryPatch {
-    if (httpClearProxy) {
-      // 「清除代理」覆盖「清除密码」语义：URL 留空串就够了，password 字段省略避免与空 password 同时出现歧义。
-      return { url: '', username: '' };
+  // FR-147：测试走表单当前值，不要求先保存；URL 空或点过清除代理即显式测直连。
+  function buildProxyPatchForTest(): ProxyEntryPatch {
+    if (proxyClearProxy || proxyUrl.trim() === '') {
+      return { url: '' };
     }
-    return buildProxyPatch(httpUrl, httpUser, httpPass, httpClearPass);
+    const entry: ProxyEntryPatch = { url: proxyUrl.trim(), username: proxyUser.trim() };
+    if (proxyPass !== '') {
+      entry.password = proxyPass;
+    } else if (proxyClearPass) {
+      entry.password = '';
+    }
+    return entry;
   }
 
   // 把耗时毫秒格式化为可读字符串：>=1s 显示秒、否则毫秒；带小数位便于判断瞬时响应与慢代理差异。
@@ -351,20 +330,27 @@ export function SettingsPage() {
     }
   }
 
-  // 关闭测试模态框：先把挂起的请求 abort 掉，避免离开时旧 promise 写状态；再复位显示与超时标。
-  function closeTestModal() {
-    testAbortRef.current?.abort();
+  // 取消当前测试并立即解除 loading；清空 controller 身份后，旧 promise 完成时无法回写状态。
+  function cancelCurrentProxyTest() {
+    const controller = testAbortRef.current;
     testAbortRef.current = null;
+    controller?.abort();
+    setTesting(false);
+  }
+
+  // 关闭测试模态框：取消挂起请求，避免离开后旧 promise 写状态。
+  function closeTestModal() {
+    cancelCurrentProxyTest();
     setTestModalOpen(false);
     setTestTimedOut(false);
   }
 
-  // 打开代理连通性测试模态框（FR-128 回流 UX）：每代理各一个按钮触发，预填当前代理 URL。
-  function openTestModal(defaultUrl: string) {
-    // 重新打开前若仍有挂起请求，先 abort 以保证只会有一个测试在跑。
-    testAbortRef.current?.abort();
-    testAbortRef.current = null;
-    setTestUrl(defaultUrl);
+  // 打开代理连通性测试模态框（FR-128 回流 UX + FR-146/147 缺陷修复）：
+  // 预填**目标 URL 占位值**（testUrlPlaceholder），不再预填代理地址——测试输入的是目标站点、不是代理本身。
+  function openTestModal() {
+    // 重新打开前取消挂起请求，保证只会有一个测试在跑，并复位 loading 防止按钮卡死。
+    cancelCurrentProxyTest();
+    setTestUrl(t('proxy.testUrlPlaceholder'));
     setTestResult(null);
     setTestError(null);
     setTestTimedOut(false);
@@ -390,18 +376,21 @@ export function SettingsPage() {
     setTestError(null);
     setTestTimedOut(false);
     try {
-      const result = await api.testProxy(url, { signal: controller.signal });
-      if (controller.signal.aborted) return;
+      const result = await api.testProxy(url, {
+        proxy: buildProxyPatchForTest(),
+        signal: controller.signal,
+      });
+      if (testAbortRef.current !== controller || controller.signal.aborted) return;
       setTestResult(result);
     } catch (err) {
-      if (controller.signal.aborted) return;
+      if (testAbortRef.current !== controller || controller.signal.aborted) return;
       const msg = errorMessage(err);
       // ApiError(408, 'timeout') 由 client.request 抛；'aborted'(0) 由外部 signal 触发；二者不应混入 UI 提示。
       const isTimeout = err instanceof api.ApiError && err.status === 408;
       setTestTimedOut(isTimeout);
       setTestError(msg);
     } finally {
-      if (!controller.signal.aborted) {
+      if (testAbortRef.current === controller) {
         testAbortRef.current = null;
         setTesting(false);
       }
@@ -421,9 +410,7 @@ export function SettingsPage() {
     try {
       const updated = await api.updateSettings({
         network_proxy: {
-          http: buildHttpPatchForSave(),
-          https: buildProxyPatch(httpsUrl, httpsUser, httpsPass, httpsClearPass || httpsClearProxy),
-          all: buildProxyPatch(allUrl, allUser, allPass, allClearPass || allClearProxy),
+          proxy: buildProxyPatchForSave(),
           no_proxy: noProxy.trim(),
         },
       });
@@ -457,12 +444,13 @@ export function SettingsPage() {
       <Title order={2}>{t('pageTitle')}</Title>
       {error && <ErrorAlert message={error} />}
 
-      {/* 代理连通性测试模态框（FR-128 回流 UX：每代理各一个按钮共用此模态框） */}
+      {/* 代理连通性测试模态框（FR-128 回流 UX：单槽「测试」按钮弹出） */}
       <Modal
         opened={testModalOpen}
         onClose={closeTestModal}
         title={t('proxy.testModalTitle')}
         size="md"
+        closeButtonProps={{ 'aria-label': t('proxy.closeTestModal') }}
       >
         <Stack gap="sm">
           <Text size="sm" c="dimmed">
@@ -474,9 +462,9 @@ export function SettingsPage() {
               placeholder={t('proxy.testUrlPlaceholder')}
               value={testUrl}
               onChange={(e) => {
+                cancelCurrentProxyTest();
                 setTestUrl(e.currentTarget.value);
-                // URL 一变即作废旧结果与错误，避免上一次结果误导本次判断；不取消挂起的请求，
-                // 在点测试时会主动 abort 旧 controller 兜底（见 handleProxyTest）。
+                // URL 一变即取消旧请求并作废旧结果，避免旧 promise 回写本次测试状态。
                 setTestResult(null);
                 setTestError(null);
                 setTestTimedOut(false);
@@ -487,15 +475,15 @@ export function SettingsPage() {
             <Button
               size="xs"
               variant="subtle"
-              // 「重置」按钮：把 URL 输入恢复成占位提示值，便于复用上次打开时预填的代理 URL。
+              // 「重置」按钮：把 URL 输入恢复成占位提示值（与打开模态框时的预填一致）。
               onClick={() => {
+                cancelCurrentProxyTest();
                 setTestUrl(t('proxy.testUrlPlaceholder'));
                 setTestResult(null);
                 setTestError(null);
                 setTestTimedOut(false);
               }}
               data-testid="proxy-test-reset-button"
-              disabled={testing}
             >
               {t('proxy.resetUrl')}
             </Button>
@@ -574,153 +562,66 @@ export function SettingsPage() {
               {t('proxy.desc')}
             </Text>
             <Stack gap="md">
-              {/* HTTP / HTTPS 各自 scheme 专属代理；SOCKS5 填 all（兜底全 scheme，FR-100） */}
-              {/* HTTP 代理 + 测试按钮 + 清除代理按钮（FR-128 回流 UX + 「清除代理」UX 补全）*/}
+              {/* 单一通用代理槽（FR-146）：URL 自填 scheme，经 Proxy::all 对全部出站请求生效 */}
               <Stack gap="xs">
                 <ProxyFields
-                  title={t('proxy.httpTitle')}
-                  urlPlaceholder="http://host:3128"
-                  url={httpUrl}
-                  onUrlChange={setHttpUrl}
-                  username={httpUser}
-                  onUsernameChange={setHttpUser}
-                  password={httpPass}
-                  onPasswordChange={setHttpPass}
-                  hasPassword={httpHasPass}
-                  passwordCleared={httpClearPass}
-                  onClearPassword={() => setHttpClearPass(true)}
+                  title={t('proxy.generalTitle')}
+                  urlPlaceholder="socks5://host:1080 或 http://host:3128"
+                  url={proxyUrl}
+                  onUrlChange={(value) => {
+                    setProxyUrl(value);
+                    setProxyClearProxy(false);
+                  }}
+                  username={proxyUser}
+                  onUsernameChange={(value) => {
+                    setProxyUser(value);
+                    setProxyClearProxy(false);
+                  }}
+                  password={proxyPass}
+                  onPasswordChange={(value) => {
+                    setProxyPass(value);
+                    setProxyClearProxy(false);
+                    if (value !== '') setProxyClearPass(false);
+                  }}
+                  hasPassword={proxyHasPass}
+                  passwordCleared={proxyClearPass}
+                  onClearPassword={() => setProxyClearPass(true)}
                 />
+                {/* 支持的 scheme 说明（socks5h 由代理端解析域名，受污染网络推荐） */}
+                <Text size="xs" c="dimmed">
+                  {t('proxy.schemeHint')}
+                </Text>
                 <Group gap="xs">
                   <Button
                     size="xs"
                     variant="light"
-                    onClick={() => openTestModal(httpUrl || t('proxy.testUrlPlaceholder'))}
-                    data-testid="proxy-test-button-http"
+                    onClick={openTestModal}
+                    data-testid="proxy-test-open"
                   >
                     {t('proxy.testButton')}
                   </Button>
-                  {/* 「清除代理」按钮：仅当该槽位已配置（URL 或 用户名非空且未点过清除）时出现。
-                      点了之后只清空 HTTP 这一槽，HTTPS / SOCKS5 / no_proxy 不动。 */}
-                  {(httpUrl.trim() !== '' || httpUser.trim() !== '') && !httpClearProxy && (
+                  {/* 「清除代理」按钮：仅当槽位已配置（URL 或 用户名非空且未点过清除）时出现。
+                      点了之后清空 URL / 用户名 / 密码，no_proxy 不动。 */}
+                  {(proxyUrl.trim() !== '' || proxyUser.trim() !== '') && !proxyClearProxy && (
                     <Button
                       size="xs"
                       variant="subtle"
                       color="red"
-                      data-testid="proxy-clear-http"
+                      data-testid="proxy-clear"
                       onClick={() => {
-                        setHttpUrl('');
-                        setHttpUser('');
-                        setHttpPass('');
-                        setHttpHasPass(false);
+                        setProxyUrl('');
+                        setProxyUser('');
+                        setProxyPass('');
+                        setProxyHasPass(false);
                         // 标记清除代理；与清除密码互斥（保存时优先走清除代理分支）
-                        setHttpClearProxy(true);
-                        setHttpClearPass(false);
+                        setProxyClearProxy(true);
+                        setProxyClearPass(false);
                       }}
                     >
                       {t('proxy.clearProxy')}
                     </Button>
                   )}
-                  {httpClearProxy && (
-                    <Badge size="sm" color="orange" variant="light">
-                      {t('proxy.proxyWillClear')}
-                    </Badge>
-                  )}
-                </Group>
-              </Stack>
-
-              {/* HTTPS 代理 + 测试按钮 + 清除代理 */}
-              <Stack gap="xs">
-                <ProxyFields
-                  title={t('proxy.httpsTitle')}
-                  urlPlaceholder="http://host:3128"
-                  url={httpsUrl}
-                  onUrlChange={setHttpsUrl}
-                  username={httpsUser}
-                  onUsernameChange={setHttpsUser}
-                  password={httpsPass}
-                  onPasswordChange={setHttpsPass}
-                  hasPassword={httpsHasPass}
-                  passwordCleared={httpsClearPass}
-                  onClearPassword={() => setHttpsClearPass(true)}
-                />
-                <Group gap="xs">
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => openTestModal(httpsUrl || t('proxy.testUrlPlaceholder'))}
-                    data-testid="proxy-test-button-https"
-                  >
-                    {t('proxy.testButton')}
-                  </Button>
-                  {(httpsUrl.trim() !== '' || httpsUser.trim() !== '') && !httpsClearProxy && (
-                    <Button
-                      size="xs"
-                      variant="subtle"
-                      color="red"
-                      data-testid="proxy-clear-https"
-                      onClick={() => {
-                        setHttpsUrl('');
-                        setHttpsUser('');
-                        setHttpsPass('');
-                        setHttpsHasPass(false);
-                        setHttpsClearProxy(true);
-                        setHttpsClearPass(false);
-                      }}
-                    >
-                      {t('proxy.clearProxy')}
-                    </Button>
-                  )}
-                  {httpsClearProxy && (
-                    <Badge size="sm" color="orange" variant="light">
-                      {t('proxy.proxyWillClear')}
-                    </Badge>
-                  )}
-                </Group>
-              </Stack>
-
-              {/* SOCKS5 代理（all）+ 测试按钮 + 清除代理 */}
-              <Stack gap="xs">
-                <ProxyFields
-                  title={t('proxy.socks5Title')}
-                  urlPlaceholder="socks5://host:1080"
-                  url={allUrl}
-                  onUrlChange={setAllUrl}
-                  username={allUser}
-                  onUsernameChange={setAllUser}
-                  password={allPass}
-                  onPasswordChange={setAllPass}
-                  hasPassword={allHasPass}
-                  passwordCleared={allClearPass}
-                  onClearPassword={() => setAllClearPass(true)}
-                />
-                <Group gap="xs">
-                  <Button
-                    size="xs"
-                    variant="light"
-                    onClick={() => openTestModal(allUrl || t('proxy.testUrlPlaceholder'))}
-                    data-testid="proxy-test-button-all"
-                  >
-                    {t('proxy.testButton')}
-                  </Button>
-                  {(allUrl.trim() !== '' || allUser.trim() !== '') && !allClearProxy && (
-                    <Button
-                      size="xs"
-                      variant="subtle"
-                      color="red"
-                      data-testid="proxy-clear-all"
-                      onClick={() => {
-                        setAllUrl('');
-                        setAllUser('');
-                        setAllPass('');
-                        setAllHasPass(false);
-                        setAllClearProxy(true);
-                        setAllClearPass(false);
-                      }}
-                    >
-                      {t('proxy.clearProxy')}
-                    </Button>
-                  )}
-                  {allClearProxy && (
+                  {proxyClearProxy && (
                     <Badge size="sm" color="orange" variant="light">
                       {t('proxy.proxyWillClear')}
                     </Badge>

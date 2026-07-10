@@ -1,6 +1,6 @@
 # ADR-0022：运行时可编辑设置与出站客户端热替换
 
-> 本 ADR **取代 ADR-0020**（统一出站网络代理与共享出站客户端）：沿用其「`[network.proxy]` 为出站代理唯一真源、`config` 层统一 `build_outbound_client` helper、rustls-only、凭据脱敏」诸决策，但**推翻 ADR-0020 后果中「代理配置在启动期装载、运行时不热替换」一条**，改为运行时经网页 PATCH 可编辑 + 热替换。在线更新（ADR-0021）的运行时可调字段一并纳入同一热替换槽（ADR-0021 其余裁定不变）。
+> 本 ADR **取代 ADR-0020**（统一出站网络代理与共享出站客户端）：沿用其「`[network.proxy]` 为出站代理唯一真源、`config` 层统一 `build_outbound_client` helper、rustls-only、凭据脱敏」诸决策，但**推翻 ADR-0020 后果中「代理配置在启动期装载、运行时不热替换」一条**，改为运行时经网页 PATCH 可编辑 + 热替换。在线更新（ADR-0021）的运行时可调字段一并纳入同一热替换槽（ADR-0021 其余裁定不变）。本 ADR 的「代理不入 DB、重启回落文件/env」条款已被 [ADR-0030](0030-encrypted-proxy-credentials-at-rest.md) 取代；现行代理经专用加密通道持久化。
 
 ## 状态
 

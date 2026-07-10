@@ -463,31 +463,33 @@
 
 - **方法 / 路径**：`GET /api/v1/settings`
 - **请求**：无请求体。仅管理员可调用。
-- **行为**：聚合网络代理（FR-84）与在线更新（FR-85）配置及当前版本，供控制台「设置」页展示。读**运行时可编辑设置热替换槽当前值**（含运行时 PATCH 在内，FR-88 / ADR-0022）；真源为 `config.toml` / env，运行时改动只入内存槽、重启回落文件配置。
+- **行为**：聚合网络代理（FR-84）与在线更新（FR-85）配置及当前版本，供控制台「设置」页展示。读**运行时可编辑设置热替换槽当前值**（含运行时 PATCH 在内，FR-88 / ADR-0022）；网页代理经 ADR-0030 专用加密通道持久化到 `app_settings/network.proxy`，重启恢复优先级为**显式 env > DB > `config.toml`**。
 - **脱敏**：响应**绝不含任何凭据**——代理 URL 去除 `user:pass@` 凭据（`scheme://user:pass@host` → `scheme://host`）；更新 token 仅以 `has_token: bool` 暴露、绝不回显 token 本体。
-- **响应**：`{ "current_version", "network_proxy": { "http", "https", "no_proxy" }, "update": { "enabled", "repo", "api_base_url", "restart_mode", "channel", "has_token", "rollback_available" } }`。`network_proxy` 各 URL 为脱敏后字符串或 `null`；`update.channel` 为更新通道（`stable` / `prerelease`，FR-89）；`update.has_token` 表示是否已配置访问 token；`update.rollback_available`（FR-104）表示是否有可回滚的上一版本备份（持久回滚备份存在），供控制台启用 / 禁用回滚按钮。
+- **响应**：`{ "current_version", "network_proxy": { "proxy": { "url", "username", "has_password" }, "no_proxy" }, "update": { "enabled", "repo", "api_base_url", "restart_mode", "channel", "has_token", "rollback_available" } }`（FR-146 单代理，ADR-0042）。`network_proxy.proxy.url` 为脱敏后字符串或 `null`（去 `user:pass@`）、`username` 回显、`has_password` 仅布尔；`update.channel` 为更新通道（`stable` / `prerelease`，FR-89）；`update.has_token` 表示是否已配置访问 token；`update.rollback_available`（FR-104）表示是否有可回滚的上一版本备份（持久回滚备份存在），供控制台启用 / 禁用回滚按钮。
 - **错误**：`401` 未认证；`403` 非管理员。
 
 ### 编辑设置（仅 Admin，FR-88，运行时热替换）
 
 - **方法 / 路径**：`PATCH /api/v1/settings`
-- **请求**：仅管理员可调用。JSON 体 `{ "network_proxy"?: { "http", "https", "no_proxy" }, "update"?: { "enabled", "repo", "api_base_url", "restart_mode", "channel", "token"? } }`。
+- **请求**：仅管理员可调用。JSON 体 `{ "network_proxy"?: { "proxy": { "url", "username"?, "password"? }, "no_proxy" }, "update"?: { "enabled", "repo", "api_base_url", "restart_mode", "channel", "token"? } }`（FR-146 单代理；`url` 接受 `http://` / `https://` / `socks5://` / `socks5h://`，密码三态：缺省=保留 / 空串=清空 / 非空=设置）。
   - **部分更新（FR-109）**：`network_proxy` 与 `update` 两块**均可选**——只提供哪块就只改哪块（设置页只发 `network_proxy`、系统页只发 `update`）；两块都给则整体替换，向后兼容。
-  - `network_proxy` 各项为字符串或 `null`；空串 / 空白视为不配置（清空）。代理 URL 可含 `user:pass@` 凭据。
+  - `network_proxy.proxy.url` 为字符串或 `null`；空串 / 空白视为清除代理（用户名 / 密码一并忽略）。
   - `update.channel`（FR-89）：更新通道，仅允许 `stable` / `prerelease`。
   - `update.token` 三态：**缺省 / `null`** 保留现有 token 不变；**空串 `""`** 清空 token；**非空串**设置为新 token。
-- **行为**：校验后锁外重建出站 `reqwest::Client`、原子换槽，**即时生效、无须重启**（FR-88 / ADR-0022）。代理凭据与 token **只入内存槽、不写回 TOML / 不入 DB / 不进日志 / 不回显**，重启回落文件 + env 配置。**持久化（FR-106，ADR-0028）**：在线更新的**非密钥字段**（`enabled` / `repo` / `api_base_url` / `restart_mode` / `channel`）落库 `app_settings`（key=`update`，经专用非密钥视图序列化、**token 自动剔除**），**重启仍生效**；网络代理（含账密）与 update token 继续**只入内存槽、不落库**（重启回落文件 + env，凭据红线不破）。落库失败只 WARN、不阻断即时生效。
+- **行为**：校验后锁外重建出站 `reqwest::Client`、原子换槽，**即时生效、无须重启**（FR-88 / ADR-0022）。代理凭据与 token **不写回 TOML / 不进日志 / 不回显**；代理热值入内存槽，代理密码按 ADR-0030 加密落库（key=`network.proxy`）以保证重启不丢，解密失败降级无密码 + WARN；update token 仍只入内存槽、不落库。**持久化（FR-106，ADR-0028）**：在线更新的**非密钥字段**（`enabled` / `repo` / `api_base_url` / `restart_mode` / `channel`）落库 `app_settings`（key=`update`，经专用非密钥视图序列化、**token 自动剔除**），**重启仍生效**。落库失败只 WARN、不阻断即时生效。
 - **校验失败不改状态**：任一校验未过返回 `400` 且**不改变**现有生效值（再次 GET 仍返回旧值）。
 - **响应**：`200`，体同 GET（脱敏后的当前生效值）。
 - **错误**：`400` 网络代理 URL 无法构造 / `restart_mode` 非 `self`|`exit` / `channel` 非 `stable`|`prerelease` / `repo` / `api_base_url` 为空；`401` 未认证；`403` 非管理员。
 
-### 出站代理连通性测试（仅 Admin，FR-128）
+### 出站代理连通性测试（仅 Admin，FR-128 / FR-147）
 
 - **方法 / 路径**：`POST /api/v1/settings/proxy-test`
-- **请求**：仅管理员可调用。JSON 体 `{ "url": "https://example.com" }`，仅接受 `http://` 或 `https://` 前缀的 URL。
-- **行为**：取当前生效出站 client（含代理配置）对目标 URL 发 GET，超时 10s，返回连通性。仅访问用户给定 URL，不外发任何使用数据（ADR-0009）。
+- **请求**：仅管理员可调用。JSON 体 `{ "url": "https://www.google.com", "proxy"?: { "url", "username"?, "password"? } }`，目标 `url` 仅接受 `http://` 或 `https://` 前缀；`proxy` 缺省时兼容旧行为，测试当前已保存生效代理。
+  - `proxy.url` 非空时按表单当前值临时构造出站 client（无需先保存）；`password` 三态沿用设置 PATCH 语义：缺省=同用户名时沿用已存密码 / 空串=清空 / 非空=本次测试使用该密码。
+  - `proxy.url` 空串 / 空白表示显式测直连，关闭自动系统代理探测，不走已保存代理。
+- **行为**：对目标 URL 发 GET，超时 10s，返回连通性。仅访问用户给定 URL，不外发任何使用数据（ADR-0009）。
 - **响应**：`200`，体 `{ "ok": bool, "status"?: u16, "elapsed_ms": u64, "error"?: string }`。`ok=true` 时携带 HTTP 响应状态码与耗时；`ok=false` 时携带失败原因（连接失败 / 连接超时 / 请求失败）。
-- **错误**：`400` URL 格式非法 / 非 http/https scheme（错误码 `bad_request`）；`401` 未认证；`403` 非管理员。
+- **错误**：`400` 目标 URL 格式非法 / 非 http/https scheme / 代理 URL 非法（错误码 `bad_request`，不含代理凭据）；`401` 未认证；`403` 非管理员。
 
 ### 读取动态配置（仅 Admin，FR-106）
 

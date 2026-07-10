@@ -126,9 +126,8 @@ function defaultSettings(): SettingsView {
   return {
     current_version: '0.5.0-mock',
     network_proxy: {
-      http: { url: null, username: null, has_password: false },
-      https: { url: null, username: null, has_password: false },
-      all: { url: null, username: null, has_password: false },
+      // FR-146：收敛为单一通用代理槽
+      proxy: { url: null, username: null, has_password: false },
       no_proxy: null,
     },
     update: {
