@@ -424,7 +424,7 @@ M1 期内的交付工序（前端/mock 先行、契约骨架、阶段门禁）�
 
 | 规格文档 | 覆盖范围 | 状态 |
 |---|---|---|
-| `docs/specs/m1-auth.md` | 管理员自举、登录、会话、API Token、CLI 鉴权、用户管理（M1-FR-001~006） | 待产出 |
+| `docs/specs/m1-auth.md` | 管理员自举、登录、会话、API Token、CLI 鉴权、用户管理（M1-FR-001~006） | 已产出 |
 | `docs/specs/m1-repository-core.md` | 仓库可见性、ACL、仓库管理、hosted/proxy 通用能力、浏览、使用片段、健康检查（M1-FR-007~011、019~021） | 待产出 |
 | `docs/specs/m1-raw.md` | Raw hosted 与 Raw proxy 协议行为（M1-FR-013~014） | 待产出 |
 | `docs/specs/m1-maven.md` | Maven hosted 与 Maven proxy 协议行为（M1-FR-015~016） | 待产出 |
