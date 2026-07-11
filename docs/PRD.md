@@ -426,7 +426,7 @@ M1 期内的交付工序（前端/mock 先行、契约骨架、阶段门禁）�
 |---|---|---|
 | `docs/specs/m1-auth.md` | 管理员自举、登录、会话、API Token、CLI 鉴权、用户管理（M1-FR-001~006） | 已产出 |
 | `docs/specs/m1-repository-core.md` | 仓库可见性、ACL、仓库管理、hosted/proxy 通用能力、浏览、使用片段、健康检查（M1-FR-007~011、019~021） | 已产出 |
-| `docs/specs/m1-raw.md` | Raw hosted 与 Raw proxy 协议行为（M1-FR-013~014） | 待产出 |
+| `docs/specs/m1-raw.md` | Raw hosted 与 Raw proxy 协议行为（M1-FR-013~014） | 已产出 |
 | `docs/specs/m1-maven.md` | Maven hosted 与 Maven proxy 协议行为（M1-FR-015~016） | 待产出 |
 | `docs/specs/m1-npm.md` | npm hosted 与 npm proxy 协议行为（M1-FR-017~018） | 待产出 |
 | `docs/specs/m1-group.md` | 三格式 group 语义、成员顺序、ACL 过滤与零泄露（M1-FR-012、027 的目标语义） | 待产出 |
