@@ -8,6 +8,8 @@
 - 一个 SQLite 元数据库文件（元数据唯一真源）。
 - 一个本地文件系统 blob 数据目录（制品与代理缓存本体）。
 - TLS 由前置反向代理终止，服务本身不直接持有证书。
+- 配置加载顺序：代码默认值 → 工作目录 `config.toml`（可选）→ `JIANARTIFACT_` 前缀环境变量（最高优先）。当前字段：`bind`（监听地址，默认 `0.0.0.0:8080`）、`database-path`（SQLite 文件，默认 `data/jianartifact.db`）、`data-dir`（blob 目录，默认 `data/blobs`）、`log-level`（日志级别，默认 `info`）。
+- 辅助模式：`jianartifact openapi` 打印管理 API 的 OpenAPI 契约 JSON 后退出（不启动服务）。
 
 ## 2. 构建
 

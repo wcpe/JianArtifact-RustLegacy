@@ -1,0 +1,19 @@
+# 依赖许可证机器检查配置（cargo deny check licenses，纳入质量门）。
+# 只允许下列宽松许可证；出现清单外许可证即门禁失败，经评审后才可加入。
+
+[licenses]
+# 允许的许可证标识（SPDX）
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+# 许可证识别的最低置信度
+confidence-threshold = 0.8

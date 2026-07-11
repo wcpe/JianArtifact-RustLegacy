@@ -1,0 +1,10 @@
+# cargo-audit 配置：忽略项必须在此集中声明并注明原因（static-analysis 规则）。
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071（rsa crate，Marvin 时序侧信道，无修复版本）：
+    # rsa 仅出现在 Cargo.lock 中、由 sqlx-mysql 候选条目固定；本项目 sqlx 仅启用
+    # sqlite feature，`cargo tree -i rsa --target all -e all` 查无该包（不编译不链接），
+    # 不构成实际风险。若未来启用 mysql 或上游发布修复版本，删除本条重新评估。
+    "RUSTSEC-2023-0071",
+]

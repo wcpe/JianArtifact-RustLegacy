@@ -5,6 +5,7 @@
 ## 1. 契约真源
 
 - 管理 API 的端点、参数与数据模型定义，以后端代码经 utoipa 生成的 OpenAPI 文档为**唯一真源**（见 ADR-0012）；端点明细随实现落地由 OpenAPI 呈现。
+- OpenAPI 契约的两个获取途径：运行中服务的 `GET /api/v1/openapi.json`；或不启动服务执行 `jianartifact openapi` 将契约 JSON 打印到标准输出（供前端类型生成与 devmock 契约比对在构建期消费）。
 - 前端 TypeScript 类型由该 OpenAPI 自动生成；devmock 的契约测试自动与该 OpenAPI 比对，任何漂移即质量门禁失败（见 ADR-0010）。
 - 本文档只记录跨端点的通用约定；当出现新的跨端点约定（新的错误码域前缀、新的路径空间等）时同步更新本文档。
 
