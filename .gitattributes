@@ -8,8 +8,14 @@ Dockerfile* text eol=lf
 *.yaml text eol=lf
 *.toml text eol=lf
 *.rs text eol=lf
-# 由容器内 Linux 工具（cargo/pnpm/prettier）重写的文件钉 LF，避免换行符来回抖动
+# 由容器内 Linux 工具（cargo/pnpm/prettier）重写的文件钉 LF，避免换行符来回抖动；
+# 前端源码若检出为 CRLF，容器内 prettier --check（endOfLine=lf）会误判失败
 *.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
 Cargo.lock text eol=lf
 pnpm-lock.yaml text eol=lf
 *.ps1 text eol=crlf
