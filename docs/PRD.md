@@ -434,7 +434,7 @@ M1 期内的交付工序（前端/mock 先行、契约骨架、阶段门禁）�
 | `docs/specs/m1-nexus-offline-package.md` | 离线迁移包格式、导出流程、一致性快照与校验（M1-FR-041 与 FR-023 的包格式部分） | 待产出 |
 | `docs/specs/m1-nfr.md` | 钉死大文件、缓冲、内存、并发、磁盘和规模验收数值（NFR-01~16，权威真源；本文 §5.5 为摘要） | 已产出 |
 | `docs/specs/m1-build-deploy.md` | Makefile 统一入口、Docker 内 Linux 发布构建、SSH+systemd 部署与凭据处理（M1-FR-042~043） | 已产出 |
-| `docs/specs/m1-frontend-foundation.md` | 前端四子工程脚手架、共享严格检查配置与质量门接线，及 devmock 场景包与 wiki 验收站（M1-FR-035、036、044） | 待产出 |
+| `docs/specs/m1-frontend-foundation.md` | 前端四子工程脚手架、共享严格检查配置与质量门接线，及 devmock 场景包与 wiki 验收站（M1-FR-035、036、044） | 已产出 |
 
 ## 11. 术语表
 
