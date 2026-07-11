@@ -6,16 +6,19 @@ set -euo pipefail
 # 切到仓库根目录（脚本所在目录的上一级），保证相对路径稳定
 cd "$(dirname "$0")/.."
 
-echo "==> [1/4] Rust 格式检查"
+echo "==> [1/5] Rust 格式检查"
 cargo fmt --all -- --check
 
-echo "==> [2/4] Rust 静态分析（警告视为错误）"
+echo "==> [2/5] Rust 静态分析（警告视为错误）"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-echo "==> [3/4] Rust 测试"
+echo "==> [3/5] Rust 测试"
 cargo test --workspace
 
-echo "==> [4/4] 前端质量门"
+echo "==> [4/5] 部署脚本逻辑测试"
+bash scripts/deploy/test-remote-install.sh
+
+echo "==> [5/5] 前端质量门"
 # 前端子工程清单（apps/server 是 Rust crate，不参与前端门禁判定）
 frontend_src=""
 for dir in apps/web apps/ui apps/wiki apps/devmock apps/eslint-config apps/typescript-config; do

@@ -30,9 +30,10 @@ Thumbs.db
 # 过程性文档与临时文件（不入库）
 /.tmp/
 
-# 环境与密钥（不入库）
+# 环境与密钥（不入库）；.env.example 是无真实值的模板，必须入库
 .env
 .env.*
+!.env.example
 
 # 本地数据：SQLite 元数据库与 blob 数据目录
 *.db

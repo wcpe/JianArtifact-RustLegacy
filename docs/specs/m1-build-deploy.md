@@ -1,6 +1,6 @@
 # 功能规格：Makefile 构建入口与 SSH+systemd 部署（M1-FR-042 / 043）
 
-> 状态：开发中（FR-042 已实现并过验收，待发版标已交付；FR-043 草拟）　·　关联 PRD：M1-FR-042、M1-FR-043　·　分支：main 直接提交（042 与 043 分别独立提交）
+> 状态：开发中（FR-042 已实现并过验收；FR-043 已实现并过逻辑测试，真机验收与探活补验待完成）　·　关联 PRD：M1-FR-042、M1-FR-043　·　分支：main 直接提交（042 与 043 分别独立提交）
 
 ## 1. 背景与目标
 
@@ -53,8 +53,8 @@
 
 - [x] FR-042：Makefile（help/check/release/clean）+ `scripts/build-release.sh` + unit 模板 + 版本一致性校验 + `.gitattributes` 补 Makefile 行
 - [x] FR-042 验收：容器内产出 tar 与 sha256，ELF 头校验（readelf）证明 x86_64，宿主零构建产物（空挂载点豁免），VERSION 不一致红测试通过（2026-07-12）
-- [ ] FR-043：`scripts/deploy.sh`（含 releases/current 布局、自动回滚、保留清理）+ `make rollback` + `.env.example` + Makefile `deploy` 目标（依赖 `release`）
-- [ ] FR-043 验收：真机以**非 root 用户全程**部署 Linux 主机，幂等重跑，自动/手动回滚，失败路径逐项验证；探活项后置（见 §5）
+- [x] FR-043：`scripts/deploy.sh` + `scripts/deploy/remote-install.sh`（releases/current 布局、自动回滚、保留清理）+ `make deploy`/`rollback` + `.env.example`；逻辑测试 `scripts/deploy/test-remote-install.sh` 纳入质量门（8 项断言，2026-07-12）
+- [ ] FR-043 真机验收：以**非 root 用户全程**部署 Linux 主机，幂等重跑，自动/手动回滚，失败路径逐项验证（需用户提供目标机并确认；前置依赖=服务可常驻运行，最早随 M1-FR-021 就绪自检落地，与探活补验同批执行，见 §5——空壳二进制启动即退出会被健康确认判失败，属预期）
 - [ ] 文档同步：PRD FR-042/043 状态流转、`docs/OPERATIONS.md` 构建与部署章节改为 Makefile 入口、CHANGELOG 未发布段各 +1 行
 
 ## 5. 验收标准

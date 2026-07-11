@@ -169,7 +169,7 @@ JianArtifact 是一个以**低运维成本**为目标的自托管制品仓库，
 | M1-FR-040 | 迁移提交与控制边界 | 暂停/取消只在单对象原子提交边界生效；取消清理未提交临时文件但不删除已成功且被引用的数据；重试只处理失败、中断或变化对象 | 计划 |
 | M1-FR-041 | 离线迁移包导出 | 在源端停写/只读窗口，或经首轮导出加最终增量核对，生成同一一致性快照的 Nexus 3.70.x 迁移包；清单含格式版本、源实例标识、快照时间和整体摘要，失败不得产出可误用的完整包 | 计划 |
 | M1-FR-042 | Makefile 统一构建入口与 Linux 发布构建 | `make check` 调用与 CI 相同的 Docker 质量门脚本；`make release` 在 Docker 容器内产出 x86_64 Linux 的 release 二进制与发布 tar 包（含 systemd unit 模板与 sha256 校验和），产物落宿主专用输出目录；全程宿主不运行 cargo/pnpm、宿主目录零 target/node_modules；前端落地后强制「先前端 dist 后后端」构建顺序；产物经 ELF 头校验为 x86_64 二进制 | 开发中 |
-| M1-FR-043 | SSH + systemd 部署脚本（rootless + 可回滚） | `make deploy` 读取不入库的 env 配置（提供无真实值的示例模板），自动依赖 release 产物防止复用陈旧包；采用用户级 systemd，日常部署/升级/回滚全程无需 root；发布落 releases 目录并以 current 符号链接原子切换，保留可配置份数；健康确认失败自动回滚到上一发布，另提供 `make rollback` 手动回滚；失败非零退出并给中文错误；重复执行幂等；凭据不进日志不进仓库；真机验收为非 root 用户部署到 Linux 主机后健康检查通过且回滚可用 | 计划 |
+| M1-FR-043 | SSH + systemd 部署脚本（rootless + 可回滚） | `make deploy` 读取不入库的 env 配置（提供无真实值的示例模板），自动依赖 release 产物防止复用陈旧包；采用用户级 systemd，日常部署/升级/回滚全程无需 root；发布落 releases 目录并以 current 符号链接原子切换，保留可配置份数；健康确认失败自动回滚到上一发布，另提供 `make rollback` 手动回滚；失败非零退出并给中文错误；重复执行幂等；凭据不进日志不进仓库；真机验收为非 root 用户部署到 Linux 主机后健康检查通过且回滚可用 | 开发中 |
 | M1-FR-044 | 前端工程基座与严格静态检查接线 | 四个前端子工程（web/ui/wiki/devmock）脚手架落地；`apps/eslint-config` 与 `apps/typescript-config` 为真实共享配置（ESLint `--max-warnings 0`、TS `strict`+`noUncheckedIndexedAccess`+`isolatedModules`、Prettier 只检不改）；四工程各自独立 typecheck/lint/test/build 全绿并纳入 Docker 质量门；故意引入违规样例能使门禁失败（红→绿证据） | 计划 |
 
 > 状态取值：计划 / 开发中 / 已交付@vX.Y.Z。

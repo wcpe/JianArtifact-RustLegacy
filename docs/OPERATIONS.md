@@ -1,6 +1,6 @@
 # 运维手册：JianArtifact
 
-> 运行形态、构建、质量门、数据目录与日志约定。业务实现尚未开始，部署 / 升级 / 回滚的细化步骤随首个可运行版本补充；运维方式变化时更新本文件。
+> 运行形态、构建、质量门、部署与回滚、数据目录与日志约定。业务实现尚未开始；运维方式变化时更新本文件。
 
 ## 1. 运行形态
 
@@ -21,7 +21,15 @@
 
 唯一入口：`make check`（等价于 `scripts/check.sh`，Windows 亦可用 `scripts/check.ps1`）。三者均经 `docker compose run --rm dev bash scripts/quality-gate.sh` 在容器内依次执行 Rust 格式检查、clippy 静态分析、测试，以及前端 typecheck / lint / test / build（前端子工程尚未落地、仓库无 `pnpm-lock.yaml` 时自动跳过前端段）。CI 使用同一脚本，各端行为一致。
 
-## 4. 数据目录与备份
+## 4. 部署与回滚（rootless）
+
+- 入口：`make deploy`（自动依赖 `make release`，防复用陈旧包）与 `make rollback`；配置来自项目根 `.env`（模板 `.env.example`，`.env` 不入库）。
+- 目标机要求：Linux + systemd + GNU coreutils，部署用户**无需 root/sudo**；一次性前置为管理员执行 `loginctl enable-linger <部署用户>`（否则服务随登出停止，脚本会中文警告）。
+- 目标机布局：`~/jianartifact/releases/<版本>-<时间戳>/` 存放各发布，`current` 符号链接指向活动发布并被用户级 unit 的 `ExecStart` 引用；保留份数由 `DEPLOY_KEEP_RELEASES` 控制（默认 3，活动发布与其上一版永不清理）。
+- 健康确认与自动回滚：部署/回滚后服务必须进入 `active`，配置 `DEPLOY_HEALTH_URL`（指向 `/readyz` 就绪自检）后再按状态码探活；健康确认失败自动切回上一发布并非零退出。
+- 逻辑测试：`scripts/deploy/test-remote-install.sh` 已纳入质量门，用桩 systemd 覆盖切换、回滚、保留清理与校验失败路径。
+
+## 5. 数据目录与备份
 
 | 备份对象 | 说明 |
 |---|---|
@@ -30,7 +38,7 @@
 
 只备份其一会造成索引与内容漂移，恢复后出现悬空索引或孤儿 blob。具体目录路径由部署配置决定，默认布局随实现落地后在此登记。
 
-## 5. 日志约定
+## 6. 日志约定
 
 - 全部日志使用中文。
 - 严格分级：ERROR / WARN / INFO / DEBUG，不得混用。

@@ -39,6 +39,8 @@ JianArtifact/
 ```bash
 make check     # 质量门：格式、静态分析、测试（与 CI 同脚本）
 make release   # 发布构建：产出 Linux x86_64 tar 包到 dist/
+make deploy    # 部署到 .env 配置的 Linux 主机（rootless 用户级 systemd）
+make rollback  # 目标机回滚到上一发布
 make clean     # 清空发布输出目录
 ```
 
