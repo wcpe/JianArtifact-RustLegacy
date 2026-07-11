@@ -1,0 +1,4 @@
+/* 管理端样式入口：引入共享主题（含 Tailwind v4 入口与 shadcn 主题变量） */
+@import '@jianartifact/ui/globals.css';
+/* Tailwind 默认不扫描依赖包源码，这里显式声明扫描 ui 源码里的工具类 */
+@source "../../ui/src";

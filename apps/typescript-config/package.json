@@ -1,5 +1,9 @@
 {
   "name": "@jianartifact/typescript-config",
   "version": "0.1.0",
-  "private": true
+  "private": true,
+  "files": [
+    "base.json",
+    "vite-react.json"
+  ]
 }

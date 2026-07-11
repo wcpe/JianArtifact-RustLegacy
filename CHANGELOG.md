@@ -10,5 +10,6 @@
 - 建立工程骨架：Cargo / pnpm / Turborepo 工作区、Docker 化统一质量门与 CI 工作流。
 - Makefile 统一构建入口（check / release / clean）与容器内 Linux 发布构建：产出 x86_64 tar 发布包（含二进制、用户级 systemd unit 模板、VERSION 与 sha256 校验和），构建前强制校验 VERSION 与 Cargo 版本一致。
 - rootless 部署与回滚（make deploy / rollback）：SSH 上传经 sha256 校验后落 releases 目录并以 current 符号链接原子切换，用户级 systemd 全程无 root；健康确认失败自动回滚上一发布，保留份数可配置；部署逻辑测试（桩 systemd）纳入质量门。
+- 前端工程基座（React 19 + Tailwind 4 + Vite 7）：web / ui / wiki / devmock 四工程脚手架与共享严格配置（TS strict + noUncheckedIndexedAccess、ESLint 9 严格集 --max-warnings 0、Prettier 只检不改）接入 Docker 质量门；ui 经 shadcn CLI 收录 Button 组件源码，wiki 提供组件预览矩阵，devmock 建立 MSW 双端骨架。
 
 > 发版时把"未发布版本"段切成 `## [X.Y.Z] - YYYY-MM-DD`，再新建空的"未发布版本"段。

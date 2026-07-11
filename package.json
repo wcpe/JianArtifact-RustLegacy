@@ -7,9 +7,12 @@
     "typecheck": "turbo run typecheck",
     "lint": "turbo run lint",
     "test": "turbo run test",
-    "build": "turbo run build"
+    "build": "turbo run build",
+    "format:check": "prettier --check \"apps/**/*.{ts,tsx,js,css,html,json}\"",
+    "format": "prettier --write \"apps/**/*.{ts,tsx,js,css,html,json}\""
   },
   "devDependencies": {
+    "prettier": "^3.0.0",
     "turbo": "^2.5.0"
   }
 }

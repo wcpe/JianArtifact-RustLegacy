@@ -1,0 +1,4 @@
+{
+  "extends": "@jianartifact/typescript-config/vite-react.json",
+  "include": ["src"]
+}

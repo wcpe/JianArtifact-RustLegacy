@@ -28,6 +28,7 @@ for dir in apps/web apps/ui apps/wiki apps/devmock apps/eslint-config apps/types
 done
 if [ -f pnpm-lock.yaml ]; then
     pnpm install --frozen-lockfile
+    pnpm run format:check
     pnpm turbo typecheck lint test build
 elif [ -n "$frontend_src" ]; then
     # 防静默漏检：已有前端源码却缺锁文件时必须失败，不得绿灯放行

@@ -19,7 +19,7 @@
 
 ## 3. 测试与质量门
 
-唯一入口：`make check`（等价于 `scripts/check.sh`，Windows 亦可用 `scripts/check.ps1`）。三者均经 `docker compose run --rm dev bash scripts/quality-gate.sh` 在容器内依次执行 Rust 格式检查、clippy 静态分析、测试，以及前端 typecheck / lint / test / build（前端子工程尚未落地、仓库无 `pnpm-lock.yaml` 时自动跳过前端段）。CI 使用同一脚本，各端行为一致。
+唯一入口：`make check`（等价于 `scripts/check.sh`，Windows 亦可用 `scripts/check.ps1`）。三者均经 `docker compose run --rm dev bash scripts/quality-gate.sh` 在容器内依次执行：Rust 格式检查、clippy 静态分析、Rust 测试、部署脚本逻辑测试、Prettier 格式检查（只检不改）与前端四工程 typecheck / lint / test / build（Turborepo 编排与缓存）。CI 使用同一脚本，各端行为一致。
 
 ## 4. 部署与回滚（rootless）
 
