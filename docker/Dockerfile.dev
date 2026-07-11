@@ -1,0 +1,21 @@
+# JianArtifact 统一开发与质量门镜像
+# 单一镜像同时提供 Rust 与前端工具链，保证本地与 CI 使用完全相同的环境。
+# 硬约束：宿主机不得直接运行 cargo/pnpm/npm，一切构建、测试、检查均在本镜像容器内执行。
+FROM rust:1.96.1-bookworm
+
+# Rust 门禁组件：格式检查（rustfmt）与静态分析（clippy）
+RUN rustup component add rustfmt clippy
+
+# 依赖安全审计工具
+RUN cargo install cargo-audit --locked
+
+# Node.js 22：前端构建与测试运行时
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# 通过 corepack 固定 pnpm 9（与根 package.json 的 packageManager 字段一致）
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+
+# 统一工作目录：docker-compose 将项目根挂载到此处
+WORKDIR /workspace

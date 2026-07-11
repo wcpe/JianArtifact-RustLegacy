@@ -1,0 +1,15 @@
+# JianArtifact 后端服务 crate
+# 暂不引入任何业务依赖：依赖随 docs/specs 各规格实现按 SDD 流程逐个引入
+
+[package]
+name = "jianartifact-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jianartifact"
+path = "src/main.rs"
+
+[lints]
+workspace = true

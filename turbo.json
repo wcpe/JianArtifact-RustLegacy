@@ -1,0 +1,16 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    // 构建任务：先构建被依赖的上游子工程，产物输出到 dist/
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**"]
+    },
+    // 类型检查：各子工程独立执行，无产物输出
+    "typecheck": {},
+    // 代码检查：各子工程独立执行（落地时必须 --max-warnings 0）
+    "lint": {},
+    // 测试：各子工程独立执行
+    "test": {}
+  }
+}

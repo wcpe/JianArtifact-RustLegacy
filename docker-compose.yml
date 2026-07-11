@@ -1,0 +1,47 @@
+# JianArtifact 容器化开发与质量门编排
+# 硬约束（需求 §8.5）：构建、测试、lint、typecheck 统一在容器内执行；
+# Rust target、node_modules、包管理器缓存全部落入命名卷，宿主项目目录零构建产物。
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dev
+    working_dir: /workspace
+    environment:
+      # pnpm 内容寻址存储固定到命名卷路径，避免写入宿主目录
+      npm_config_store_dir: /workspace/.pnpm-store
+    volumes:
+      # 项目源代码（唯一挂载宿主目录的卷）
+      - .:/workspace
+      # Rust 构建产物（workspace 统一 target 目录）
+      - cargo-target:/workspace/target
+      # 根与各前端子工程的 node_modules
+      - node-modules-root:/workspace/node_modules
+      - node-modules-web:/workspace/apps/web/node_modules
+      - node-modules-ui:/workspace/apps/ui/node_modules
+      - node-modules-wiki:/workspace/apps/wiki/node_modules
+      - node-modules-devmock:/workspace/apps/devmock/node_modules
+      - node-modules-eslint-config:/workspace/apps/eslint-config/node_modules
+      - node-modules-typescript-config:/workspace/apps/typescript-config/node_modules
+      # cargo registry 缓存（rust 官方镜像 CARGO_HOME=/usr/local/cargo）
+      - cargo-registry:/usr/local/cargo/registry
+      # pnpm 内容寻址存储
+      - pnpm-store:/workspace/.pnpm-store
+      # Turborepo 任务缓存
+      - turbo-cache:/workspace/.turbo
+
+# 命名卷：全部构建产物与缓存的唯一落点。
+# 已知行为：绑定挂载内嵌套命名卷时，Docker 会在宿主项目目录创建对应的空挂载点目录
+# （target/、node_modules/ 等，内容为空且已被 .gitignore 忽略），属可接受的残留。
+volumes:
+  cargo-target:
+  node-modules-root:
+  node-modules-web:
+  node-modules-ui:
+  node-modules-wiki:
+  node-modules-devmock:
+  node-modules-eslint-config:
+  node-modules-typescript-config:
+  cargo-registry:
+  pnpm-store:
+  turbo-cache:

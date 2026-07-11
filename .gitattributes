@@ -1,0 +1,13 @@
+# 换行符策略：容器内执行的脚本必须为 LF，避免 Windows 宿主检出 CRLF 后在 Linux 容器中执行失败
+* text=auto
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+# 由容器内 Linux 工具（cargo/pnpm/prettier）重写的文件钉 LF，避免换行符来回抖动
+*.json text eol=lf
+Cargo.lock text eol=lf
+pnpm-lock.yaml text eol=lf
+*.ps1 text eol=crlf

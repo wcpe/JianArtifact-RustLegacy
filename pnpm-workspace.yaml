@@ -1,0 +1,9 @@
+# pnpm 工作区：全部前端子工程统一位于 apps/ 下
+# 工程组织硬约束：禁止新增 packages/*、services/* 等第二套子工程根目录
+packages:
+  - apps/web
+  - apps/ui
+  - apps/wiki
+  - apps/devmock
+  - apps/eslint-config
+  - apps/typescript-config

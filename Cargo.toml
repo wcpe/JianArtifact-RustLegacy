@@ -1,0 +1,23 @@
+# JianArtifact 工作区根配置
+# 工程组织硬约束：所有可构建的 Rust crate 必须是 apps/* 工作区成员
+
+[workspace]
+resolver = "3"
+members = ["apps/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+# 门禁语义：生产代码全面禁止 unsafe，违反即编译失败，无白名单
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# 门禁语义：可恢复错误必须显式处理 Result/Option，
+# 禁止用 unwrap/expect/panic 兜底把可恢复错误变成进程崩溃；
+# 测试等确有必要的场景须逐处 allow 并接受评审，不得整文件放开。
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

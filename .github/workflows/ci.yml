@@ -1,0 +1,20 @@
+# JianArtifact 持续集成
+# 硬约束：CI 与本地使用同一组脚本（scripts/quality-gate.sh），
+# 避免“本地通过、CI 用不同命令失败”的漂移。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality-gate:
+    name: 质量门
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行统一质量门（与本地同一组脚本）
+        run: docker compose run --rm dev bash scripts/quality-gate.sh
