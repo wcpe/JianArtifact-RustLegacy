@@ -27,7 +27,7 @@
   - 一次性前置条件（写入 `docs/OPERATIONS.md` 与 `.env.example` 注释）：目标机需 `loginctl enable-linger <部署用户>`（多数发行版需管理员执行一次，否则服务随登出停止）；deploy 脚本检测 linger 未开启时给出中文警告但不阻断。
 - `make deploy` 调用宿主侧 `scripts/deploy.sh`（bash，经宿主 OpenSSH 客户端执行 ssh/scp；构建部分仍在 Docker 内）。
 - 配置全部来自项目根 `.env`（已被 `.gitignore` 排除），提供 `.env.example` 模板（每个变量中文注释、无真实值）：
-  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `~/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；未配置时探活降级，见下）、`DEPLOY_KEEP_RELEASES`（保留的发布份数，默认 3）。
+  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `~/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；应指向服务的就绪自检接口 `/readyz`（M1-FR-021），探活仅依据 HTTP 状态码、200 为健康；未配置时探活降级，见下）、`DEPLOY_KEEP_RELEASES`（保留的发布份数，默认 3）。
 - **发布目录布局（支撑回滚）**：`DEPLOY_DIR/releases/<版本>-<打包时间戳>/` 存放各版发布内容，`DEPLOY_DIR/current` 为指向活动发布的符号链接；unit 的 `ExecStart` 走 `current` 路径。切换 = 符号链接原子替换（临时链接 + `mv -T`），超出保留份数的最旧发布自动清理（活动发布与其上一版永不清理）。
 - 部署流程（幂等，重复执行安全）：
   1. 目标依赖链保证先完成 `release`（防复用陈旧包——上一代踩过的坑）；
@@ -78,7 +78,7 @@
   - 保留清理：连续部署超过 `DEPLOY_KEEP_RELEASES` 份后，最旧发布被清理，活动发布与其上一版仍在。
 - 失败路径：错误主机/端口（SSH 不通）、篡改 tar（sha256 不匹配）→ 均非零退出、中文错误，`current` 与运行中服务不受影响。
 - 输出与日志全程不出现口令/密钥内容；linger 未开启时输出中文警告。
-- **探活后置项**：`/healthz`（M1-FR-021）落地后配置 `DEPLOY_HEALTH_URL` 补验「探活失败自动回滚」与「部署后健康检查通过」（此前健康确认降级为服务 active 状态检查），FR-043 在补验完成前不得标记完成验收（对应 ROADMAP 阶段 0 注记）。
+- **探活后置项**：就绪自检接口 `/readyz`（M1-FR-021）落地后配置 `DEPLOY_HEALTH_URL` 补验「探活失败自动回滚」与「部署后就绪自检通过」（此前健康确认降级为服务 active 状态检查），FR-043 在补验完成前不得标记完成验收（对应 ROADMAP 阶段 0 注记）。
 
 ## 6. 风险 / 待定
 
@@ -87,4 +87,4 @@
 - unit 模板中的数据目录、配置文件路径依赖 config 域设计（阶段 3），当前模板仅含运行所需最小字段；config 落地后同步更新模板并在 CHANGELOG 记录。
 - 默认部署目录 `~/jianartifact`、服务名 `jianartifact`、保留 3 份发布为本规格选定的约定（均可经 `.env` 覆盖）；如需调整在开发前提出。
 - rootless 的边界：`loginctl enable-linger` 多数发行版需管理员一次性执行；若目标机连 linger 都无法开启，服务仅在部署用户登录会话期间运行——该局限写入 OPERATIONS，属系统限制而非本项目缺陷。
-- 健康探活落地（M1-FR-021）之前，自动回滚的触发只有「服务未进入 active」一种信号，无法识别"进程活着但行为坏了"的坏版本；补验时机见 §5。
+- 就绪自检接口（M1-FR-021 `/readyz`，探测元数据库可读写与 blob 目录可写）落地之前，自动回滚的触发只有「服务未进入 active」一种信号，无法识别"进程活着但行为坏了"的坏版本；`/readyz` 落地并配置 `DEPLOY_HEALTH_URL` 后，此类坏版本也会触发自动回滚，补验时机见 §5。
