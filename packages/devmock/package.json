@@ -7,7 +7,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
-    "build": "msw init public && vite build"
+    "build": "rm -rf public && msw init public && vite build"
   },
   "dependencies": {
     "msw": "^2.0.0"
