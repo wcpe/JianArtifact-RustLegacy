@@ -13,14 +13,13 @@
 
 全部构建在 Docker 容器内执行，宿主机禁止直接运行 cargo / pnpm。
 
-构建顺序硬约束：必须先产出前端 dist，再构建后端二进制（rust-embed 在编译期打包前端静态产物，顺序颠倒会得到缺失前端的二进制或构建失败）：
+发布构建入口：`make release`（执行 `scripts/build-release.sh` 于容器内）。流程：VERSION 与 Cargo workspace 版本一致性校验 → 前端构建（子工程未落地时跳过）→ `cargo build --release` → ELF x86_64 产物校验 → 打包 `dist/jianartifact-<版本>-x86_64-unknown-linux-gnu.tar.gz`（内含二进制、用户级 systemd unit 模板与 VERSION）及 `.sha256` 伴随文件。`make clean` 清空 `dist/`。
 
-1. 容器内执行 `pnpm install --frozen-lockfile` 与 `pnpm turbo build`，产出各前端子工程 dist。
-2. 容器内执行 `cargo build --release`，产出内嵌前端的单二进制。
+构建顺序硬约束：必须先产出前端 dist，再构建后端二进制（rust-embed 在编译期打包前端静态产物，顺序颠倒会得到缺失前端的二进制或构建失败）；该顺序已由 `scripts/build-release.sh` 固化。
 
 ## 3. 测试与质量门
 
-唯一入口：`scripts/check.sh`（Windows 用 `scripts/check.ps1`）。该入口经 `docker compose run --rm dev bash scripts/quality-gate.sh` 在容器内依次执行 Rust 格式检查、clippy 静态分析、测试，以及前端 typecheck / lint / test / build（前端子工程尚未落地、仓库无 `pnpm-lock.yaml` 时自动跳过前端段）。CI 使用同一脚本，两端行为一致。
+唯一入口：`make check`（等价于 `scripts/check.sh`，Windows 亦可用 `scripts/check.ps1`）。三者均经 `docker compose run --rm dev bash scripts/quality-gate.sh` 在容器内依次执行 Rust 格式检查、clippy 静态分析、测试，以及前端 typecheck / lint / test / build（前端子工程尚未落地、仓库无 `pnpm-lock.yaml` 时自动跳过前端段）。CI 使用同一脚本，各端行为一致。
 
 ## 4. 数据目录与备份
 

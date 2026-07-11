@@ -1,6 +1,6 @@
 # 功能规格：Makefile 构建入口与 SSH+systemd 部署（M1-FR-042 / 043）
 
-> 状态：草拟　·　关联 PRD：M1-FR-042、M1-FR-043　·　分支：feature/build-deploy（042 与 043 分别独立提交）
+> 状态：开发中（FR-042 已实现并过验收，待发版标已交付；FR-043 草拟）　·　关联 PRD：M1-FR-042、M1-FR-043　·　分支：main 直接提交（042 与 043 分别独立提交）
 
 ## 1. 背景与目标
 
@@ -51,8 +51,8 @@
 
 ## 4. 任务拆分
 
-- [ ] FR-042：Makefile（help/check/release/clean）+ `scripts/build-release.sh` + unit 模板 + 版本一致性校验 + `.gitattributes` 补 Makefile 行
-- [ ] FR-042 验收：容器内产出 tar 与 sha256，`file` 验证 ELF x86_64，宿主零构建产物（空挂载点豁免）
+- [x] FR-042：Makefile（help/check/release/clean）+ `scripts/build-release.sh` + unit 模板 + 版本一致性校验 + `.gitattributes` 补 Makefile 行
+- [x] FR-042 验收：容器内产出 tar 与 sha256，ELF 头校验（readelf）证明 x86_64，宿主零构建产物（空挂载点豁免），VERSION 不一致红测试通过（2026-07-12）
 - [ ] FR-043：`scripts/deploy.sh`（含 releases/current 布局、自动回滚、保留清理）+ `make rollback` + `.env.example` + Makefile `deploy` 目标（依赖 `release`）
 - [ ] FR-043 验收：真机以**非 root 用户全程**部署 Linux 主机，幂等重跑，自动/手动回滚，失败路径逐项验证；探活项后置（见 §5）
 - [ ] 文档同步：PRD FR-042/043 状态流转、`docs/OPERATIONS.md` 构建与部署章节改为 Makefile 入口、CHANGELOG 未发布段各 +1 行
@@ -62,7 +62,7 @@
 **FR-042**
 
 - `make check` 与 `scripts/check.sh`、CI 执行同一 `quality-gate.sh`，三端行为一致（对比执行日志）。
-- `make release` 后：`dist/` 存在 tar 与 `.sha256`；解包含 `bin/jianartifact`、`systemd/jianartifact.service`、`VERSION`；容器内 `file` 输出证明二进制为 ELF 64-bit x86-64（实机证据，需用户确认）。
+- `make release` 后：`dist/` 存在 tar 与 `.sha256`；解包含 `bin/jianartifact`、`systemd/jianartifact.service`、`VERSION`；容器内 ELF 头校验（readelf，构建脚本内置断言 + 人工复核输出）证明二进制为 ELF64 x86-64（实机证据，需用户确认）。
 - 全程宿主无 cargo/pnpm 进程；宿主目录除命名卷空挂载点与 `dist/` 产物外零新增（对照 ROADMAP 阶段 0 门禁口径）。
 - 把 `VERSION` 临时改为不一致值，`make release` 立即失败并给中文错误（红→绿证据）。
 - `make clean` 清空 `dist/` 且不触碰其他目录。

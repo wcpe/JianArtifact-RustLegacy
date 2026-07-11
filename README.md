@@ -34,17 +34,15 @@ JianArtifact/
 
 ## 开发方式
 
-唯一合法的本地质量门入口（经 Docker 执行）：
+统一入口为根 `Makefile`（每个目标都是 Docker 的薄封装）：
 
 ```bash
-# Linux / macOS
-./scripts/check.sh
+make check     # 质量门：格式、静态分析、测试（与 CI 同脚本）
+make release   # 发布构建：产出 Linux x86_64 tar 包到 dist/
+make clean     # 清空发布输出目录
 ```
 
-```powershell
-# Windows
-./scripts/check.ps1
-```
+无 make 时质量门也可直接用 `./scripts/check.sh`（Windows：`./scripts/check.ps1`），与 `make check` 完全同源。
 
 硬约束：
 

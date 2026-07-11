@@ -1,0 +1,15 @@
+# JianArtifact 用户级 systemd unit 模板（随发布包分发，由部署脚本安装到用户 systemd 目录）
+# 部署目录非默认值（~/jianartifact）时，部署脚本负责改写 ExecStart 中的路径。
+
+[Unit]
+Description=JianArtifact 制品仓库服务
+
+[Service]
+Type=simple
+# %h 为用户家目录；current 是部署脚本维护的、指向活动发布的符号链接
+ExecStart=%h/jianartifact/current/bin/jianartifact
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
