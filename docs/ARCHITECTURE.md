@@ -134,9 +134,15 @@ pnpm workspace + Turborepo 统一编排，**`apps/*` 是唯一的可构建子工
 
 以**稳定源标识 + 目标路径 + 内容校验**构成幂等键。重跑只处理未完成、失败或变化的对象；已一致对象精确计为跳过，不产生重复索引或孤儿 blob。
 
-### 6.5 在线迁移两阶段一致性
+### 6.5 迁移来源与一致性
 
-在线迁移采用「**首轮固化快照 → 源端停写窗口 → 最终增量扫描**」：首轮清单固化源快照时间并搬运主体数据；随后源端进入停写/只读窗口，执行最终增量扫描；只有最终清单零未处理漂移（新增/修改/删除）时才能标记全量成功。默认不自动传播源端删除，删除项显式列入切换报告由管理员决定。
+迁移来源分三类（ADR-0015 调整了默认与构成）：
+
+- **离线直读 Nexus 原生数据目录（首选）**：数百 GB 的 blob 大头从磁盘上的 Nexus 文件型 blob store（`.bytes` + `.properties`）直接读取与归属，不逐个 HTTP 拉；少量仓库配置（proxy 上游、group 成员）经 REST 一次性拉取（Nexus 可达时）或由管理员在向导手动补（Nexus 已下线时）。不直读 Nexus 内嵌配置库（H2/OrientDB 为 JVM 私有格式，纯 Rust 不可行）。原生数据目录一致性由「迁移前停 Nexus 或取文件系统快照后再拷/挂载」保证。
+- **在线 REST（备选）**：数据不在本机但 Nexus 可达时，走 REST + 格式端点 + blob 下载。采用「**首轮固化快照 → 源端停写窗口 → 最终增量扫描**」两阶段一致性：只有最终清单零未处理漂移（新增/修改/删除）时才能标记全量成功；默认不自动传播源端删除，删除项显式列入切换报告由管理员决定。
+- **自有离线迁移包（可选归档）**：可移植、带整体校验的自有格式（ADR-0008），用于异地交付/审计。
+
+裸 blob store（仅 blob、无 REST 也无手动配置）为降级路径：hosted 与已缓存内容从磁盘尽力恢复，proxy 上游/group 成员缺失的仓库标「配置待补充」，任务总状态不得全量成功。
 
 ### 6.6 迁移并发控制
 
@@ -162,14 +168,15 @@ pnpm workspace + Turborepo 统一编排，**`apps/*` 是唯一的可构建子工
 | `docs/adr/0004-authorization-model.md` | Admin/User 全局角色 + 仓库 read/write/admin ACL，授权判定为无 IO 纯函数 |
 | `docs/adr/0005-repository-types.md` | hosted/proxy/只读 group 三类仓库模型与聚合语义 |
 | `docs/adr/0006-protocol-adapter-boundary.md` | 协议适配层禁直连数据库，必须经领域服务与仓储接口 |
-| `docs/adr/0007-nexus-migration-strategy.md` | Nexus OSS 3.70.x 在线迁移策略与两阶段一致性 |
-| `docs/adr/0008-offline-migration-package.md` | 完整离线迁移包契约与裸 blob 尽力恢复降级 |
+| `docs/adr/0007-nexus-migration-strategy.md` | Nexus OSS 3.70.x 迁移策略、全量成功完成定义与两阶段一致性（入口/默认经 0015 调整） |
+| `docs/adr/0008-offline-migration-package.md` | 自有离线迁移包契约与裸 blob 尽力恢复降级（0015 后降为可选归档） |
 | `docs/adr/0009-migration-task-persistence.md` | 任务表 + 分仓明细表持久化，重启在途任务标已中断 |
 | `docs/adr/0010-quality-gates-and-docker.md` | 质量硬门禁与 Docker 容器化验证约束 |
 | `docs/adr/0011-ui-design-system.md` | shadcn/ui + Tailwind 设计系统，组件源码归 `apps/ui`，TanStack Table |
 | `docs/adr/0012-api-contract-source.md` | utoipa 生成 OpenAPI 为管理 API 契约唯一真源 |
 | `docs/adr/0013-single-binary-delivery.md` | rust-embed 编译期内嵌前端产物，单二进制交付 |
 | `docs/adr/0014-frontend-first-delivery.md` | M1 按域三步工序：契约骨架 → 前端 + devmock → 后端业务实现，契约真源仍为 ADR-0012 |
+| `docs/adr/0015-offline-native-datadir-primary.md` | 迁移首选离线直读 Nexus 原生数据目录（blob 磁盘直读 + 配置 REST/手动），在线 REST 降为备选 |
 
 ### 8.2 第一期非目标
 

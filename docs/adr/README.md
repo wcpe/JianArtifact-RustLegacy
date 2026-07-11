@@ -10,14 +10,15 @@
 | [0004](0004-authorization-model.md) | 授权模型 | 已接受 |
 | [0005](0005-repository-types.md) | 仓库类型模型（hosted/proxy/group） | 已接受 |
 | [0006](0006-protocol-adapter-boundary.md) | 格式协议适配层边界 | 已接受 |
-| [0007](0007-nexus-migration-strategy.md) | Nexus 迁移策略 | 已接受 |
-| [0008](0008-offline-migration-package.md) | 离线迁移包格式 | 已接受 |
+| [0007](0007-nexus-migration-strategy.md) | Nexus 迁移策略 | 已接受（入口与默认路径经 [0015](0015-offline-native-datadir-primary.md) 调整） |
+| [0008](0008-offline-migration-package.md) | 离线迁移包格式 | 已接受（由 [0015](0015-offline-native-datadir-primary.md) 降为可选归档形态） |
 | [0009](0009-migration-task-persistence.md) | 迁移任务持久化与状态机 | 已接受 |
 | [0010](0010-quality-gates-and-docker.md) | 质量门禁与 Docker 化验证 | 已接受 |
 | [0011](0011-ui-design-system.md) | UI 设计系统 | 已接受 |
 | [0012](0012-api-contract-source.md) | API 契约唯一真源 | 已接受 |
 | [0013](0013-single-binary-delivery.md) | 单二进制交付 | 已接受 |
 | [0014](0014-frontend-first-delivery.md) | 前端先行交付工序与契约骨架 | 已接受 |
+| [0015](0015-offline-native-datadir-primary.md) | 离线直读 Nexus 原生数据目录为首选全量迁移路径 | 已接受 |
 
 > 模板：[`_template.md`](_template.md)（状态 / 背景 / 决策 / 理由 / 后果 / 备选方案），新 ADR 从模板复制起稿、顺延编号。
 
