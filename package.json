@@ -8,8 +8,8 @@
     "lint": "turbo run lint",
     "test": "turbo run test",
     "build": "turbo run build",
-    "format:check": "prettier --check \"apps/**/*.{ts,tsx,js,css,html,json}\"",
-    "format": "prettier --write \"apps/**/*.{ts,tsx,js,css,html,json}\""
+    "format:check": "prettier --check \"{apps,packages}/**/*.{ts,tsx,js,css,html,json}\"",
+    "format": "prettier --write \"{apps,packages}/**/*.{ts,tsx,js,css,html,json}\""
   },
   "devDependencies": {
     "prettier": "^3.0.0",

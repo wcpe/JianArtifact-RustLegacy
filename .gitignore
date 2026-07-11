@@ -36,7 +36,7 @@ Thumbs.db
 !.env.example
 
 # MSW 浏览器 worker（构建期由 msw init 生成，第三方生成文件不入库）
-apps/devmock/public/
+packages/devmock/public/
 
 # 本地数据：SQLite 元数据库与 blob 数据目录
 *.db

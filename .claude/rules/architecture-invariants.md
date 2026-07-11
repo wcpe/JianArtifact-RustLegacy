@@ -5,10 +5,10 @@
 
 ## 1. 工作区与模块边界
 
-- `apps/*` 是唯一可构建子工程根：所有 Rust crate、React 应用、共享 UI、Mock、配置包和内部工具必须是 `apps/*` 工作区成员；禁止新增 `packages/*`、`services/*` 等第二套子工程根目录。
+- 工作区恰有两个可构建子工程根（ADR-0016）：`apps/`（可运行入口：server、web、wiki）与 `packages/`（共享库：ui、devmock、eslint-config、typescript-config）；禁止再新增 `services/`、`libs/` 等第三套子工程根目录。`packages/*` 禁止依赖 `apps/*`。
 - 后端模块依赖严格单向：`api` / `protocol`（入口层）→ `auth` / `repository` / `domain` / `migration`（领域服务层）→ `persistence` / `storage`（基础设施层）；`config` 仅被各层只读引用。模块、crate、前端包之间一律禁止循环依赖。
 - `protocol` 协议适配层严禁直接读写数据库（含直接使用 sqlx / SQL），必须经领域服务与仓储接口。
-- `apps/ui` 禁止依赖 `apps/web`；`ui` 只允许被 `web`、`wiki` 单向依赖。
+- `packages/ui` 禁止依赖 `apps/web`；`ui` 只允许被 `web`、`wiki` 单向依赖。
 - 前端禁止自行实现鉴权判定替代后端授权：所有权限拒绝以后端结果为准，前端隐藏入口只是体验优化，不是安全边界。
 
 ## 2. 简单优先（禁用重型件）
@@ -28,7 +28,7 @@
 ## 4. 技术栈锁定
 
 - 后端：Rust + axum 0.8 + tokio + sqlx（SQLite bundled）+ argon2 + JWT HS256（服务端撤销状态）+ reqwest（rustls）。
-- 前端：React + TypeScript strict + Vite + shadcn/ui + Tailwind（组件源码归 `apps/ui`）+ TanStack Table；pnpm workspace + Turborepo。
+- 前端：React + TypeScript strict + Vite + shadcn/ui + Tailwind（组件源码归 `packages/ui`）+ TanStack Table；pnpm workspace + Turborepo。
 - 交付形态：rust-embed 编译期内嵌前端产物，单二进制交付。
 - 换框架、换存储后端、换交付形态均为架构决策 → 先走新 ADR，不擅自更换。
 

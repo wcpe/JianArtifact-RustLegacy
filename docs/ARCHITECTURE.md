@@ -22,17 +22,17 @@ JianArtifact 是一个以低运维成本为目标的自托管制品仓库，统�
 
 ### 2.1 工作区结构
 
-pnpm workspace + Turborepo 统一编排，**`apps/*` 是唯一的可构建子工程根**；禁止新增 `packages/*`、`services/*` 等第二套子工程根目录。`docs/` 与 `scripts/` 只存正式文档和工程脚本，不属于可构建子工程。
+pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工程根**（ADR-0016）：`apps/`（可运行入口）与 `packages/`（共享库）；禁止再新增 `services/`、`libs/` 等第三套子工程根目录。`docs/` 与 `scripts/` 只存正式文档和工程脚本，不属于可构建子工程。
 
 | 子工程 | 职责 | 依赖方向 |
 |---|---|---|
 | `apps/server` | Rust 后端：管理 API、格式协议、存储、认证授权与迁移 | 不依赖任何前端子工程 |
 | `apps/web` | React + TypeScript 管理端产品应用，只消费管理 API | 依赖 `ui`、共享配置；开发开关下可连 `devmock` |
-| `apps/ui` | 共享设计系统与组件库（shadcn/ui + Tailwind，组件源码归本工程），四层：基础组件、复合组件、页面布局、业务模式 | **只允许被 `web`、`wiki` 单向依赖，禁止依赖 `web`** |
 | `apps/wiki` | UI 组件与业务模式独立预览站，覆盖正常/加载/空/错误/无权限等状态，是视觉回归与无障碍验收入口 | 依赖 `ui`、共享配置 |
-| `apps/devmock` | 浏览器与 Node 双端 Mock、场景包与契约模拟；**其契约必须与后端 OpenAPI 自动比对，防止漂移** | 依赖共享配置 |
-| `apps/eslint-config` | 前端共享 ESLint 严格配置 | 被其余前端子工程引用 |
-| `apps/typescript-config` | 前端共享 TypeScript 严格配置 | 被其余前端子工程引用 |
+| `packages/ui` | 共享设计系统与组件库（shadcn/ui + Tailwind，组件源码归本工程），四层：基础组件、复合组件、页面布局、业务模式 | **只允许被 `web`、`wiki` 单向依赖，禁止依赖 `apps/*`** |
+| `packages/devmock` | 浏览器与 Node 双端 Mock、场景包与契约模拟；**其契约必须与后端 OpenAPI 自动比对，防止漂移** | 依赖共享配置 |
+| `packages/eslint-config` | 前端共享 ESLint 严格配置 | 被前端子工程引用 |
+| `packages/typescript-config` | 前端共享 TypeScript 严格配置 | 被前端子工程引用 |
 
 ### 2.2 `apps/server` 内部分层
 
@@ -172,11 +172,12 @@ pnpm workspace + Turborepo 统一编排，**`apps/*` 是唯一的可构建子工
 | `docs/adr/0008-offline-migration-package.md` | 自有离线迁移包契约与裸 blob 尽力恢复降级（0015 后降为可选归档） |
 | `docs/adr/0009-migration-task-persistence.md` | 任务表 + 分仓明细表持久化，重启在途任务标已中断 |
 | `docs/adr/0010-quality-gates-and-docker.md` | 质量硬门禁与 Docker 容器化验证约束 |
-| `docs/adr/0011-ui-design-system.md` | shadcn/ui + Tailwind 设计系统，组件源码归 `apps/ui`，TanStack Table |
+| `docs/adr/0011-ui-design-system.md` | shadcn/ui + Tailwind 设计系统，组件源码归 `packages/ui`，TanStack Table |
 | `docs/adr/0012-api-contract-source.md` | utoipa 生成 OpenAPI 为管理 API 契约唯一真源 |
 | `docs/adr/0013-single-binary-delivery.md` | rust-embed 编译期内嵌前端产物，单二进制交付 |
 | `docs/adr/0014-frontend-first-delivery.md` | M1 按域三步工序：契约骨架 → 前端 + devmock → 后端业务实现，契约真源仍为 ADR-0012 |
 | `docs/adr/0015-offline-native-datadir-primary.md` | 迁移首选离线直读 Nexus 原生数据目录（blob 磁盘直读 + 配置 REST/手动），在线 REST 降为备选 |
+| `docs/adr/0016-apps-packages-two-roots.md` | 工作区改为 apps/（入口）+ packages/（共享库）双根，取代 ADR-0001 的单一 apps/ 根 |
 
 ### 8.2 第一期非目标
 

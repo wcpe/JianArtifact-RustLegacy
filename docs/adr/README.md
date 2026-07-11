@@ -4,7 +4,7 @@
 
 | 编号 | 决策 | 状态 |
 |---|---|---|
-| [0001](0001-tech-stack-and-workspace.md) | 技术栈选型与单一工作区布局 | 已接受 |
+| [0001](0001-tech-stack-and-workspace.md) | 技术栈选型与工作区布局 | 已接受（工作区根结构经 [0016](0016-apps-packages-two-roots.md) 取代） |
 | [0002](0002-sqlite-metadata-and-blob-storage.md) | SQLite 元数据唯一真源与文件系统 blob 存储 | 已接受 |
 | [0003](0003-authentication-and-session.md) | 认证与会话方案 | 已接受 |
 | [0004](0004-authorization-model.md) | 授权模型 | 已接受 |
@@ -19,6 +19,7 @@
 | [0013](0013-single-binary-delivery.md) | 单二进制交付 | 已接受 |
 | [0014](0014-frontend-first-delivery.md) | 前端先行交付工序与契约骨架 | 已接受 |
 | [0015](0015-offline-native-datadir-primary.md) | 离线直读 Nexus 原生数据目录为首选全量迁移路径 | 已接受 |
+| [0016](0016-apps-packages-two-roots.md) | 工作区采用 apps/ + packages/ 双根结构 | 已接受 |
 
 > 模板：[`_template.md`](_template.md)（状态 / 背景 / 决策 / 理由 / 后果 / 备选方案），新 ADR 从模板复制起稿、顺延编号。
 

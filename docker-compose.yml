@@ -15,14 +15,14 @@ services:
       - .:/workspace
       # Rust 构建产物（workspace 统一 target 目录）
       - cargo-target:/workspace/target
-      # 根与各前端子工程的 node_modules
+      # 根与各前端子工程的 node_modules（apps/ 入口 + packages/ 共享库）
       - node-modules-root:/workspace/node_modules
       - node-modules-web:/workspace/apps/web/node_modules
-      - node-modules-ui:/workspace/apps/ui/node_modules
       - node-modules-wiki:/workspace/apps/wiki/node_modules
-      - node-modules-devmock:/workspace/apps/devmock/node_modules
-      - node-modules-eslint-config:/workspace/apps/eslint-config/node_modules
-      - node-modules-typescript-config:/workspace/apps/typescript-config/node_modules
+      - node-modules-ui:/workspace/packages/ui/node_modules
+      - node-modules-devmock:/workspace/packages/devmock/node_modules
+      - node-modules-eslint-config:/workspace/packages/eslint-config/node_modules
+      - node-modules-typescript-config:/workspace/packages/typescript-config/node_modules
       # cargo registry 缓存（rust 官方镜像 CARGO_HOME=/usr/local/cargo）
       - cargo-registry:/usr/local/cargo/registry
       # pnpm 内容寻址存储

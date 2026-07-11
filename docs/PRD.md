@@ -171,7 +171,7 @@ JianArtifact 是一个以**低运维成本**为目标的自托管制品仓库，
 | M1-FR-041 | 离线迁移包导出 | 在源端停写/只读窗口，或经首轮导出加最终增量核对，生成同一一致性快照的 Nexus 3.70.x 迁移包；清单含格式版本、源实例标识、快照时间和整体摘要，失败不得产出可误用的完整包 | 计划 |
 | M1-FR-042 | Makefile 统一构建入口与 Linux 发布构建 | `make check` 调用与 CI 相同的 Docker 质量门脚本；`make release` 在 Docker 容器内产出 x86_64 Linux 的 release 二进制与发布 tar 包（含 systemd unit 模板与 sha256 校验和），产物落宿主专用输出目录；全程宿主不运行 cargo/pnpm、宿主目录零 target/node_modules；前端落地后强制「先前端 dist 后后端」构建顺序；产物经 ELF 头校验为 x86_64 二进制 | 开发中 |
 | M1-FR-043 | SSH + systemd 部署脚本（rootless + 可回滚） | `make deploy` 读取不入库的 env 配置（提供无真实值的示例模板），自动依赖 release 产物防止复用陈旧包；采用用户级 systemd，日常部署/升级/回滚全程无需 root；发布落 releases 目录并以 current 符号链接原子切换，保留可配置份数；健康确认失败自动回滚到上一发布，另提供 `make rollback` 手动回滚；失败非零退出并给中文错误；重复执行幂等；凭据不进日志不进仓库；真机验收为非 root 用户部署到 Linux 主机后健康检查通过且回滚可用 | 开发中 |
-| M1-FR-044 | 前端工程基座与严格静态检查接线 | 四个前端子工程（web/ui/wiki/devmock）脚手架落地；`apps/eslint-config` 与 `apps/typescript-config` 为真实共享配置（ESLint `--max-warnings 0`、TS `strict`+`noUncheckedIndexedAccess`+`isolatedModules`、Prettier 只检不改）；四工程各自独立 typecheck/lint/test/build 全绿并纳入 Docker 质量门；故意引入违规样例能使门禁失败（红→绿证据） | 开发中 |
+| M1-FR-044 | 前端工程基座与严格静态检查接线 | 四个前端子工程（apps/web、apps/wiki、packages/ui、packages/devmock）脚手架落地；`packages/eslint-config` 与 `packages/typescript-config` 为真实共享配置（ESLint `--max-warnings 0`、TS `strict`+`noUncheckedIndexedAccess`+`isolatedModules`、Prettier 只检不改）；四工程各自独立 typecheck/lint/test/build 全绿并纳入 Docker 质量门；故意引入违规样例能使门禁失败（红→绿证据） | 开发中 |
 
 > 状态取值：计划 / 开发中 / 已交付@vX.Y.Z。
 > 标 `已交付` 是有门的：只有该 FR 对应 spec 的验收标准全部满足、对应测试与实机验收通过后，才在发版时统一标 `已交付@vX.Y.Z`——开发/修复过程中不得自行预标。FR 标了 `已交付` 实际是断的（false-done）：功能坏了要修回，走缺陷修复流程把状态归真（从没真正工作过则回退 `开发中`）；需求本身要撤/推迟则走变更回退流程。
@@ -197,15 +197,16 @@ JianArtifact 是一个以**低运维成本**为目标的自托管制品仓库，
 
 ### 5.1 工程组织约束
 
-所有可构建的 Rust crate、React 应用、共享 UI、开发 Mock、配置包和未来内部工具都必须是 `apps/*` 工作区成员；禁止新增 `packages/*`、`services/*` 等第二套子工程根目录。`docs/` 与 `scripts/` 只存正式文档和工程脚本，不属于可构建子工程。此结构为强制约束：
+可构建子工程分两个根（ADR-0016）：`apps/`（可运行入口）与 `packages/`（共享库）；所有 Rust crate、React 应用、共享 UI、开发 Mock、配置包和未来内部工具都必须是二者之一的工作区成员，禁止再新增 `services/`、`libs/` 等第三套子工程根目录。`docs/` 与 `scripts/` 只存正式文档和工程脚本，不属于可构建子工程。此结构为强制约束：
 
 ```text
 JianArtifact/
-├─ apps/
+├─ apps/                  # 可运行入口
 │  ├─ server/             # Rust 后端、管理 API、格式协议、存储与迁移
 │  ├─ web/                # React 管理端产品应用
+│  └─ wiki/               # UI 组件与业务模式预览、可访问性验收入口
+├─ packages/              # 共享库
 │  ├─ ui/                 # 共享 React 组件、布局、主题与设计令牌
-│  ├─ wiki/               # UI 组件与业务模式预览、可访问性验收入口
 │  ├─ devmock/            # 浏览器与 Node 双端 Mock、场景包和契约模拟
 │  ├─ eslint-config/      # 前端共享 ESLint 严格配置
 │  └─ typescript-config/  # 前端共享 TypeScript 严格配置
@@ -231,11 +232,11 @@ JianArtifact/
 - 页面至少包括：登录、仪表盘、仓库列表、仓库详情与文件浏览、用户管理、Token 管理、迁移向导、迁移任务与报告。
 - 所有权限拒绝必须以后端结果为准；前端隐藏按钮只是体验优化，不是安全边界。
 
-**apps/ui**
+**packages/ui**
 
 - 共享设计系统与组件库，产品页不得各自复制基础按钮、表单、弹窗、表格和状态组件。
 - 组件分为基础组件、复合组件、页面布局和业务模式四层。
-- 不允许依赖 `apps/web`，只允许由 `web` 和 `wiki` 单向依赖。
+- 不允许依赖 `apps/*`，只允许由 `web` 和 `wiki` 单向依赖。
 - 必须覆盖键盘操作、焦点可见性、语义标签、错误提示和基础响应式布局。
 
 **apps/wiki**
@@ -245,7 +246,7 @@ JianArtifact/
 - 新增共享组件必须先在 wiki 中建立可复现预览，再进入产品页面。
 - 可作为视觉回归和无障碍检查的稳定入口。
 
-**apps/devmock**
+**packages/devmock**
 
 - 提供浏览器和 Node 两种运行方式。
 - 使用与真实管理 API 一致的请求/响应契约，提供有状态内存数据。
@@ -382,9 +383,9 @@ M1 期内的交付工序（前端/mock 先行、契约骨架、阶段门禁）�
 
 ### 8.3 React/TypeScript 门禁
 
-- Prettier 只检查不自动改写的 CI 模式；ESLint `--max-warnings 0`，共享配置由 `apps/eslint-config` 提供。
+- Prettier 只检查不自动改写的 CI 模式；ESLint `--max-warnings 0`，共享配置由 `packages/eslint-config` 提供。
 - TypeScript 启用 `strict`、`noUncheckedIndexedAccess`、`isolatedModules`，禁止以大范围 `any` 绕过类型系统。
-- `apps/web`、`apps/ui`、`apps/wiki`、`apps/devmock` 均必须独立 typecheck、lint、test、build。
+- `apps/web`、`apps/wiki`、`packages/ui`、`packages/devmock` 均必须独立 typecheck、lint、test、build。
 - 组件测试覆盖交互、错误态和权限态；关键用户流程使用真实浏览器 E2E。
 - devmock 与后端 OpenAPI/契约模型必须自动比对，不得手工长期漂移。
 

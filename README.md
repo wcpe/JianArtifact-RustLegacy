@@ -17,11 +17,12 @@
 
 ```text
 JianArtifact/
-├─ apps/
+├─ apps/                  # 可运行入口
 │  ├─ server/             # Rust 后端：管理 API、格式协议、存储与迁移
 │  ├─ web/                # React 管理端产品应用
+│  └─ wiki/               # UI 组件与业务模式预览、可访问性验收入口
+├─ packages/              # 共享库
 │  ├─ ui/                 # 共享 React 组件、布局、主题与设计令牌
-│  ├─ wiki/               # UI 组件与业务模式预览、可访问性验收入口
 │  ├─ devmock/            # 浏览器与 Node 双端 Mock、场景包和契约模拟
 │  ├─ eslint-config/      # 前端共享 ESLint 严格配置
 │  └─ typescript-config/  # 前端共享 TypeScript 严格配置
@@ -30,7 +31,7 @@ JianArtifact/
 └─ 根工作区配置           # Cargo / pnpm / Turborepo 工作区编排文件
 ```
 
-所有可构建子工程必须位于 `apps/` 下，禁止新增第二套子工程根目录。
+可构建子工程分两类根：`apps/`（可运行入口）与 `packages/`（共享库）；禁止再新增第三套子工程根目录（ADR-0016）。
 
 ## 开发方式
 

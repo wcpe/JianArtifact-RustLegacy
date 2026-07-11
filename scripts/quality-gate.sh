@@ -21,7 +21,7 @@ bash scripts/deploy/test-remote-install.sh
 echo "==> [5/5] 前端质量门"
 # 前端子工程清单（apps/server 是 Rust crate，不参与前端门禁判定）
 frontend_src=""
-for dir in apps/web apps/ui apps/wiki apps/devmock apps/eslint-config apps/typescript-config; do
+for dir in apps/web apps/wiki packages/ui packages/devmock packages/eslint-config packages/typescript-config; do
     if [ -e "$dir/tsconfig.json" ] || [ -d "$dir/src" ]; then
         frontend_src=1
     fi

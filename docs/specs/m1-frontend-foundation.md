@@ -10,12 +10,12 @@
 
 **FR-044 前端工程基座与严格静态检查接线（阶段 0）**
 
-- `apps/typescript-config`：真实共享 TS 配置（`base.json` 与浏览器应用配置），锁 `strict`、`noUncheckedIndexedAccess`、`isolatedModules`、`noUnusedLocals`、`noUnusedParameters`、`noFallthroughCasesInSwitch`。
-- `apps/eslint-config`：真实共享 ESLint 9 扁平配置（typescript-eslint 严格集 + react-hooks + eslint-config-prettier 消除冲突），消费侧一律 `--max-warnings 0`。
+- `packages/typescript-config`：真实共享 TS 配置（`base.json` 与浏览器应用配置），锁 `strict`、`noUncheckedIndexedAccess`、`isolatedModules`、`noUnusedLocals`、`noUnusedParameters`、`noFallthroughCasesInSwitch`。
+- `packages/eslint-config`：真实共享 ESLint 9 扁平配置（typescript-eslint 严格集 + react-hooks + eslint-config-prettier 消除冲突），消费侧一律 `--max-warnings 0`。
 - 四个应用工程脚手架（Vite + React + TS，消费上述共享配置），各自具备 `typecheck` / `lint` / `test` / `build` 四个 scripts 并可独立运行：
-  - `apps/ui`：Tailwind + shadcn/ui 基座，首批引入 1–2 个基础组件源码（如 Button）以证明「组件源码归 ui、被 wiki/web 消费」链路；
+  - `packages/ui`：Tailwind + shadcn/ui 基座，首批引入 1–2 个基础组件源码（如 Button）以证明「组件源码归 ui、被 wiki/web 消费」链路；
   - `apps/wiki`：自建轻量预览站壳（Vite 应用，不引入 Storybook），含首批组件的预览页；
-  - `apps/devmock`：MSW 双端骨架——浏览器 worker 产物 + Node 启动器，handlers 暂为空集；
+  - `packages/devmock`：MSW 双端骨架——浏览器 worker 产物 + Node 启动器，handlers 暂为空集；
   - `apps/web`：应用壳（入口 + 空首页），页面与路由属阶段 2。
 - 质量门接线：容器内生成并提交 `pnpm-lock.yaml`（宿主禁 pnpm）；`quality-gate.sh` 前端段在 install 后增加 `prettier --check`（根配置，只检不改），随后 `turbo typecheck lint test build`；组件测试框架为 Vitest + Testing Library（jsdom）。
 - 范围内：以上工程与配置、根 Prettier 配置、质量门脚本前端段调整、锁文件入库。
@@ -38,7 +38,7 @@
 
 - 依赖清单（首批引入，均为前端 devDependencies/dependencies；按规则 15 经本规格评审确认）：react ^19、react-dom ^19、vite ^7、@vitejs/plugin-react、typescript ~5.x、tailwindcss ^4、shadcn/ui 生态（radix-ui、class-variance-authority、clsx、tailwind-merge、lucide-react）、msw ^2、vitest ^3、@testing-library/react、jsdom、eslint ^9、typescript-eslint、eslint-plugin-react-hooks、eslint-config-prettier、prettier ^3。@tanstack/react-table ^8 随表格组件落地引入；openapi-typescript 随阶段 1 契约接线引入；react-router 随阶段 2 页面引入。
 - 依赖方向不变量：ui 不依赖 web；web/wiki 单向消费 ui；devmock 不被生产构建引用。
-- shadcn 组件经 CLI 以源码形式归入 `apps/ui`（copy-in，非运行时依赖），四层组织（基础/复合/布局/业务模式，ADR-0011）。
+- shadcn 组件经 CLI 以源码形式归入 `packages/ui`（copy-in，非运行时依赖），四层组织（基础/复合/布局/业务模式，ADR-0011）。
 - turbo 任务沿用现有 `turbo.json`（typecheck/lint/test/build）；配置包（eslint-config/typescript-config）只被消费、不要求四 scripts。
 - 质量门（`scripts/quality-gate.sh`）前端段最终形态：`pnpm install --frozen-lockfile` → `pnpm prettier --check .` → `pnpm turbo typecheck lint test build`；锁文件入库后该段自动启用（现有防漏检护栏保持）。
 - 相关裁决引用：ADR-0011（UI 设计系统）、ADR-0012（契约真源与比对）、ADR-0014（前端先行工序）。
@@ -60,7 +60,7 @@
 - `pnpm-lock.yaml` 入库；`make check` 前端段真实执行且全绿（install → prettier --check → turbo typecheck/lint/test/build）。
 - turbo 输出证明四个应用工程的四类任务**真实运行而非空转**（每工程至少各 1 个真实测试用例）。
 - 红→绿证据（各引入一处违规、门变红、移除转绿）：TS 违规（未用变量触 `noUnusedLocals`）、ESLint 违规（触严格集规则）、Prettier 格式违规。
-- `apps/ui` 至少一个 shadcn 基础组件源码归入并被 wiki 预览页真实渲染（容器内 build 通过 + wiki 构建产物包含该页）。
+- `packages/ui` 至少一个 shadcn 基础组件源码归入并被 wiki 预览页真实渲染（容器内 build 通过 + wiki 构建产物包含该页）。
 - devmock Node 端可启动并响应探测请求（骨架级）；浏览器 worker 文件随构建产出。
 - 宿主目录零 node_modules 内容（命名卷空挂载点豁免）；前端构建产物只落容器卷或被忽略目录。
 

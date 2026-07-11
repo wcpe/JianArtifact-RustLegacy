@@ -5,7 +5,7 @@
 ## 1. 各组件工具链
 
 - **Rust 后端（`apps/server`）**：`rustfmt --check` 格式检查 + `clippy --all-targets --all-features -D warnings`（警告即失败）+ `cargo-audit`（依赖漏洞）+ 许可证机器检查（后两项随首个 Rust 依赖引入时接入质量门脚本，见 `docs/ROADMAP.md` 阶段 0）。
-- **前端（`apps/web` / `apps/ui` / `apps/wiki` / `apps/devmock`）**：`prettier --check`（只检查不改写）+ `eslint --max-warnings 0`（共享配置来自 `apps/eslint-config`）+ `tsc` typecheck（`strict` + `noUncheckedIndexedAccess` + `isolatedModules`，共享配置来自 `apps/typescript-config`）；随前端工程基座（M1-FR-044）落地接线。
+- **前端（`apps/web` / `apps/wiki` / `packages/ui` / `packages/devmock`）**：`prettier --check`（只检查不改写）+ `eslint --max-warnings 0`（共享配置来自 `packages/eslint-config`）+ `tsc` typecheck（`strict` + `noUncheckedIndexedAccess` + `isolatedModules`，共享配置来自 `packages/typescript-config`）；随前端工程基座（M1-FR-044）落地接线。
 
 以上检查**全部经 Docker 质量门入口 `scripts/check.sh`（或 `check.ps1`）执行，宿主机禁止直接运行 `cargo` / `pnpm`**。配置文件放在对应组件工程内或仓库根，版本固定。
 
