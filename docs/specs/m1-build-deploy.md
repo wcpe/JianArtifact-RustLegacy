@@ -10,7 +10,7 @@
 
 **FR-042 构建入口与发布构建**
 
-- 根 `Makefile` 提供目标：`help`（默认，列出各目标用途）、`check`（质量门）、`release`（发布构建与打包）、`deploy`（部署，见 FR-043）、`clean`（清发布输出目录）。
+- 根 `Makefile` 提供目标：`help`（默认，列出各目标用途）、`check`（质量门）、`release`（发布构建与打包）、`deploy`（部署，见 FR-043）、`rollback`（回滚到上一发布，见 FR-043）、`clean`（清发布输出目录）。
 - 每个目标都是 Docker 的薄封装：`check` 直接调用既有 `docker compose run --rm dev bash scripts/quality-gate.sh` 链路，与 `scripts/check.sh` / CI 完全同源；`release` 在同一 dev 镜像容器内执行构建脚本。
 - `release` 产出（落宿主根 `dist/` 目录，已被 `.gitignore` 的 `dist/` 规则覆盖）：
   - `jianartifact-<版本>-x86_64-unknown-linux-gnu.tar.gz`：内含 `bin/jianartifact`（release 二进制）、`systemd/jianartifact.service`（unit 模板）、`VERSION` 文件；
@@ -21,26 +21,31 @@
 - 范围内：Makefile、容器内构建脚本、tar 打包、unit 模板文件。
 - 不做（范围外）：arm64 等其他架构；Docker 运行时镜像交付；快照/Release CI 流水线（随首次发布落地）；cargo-audit/许可证检查接线（阶段 0 独立事项，随首个 Rust 依赖引入）。
 
-**FR-043 部署脚本**
+**FR-043 部署脚本（rootless + 可回滚）**
 
+- **无 root 部署**：采用**用户级 systemd**（`systemctl --user`），unit 装在 `~/.config/systemd/user/`，部署目录默认 `~/jianartifact`；服务监听端口 > 1024。日常部署、升级、回滚全程不需要 root/sudo。
+  - 一次性前置条件（写入 `docs/OPERATIONS.md` 与 `.env.example` 注释）：目标机需 `loginctl enable-linger <部署用户>`（多数发行版需管理员执行一次，否则服务随登出停止）；deploy 脚本检测 linger 未开启时给出中文警告但不阻断。
 - `make deploy` 调用宿主侧 `scripts/deploy.sh`（bash，经宿主 OpenSSH 客户端执行 ssh/scp；构建部分仍在 Docker 内）。
 - 配置全部来自项目根 `.env`（已被 `.gitignore` 排除），提供 `.env.example` 模板（每个变量中文注释、无真实值）：
-  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `/opt/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；未配置时探活步骤警告跳过）。
+  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `~/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；未配置时探活降级，见下）、`DEPLOY_KEEP_RELEASES`（保留的发布份数，默认 3）。
+- **发布目录布局（支撑回滚）**：`DEPLOY_DIR/releases/<版本>-<打包时间戳>/` 存放各版发布内容，`DEPLOY_DIR/current` 为指向活动发布的符号链接；unit 的 `ExecStart` 走 `current` 路径。切换 = 符号链接原子替换（临时链接 + `mv -T`），超出保留份数的最旧发布自动清理（活动发布与其上一版永不清理）。
 - 部署流程（幂等，重复执行安全）：
   1. 目标依赖链保证先完成 `release`（防复用陈旧包——上一代踩过的坑）；
   2. 上传 tar 与 `.sha256` 到目标机临时路径，远端校验 sha256，不匹配即失败；
-  3. 解压；若 `DEPLOY_DIR/bin/jianartifact` 已存在，先保留为 `jianartifact.prev`（单份，供手动回滚），再原子替换；
-  4. 安装/更新 systemd unit（内容有变化才复制并 `daemon-reload`）、`systemctl enable --now` 或 `restart`；
-  5. 探活：请求 `DEPLOY_HEALTH_URL` 重试若干次，全失败则非零退出；变量未配置时打印「跳过探活（待 M1-FR-021 健康检查落地后配置）」并成功返回。
+  3. 解压为新的 `releases/<版本>-<时间戳>/`，原子切换 `current`；
+  4. 安装/更新用户级 unit（内容有变化才复制并 `systemctl --user daemon-reload`）、`systemctl --user enable --now` 或 `restart`；
+  5. 健康确认：服务须进入 `active` 状态；配置了 `DEPLOY_HEALTH_URL` 时再请求探活并重试若干次（未配置时打印「探活降级为仅服务状态检查（待 M1-FR-021 落地后配置）」）；
+  6. **自动回滚**：健康确认失败（服务未 active，或探活重试全失败）→ 自动切回上一发布、重启、输出回滚结果，并以非零退出报告本次部署失败。
+- **手动回滚**：`make rollback` 切换 `current` 到上一发布并重启、执行同样的健康确认；无上一发布时明确报错。
 - 凭据与主机信息不得进入构建产物与仓库；脚本禁用 `set -x`，输出不回显私钥路径以外的敏感值；SSH 失败、校验失败、服务启动失败均中文报错并非零退出。
-- 范围内：deploy 脚本、`.env.example`、unit 模板的安装逻辑。
-- 不做（范围外）：多机/滚动部署；自动回滚编排；秘钥管理与分发；TLS 配置（反代职责，见 `docs/OPERATIONS.md`）。
+- 范围内：deploy 与 rollback 脚本、`.env.example`、用户级 unit 模板的安装逻辑、发布保留与清理。
+- 不做（范围外）：system 级（root）部署模式（需要时另行登记）；多机/滚动部署；指定任意历史版本回滚（只支持回到上一发布）；秘钥管理与分发；TLS 配置（反代职责，见 `docs/OPERATIONS.md`）。
 
 ## 3. 设计（怎么做）
 
 - 涉及文件：根 `Makefile`（新增）、`scripts/build-release.sh`（新增，容器内执行）、`scripts/deploy.sh`（新增，宿主执行）、`scripts/deploy/jianartifact.service`（新增，unit 模板）、`.env.example`（新增）、`docs/OPERATIONS.md`（构建与部署章节同步）。
 - 不新增子工程与依赖；不改动 `scripts/quality-gate.sh` 与 compose 编排（`release` 复用 dev 服务另跑一条命令）。
-- unit 模板要点：`Type=simple`、专用运行用户（文档说明由管理员创建）、`WorkingDirectory=DEPLOY_DIR`、重启策略 `on-failure`；数据目录与配置路径待 config 域落地后在模板中补注释占位说明（不加无用配置项）。
+- unit 模板要点：**用户级 unit**（随部署用户运行，无专用系统用户）、`Type=simple`、`ExecStart=%h/jianartifact/current/bin/jianartifact`（`%h` 为用户家目录说明符，`DEPLOY_DIR` 非默认值时由部署脚本改写该行）、重启策略 `on-failure`；数据目录与配置路径待 config 域落地后在模板中补注释占位说明（不加无用配置项）。
 - 换行符：新增 `Makefile`、`*.sh`、unit 模板均须落在 `.gitattributes` 的 LF 规则内（`Makefile` 需补一行 `Makefile text eol=lf`）。
 - 相关裁决引用：ADR-0010（质量门与 Docker 化验证）、ADR-0013（单二进制交付与构建顺序）。
 
@@ -48,8 +53,8 @@
 
 - [ ] FR-042：Makefile（help/check/release/clean）+ `scripts/build-release.sh` + unit 模板 + 版本一致性校验 + `.gitattributes` 补 Makefile 行
 - [ ] FR-042 验收：容器内产出 tar 与 sha256，`file` 验证 ELF x86_64，宿主零构建产物（空挂载点豁免）
-- [ ] FR-043：`scripts/deploy.sh` + `.env.example` + Makefile `deploy` 目标（依赖 `release`）
-- [ ] FR-043 验收：真机部署 Linux 主机，幂等重跑，失败路径逐项验证；探活项后置（见 §5）
+- [ ] FR-043：`scripts/deploy.sh`（含 releases/current 布局、自动回滚、保留清理）+ `make rollback` + `.env.example` + Makefile `deploy` 目标（依赖 `release`）
+- [ ] FR-043 验收：真机以**非 root 用户全程**部署 Linux 主机，幂等重跑，自动/手动回滚，失败路径逐项验证；探活项后置（见 §5）
 - [ ] 文档同步：PRD FR-042/043 状态流转、`docs/OPERATIONS.md` 构建与部署章节改为 Makefile 入口、CHANGELOG 未发布段各 +1 行
 
 ## 5. 验收标准
@@ -66,14 +71,20 @@
 
 - `.env.example` 覆盖 §2 全部变量、中文注释、无真实值；`.env` 确认被 git 忽略。
 - 缺失必填变量时 `make deploy` 立即失败并指出缺哪项（不发起任何连接）。
-- 真机（Linux + systemd 主机）验收，需用户确认通过：首次部署后服务 `active (running)`；改动二进制重跑 deploy 平滑更新且 `jianartifact.prev` 为上一版；连续两次 deploy 幂等成功。
-- 失败路径：错误主机/端口（SSH 不通）、篡改 tar（sha256 不匹配）、损坏二进制（服务启动失败）→ 均非零退出、中文错误、不留半装状态（unit 与旧二进制不被破坏）。
-- 输出与日志全程不出现口令/密钥内容；`DEPLOY_HEALTH_URL` 未配置时明确提示跳过探活。
-- **探活后置项**：`/healthz`（M1-FR-021）落地后配置 `DEPLOY_HEALTH_URL` 补验「部署后健康检查通过」，此前 FR-043 不得标记完成验收（对应 ROADMAP 阶段 0 注记）。
+- **rootless 验收（真机，需用户确认通过）**：以无 sudo 权限的普通用户完成全部操作——首次部署后 `systemctl --user status` 为 `active (running)`；升级重跑 deploy 平滑切换 `current`；连续两次 deploy 幂等成功；全程无任何 root/sudo 调用（脚本内 grep 证明无 sudo）。
+- **回滚验收（真机）**：
+  - 手动：部署两个版本后执行 `make rollback`，`current` 指回上一发布、服务重启且健康确认通过；再次 `rollback`（无更早发布）明确报错。
+  - 自动：部署一个必然启动失败的坏二进制样本，deploy 检测服务未 active → 自动切回上一发布并恢复运行，本次 deploy 非零退出且输出回滚结果。
+  - 保留清理：连续部署超过 `DEPLOY_KEEP_RELEASES` 份后，最旧发布被清理，活动发布与其上一版仍在。
+- 失败路径：错误主机/端口（SSH 不通）、篡改 tar（sha256 不匹配）→ 均非零退出、中文错误，`current` 与运行中服务不受影响。
+- 输出与日志全程不出现口令/密钥内容；linger 未开启时输出中文警告。
+- **探活后置项**：`/healthz`（M1-FR-021）落地后配置 `DEPLOY_HEALTH_URL` 补验「探活失败自动回滚」与「部署后健康检查通过」（此前健康确认降级为服务 active 状态检查），FR-043 在补验完成前不得标记完成验收（对应 ROADMAP 阶段 0 注记）。
 
 ## 6. 风险 / 待定
 
 - 宿主需具备 GNU make 与 OpenSSH 客户端（Windows 自带 ssh/scp；make 由用户环境提供）——环境缺失属机器问题，不在仓库内兜底。
 - 本机曾出现失效的 `DOCKER_HOST` 残留环境变量导致 docker 不可用（会话内清空可解）；属机器特定问题，Makefile 不为其写补偿逻辑。
 - unit 模板中的数据目录、配置文件路径依赖 config 域设计（阶段 3），当前模板仅含运行所需最小字段；config 落地后同步更新模板并在 CHANGELOG 记录。
-- 默认部署目录 `/opt/jianartifact`、服务名 `jianartifact`、单份 `.prev` 手动回滚为本规格选定的约定（均可经 `.env` 覆盖）；如需调整在开发前提出。
+- 默认部署目录 `~/jianartifact`、服务名 `jianartifact`、保留 3 份发布为本规格选定的约定（均可经 `.env` 覆盖）；如需调整在开发前提出。
+- rootless 的边界：`loginctl enable-linger` 多数发行版需管理员一次性执行；若目标机连 linger 都无法开启，服务仅在部署用户登录会话期间运行——该局限写入 OPERATIONS，属系统限制而非本项目缺陷。
+- 健康探活落地（M1-FR-021）之前，自动回滚的触发只有「服务未进入 active」一种信号，无法识别"进程活着但行为坏了"的坏版本；补验时机见 §5。
