@@ -1,0 +1,2883 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "JianArtifact 管理 API",
+    "description": "自托管制品仓库的管理 API 契约。由 utoipa 从代码生成，是契约唯一真源（ADR-0012）。",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "登录：校验口令并签发会话令牌。",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionToken"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "用户名或口令无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "退出：吊销当前会话。",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "已退出"
+          },
+          "401": {
+            "description": "会话无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "刷新：换发新会话令牌，旧令牌立即失效。",
+        "operationId": "refresh",
+        "responses": {
+          "200": {
+            "description": "刷新成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionToken"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "会话无效或已撤销",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/discover": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "发现：按源配置枚举可迁仓库（Admin）。",
+        "operationId": "discover",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrationSource"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "发现结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "源配置无效（路径越界/矩阵外来源等）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/plan": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "计划：按映射与决策生成可确认的迁移计划预览（Admin）。",
+        "operationId": "plan",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "计划预览",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationPlan"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "映射无效或引用的发现结果不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "任务列表（分页，Admin）。",
+        "operationId": "list_tasks",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "任务分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "创建任务：确认计划并异步执行，立即返回任务标识（Admin）。",
+        "operationId": "create_task",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "query",
+            "description": "已确认的计划标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "任务已受理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "计划不存在或存在未决阻断冲突",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "任务详情与进度（Admin）。",
+        "operationId": "task_detail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "任务详情",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/cancel": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "取消任务（清理未提交临时文件，不删已成功且被引用的数据，Admin）。",
+        "operationId": "cancel_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "取消请求已受理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "当前状态不允许取消",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/pause": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "暂停任务（在单对象原子提交边界生效，Admin）。",
+        "operationId": "pause_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "暂停请求已受理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "当前状态不允许暂停",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/report": {
+      "get": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "任务报告（Admin）。",
+        "operationId": "task_report",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "迁移报告",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MigrationReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/resume": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "继续任务（Admin）。",
+        "operationId": "resume_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "继续请求已受理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "当前状态不允许继续",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/retry": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "summary": "重试/续传（只处理失败、中断或变化对象，幂等，Admin）。",
+        "operationId": "retry_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务标识",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "重试请求已受理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "当前状态不允许重试",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "仓库列表（按权限过滤，分页）。",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "仓库分页（只含调用方可读仓库）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoListResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "创建仓库（Admin）。",
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRepoRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoInfo"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "仓库名已存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "仓库详情。",
+        "operationId": "detail",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "仓库详情",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在（含无权访问的 private）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "删除仓库（仓库 admin，高风险，需显式模式与确认头 X-Confirm-Repository=仓库名）。",
+        "operationId": "delete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "删除模式：config 仅删配置与索引 / data 连带物理回收无引用 blob",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/DeleteMode"
+            }
+          },
+          {
+            "name": "X-Confirm-Repository",
+            "in": "header",
+            "description": "防误删确认：必须与仓库名一致",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "删除完成",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteRepoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "缺少或不匹配的确认头/模式",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "编辑仓库（仓库 admin）。",
+        "operationId": "update",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRepoRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}/acl": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "ACL 条目列表（仓库 admin）。",
+        "operationId": "acl_list",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ACL 条目",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AclEntry"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}/acl/{user_id}": {
+      "put": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "设置某用户的 ACL（仓库 admin）。",
+        "operationId": "acl_set",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "用户标识",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAclRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已设置",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AclEntry"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库或用户不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "移除某用户的 ACL（仓库 admin）。",
+        "operationId": "acl_remove",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "path",
+            "description": "用户标识",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已移除"
+          },
+          "404": {
+            "description": "仓库或条目不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}/files": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "仓库内目录浏览（read 权限，分页）。",
+        "operationId": "files",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "目录路径，缺省为根",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "目录条目分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库或路径不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}/search": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "仓库内路径搜索（read 权限，子串匹配，分页）。",
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "路径子串",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "匹配条目分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/repos/{name}/usage": {
+      "get": {
+        "tags": [
+          "repos"
+        ],
+        "summary": "使用方式片段（read 权限）。",
+        "operationId": "usage",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "按格式生成的客户端配置片段",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UsageSnippet"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tokens": {
+      "get": {
+        "tags": [
+          "tokens"
+        ],
+        "summary": "列出本人 Token 元数据（分页）。",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token 元数据分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "未认证",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "tokens"
+        ],
+        "summary": "签发 Token。",
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "签发成功，明文仅此一次",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedToken"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "未认证",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "tokens"
+        ],
+        "summary": "吊销 Token。",
+        "operationId": "revoke",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Token 标识",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "已吊销"
+          },
+          "401": {
+            "description": "未认证",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Token 不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "tags": [
+          "users"
+        ],
+        "summary": "列出用户（分页，Admin）。",
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "用户分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "users"
+        ],
+        "summary": "新增用户（Admin）。",
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfo"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "用户名已存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{id}": {
+      "patch": {
+        "tags": [
+          "users"
+        ],
+        "summary": "更新用户启停与角色（Admin）。",
+        "operationId": "update",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "用户标识",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateUserRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserInfo"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无管理员权限或违反最后 Admin 保护",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "用户不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "存活探针：进程存活即 200，不做依赖探测。",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "进程存活"
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "就绪自检：关键依赖全部通过返回 200，任一失败返回 503。",
+        "operationId": "readyz",
+        "responses": {
+          "200": {
+            "description": "关键依赖就绪"
+          },
+          "503": {
+            "description": "存在未就绪依赖"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AclEntry": {
+        "type": "object",
+        "description": "ACL 条目。",
+        "required": [
+          "user_id",
+          "username",
+          "permission"
+        ],
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/Permission",
+            "description": "授予的动作（向下包含）。"
+          },
+          "user_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "用户标识。"
+          },
+          "username": {
+            "type": "string",
+            "description": "用户名。"
+          }
+        }
+      },
+      "ConfigSource": {
+        "type": "string",
+        "description": "仓库配置的来源（native-dir 源使用）。",
+        "enum": [
+          "rest",
+          "manual"
+        ]
+      },
+      "CreateRepoRequest": {
+        "type": "object",
+        "description": "创建仓库请求体。",
+        "required": [
+          "name",
+          "format",
+          "repo_type",
+          "visibility"
+        ],
+        "properties": {
+          "format": {
+            "$ref": "#/components/schemas/Format",
+            "description": "制品格式（创建后不可变）。"
+          },
+          "members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "group 成员（group 必填，有序，须同格式 hosted/proxy）。"
+          },
+          "name": {
+            "type": "string",
+            "description": "仓库名：小写字母/数字/连字符，1–64 字符，创建后不可改。"
+          },
+          "overwrite_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OverwritePolicy",
+                "description": "覆盖策略（hosted，可选按格式默认）。"
+              }
+            ]
+          },
+          "repo_type": {
+            "$ref": "#/components/schemas/RepoType",
+            "description": "仓库类型（创建后不可变）。"
+          },
+          "upstream_credential_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游凭据引用名（可选）。"
+          },
+          "upstream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游地址（proxy 必填）。"
+          },
+          "version_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VersionPolicy",
+                "description": "Maven 版本策略（Maven hosted，默认 mixed）。"
+              }
+            ]
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility",
+            "description": "可见性。"
+          }
+        }
+      },
+      "CreateTokenRequest": {
+        "type": "object",
+        "description": "创建 Token 请求体。",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Token 名称（便于用户区分用途）。"
+          }
+        }
+      },
+      "CreateUserRequest": {
+        "type": "object",
+        "description": "创建用户请求体。",
+        "required": [
+          "username",
+          "password",
+          "role"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "初始明文口令（仅传输，落库为 Argon2 哈希）。"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "全局角色。"
+          },
+          "username": {
+            "type": "string",
+            "description": "用户名。"
+          }
+        }
+      },
+      "CreatedToken": {
+        "type": "object",
+        "description": "签发成功返回：明文仅此一次出现。",
+        "required": [
+          "id",
+          "name",
+          "token",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "创建时间。"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Token 标识。"
+          },
+          "name": {
+            "type": "string",
+            "description": "Token 名称。"
+          },
+          "token": {
+            "type": "string",
+            "description": "Token 明文，仅在本次响应出现一次，请立即保存。"
+          }
+        }
+      },
+      "DeleteRepoResponse": {
+        "type": "object",
+        "description": "删除结果。",
+        "required": [
+          "orphaned_blobs",
+          "reclaimed_blobs"
+        ],
+        "properties": {
+          "orphaned_blobs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "因本次删除失去全部引用而遗留的 blob 数（mode=config 时非零有意义）。"
+          },
+          "reclaimed_blobs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "被物理回收的 blob 数（mode=data 时有意义）。"
+          }
+        }
+      },
+      "DiscoveredRepo": {
+        "type": "object",
+        "description": "发现到的源仓库。",
+        "required": [
+          "name",
+          "format",
+          "repo_type",
+          "has_credential_ref",
+          "object_count",
+          "total_bytes",
+          "config_complete"
+        ],
+        "properties": {
+          "config_complete": {
+            "type": "boolean",
+            "description": "配置是否完整（false = 待补充，不可全量成功）。"
+          },
+          "format": {
+            "$ref": "#/components/schemas/Format",
+            "description": "格式（矩阵外格式在 unsupported 中列出，不出现在此）。"
+          },
+          "has_credential_ref": {
+            "type": "boolean",
+            "description": "是否已有可用的上游凭据引用（凭据缺失的 proxy 为「配置未完成」）。"
+          },
+          "members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "group 成员（有序）。"
+          },
+          "name": {
+            "type": "string",
+            "description": "源仓库名。"
+          },
+          "object_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "可迁对象数（估算）。"
+          },
+          "repo_type": {
+            "$ref": "#/components/schemas/RepoType",
+            "description": "仓库类型。"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "可迁字节数（估算）。"
+          },
+          "upstream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游地址（脱敏，不含凭据）。"
+          }
+        }
+      },
+      "DiscoveryResult": {
+        "type": "object",
+        "description": "发现结果。",
+        "required": [
+          "discovery_id",
+          "snapshot_time",
+          "repositories",
+          "unsupported",
+          "degraded_bare_blob"
+        ],
+        "properties": {
+          "degraded_bare_blob": {
+            "type": "boolean",
+            "description": "是否为裸 blob 降级模式（true 时任务总状态不得全量成功）。"
+          },
+          "discovery_id": {
+            "type": "string",
+            "description": "本次发现的标识（后续计划引用）。"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiscoveredRepo"
+            },
+            "description": "可迁仓库清单。"
+          },
+          "snapshot_time": {
+            "type": "string",
+            "description": "源快照时间。"
+          },
+          "unsupported": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedItem"
+            },
+            "description": "不支持项清单（矩阵外格式/系统数据，禁止静默丢弃）。"
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "对外统一错误响应体。",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "稳定错误码（大写下划线，供客户端分支判断）。"
+          },
+          "message": {
+            "type": "string",
+            "description": "面向用户的中文错误消息，不含内部细节。"
+          }
+        }
+      },
+      "FailureSample": {
+        "type": "object",
+        "description": "失败明细（有界样本）。",
+        "required": [
+          "repo",
+          "object_key",
+          "category",
+          "message"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "稳定错误类别。"
+          },
+          "message": {
+            "type": "string",
+            "description": "中文说明（脱敏）。"
+          },
+          "object_key": {
+            "type": "string",
+            "description": "对象键。"
+          },
+          "repo": {
+            "type": "string",
+            "description": "仓库名。"
+          }
+        }
+      },
+      "FileEntry": {
+        "type": "object",
+        "description": "浏览条目（目录或文件）。",
+        "required": [
+          "name",
+          "is_dir"
+        ],
+        "properties": {
+          "is_dir": {
+            "type": "boolean",
+            "description": "是否目录。"
+          },
+          "name": {
+            "type": "string",
+            "description": "条目名。"
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "sha256 校验和（文件）。"
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "文件大小（字节，目录为空）。"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "更新时间。"
+          }
+        }
+      },
+      "FileListResponse": {
+        "type": "object",
+        "description": "浏览/搜索分页响应。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FileEntry"
+            },
+            "description": "当前页条目。"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "description": "当前页码（从 1 起）。",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每页条数。",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总条数。"
+          }
+        }
+      },
+      "Format": {
+        "type": "string",
+        "description": "制品格式。",
+        "enum": [
+          "raw",
+          "maven",
+          "npm"
+        ]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "description": "登录请求体。",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "明文口令（仅传输，不落库不进日志）。"
+          },
+          "username": {
+            "type": "string",
+            "description": "用户名。"
+          }
+        }
+      },
+      "MigrationPlan": {
+        "type": "object",
+        "description": "迁移计划预览。",
+        "required": [
+          "plan_id",
+          "mappings",
+          "conflicts",
+          "blocked",
+          "object_count",
+          "total_bytes",
+          "estimated_disk_bytes",
+          "disk_sufficient",
+          "unsupported"
+        ],
+        "properties": {
+          "blocked": {
+            "type": "boolean",
+            "description": "是否存在阻断执行的未决冲突。"
+          },
+          "conflicts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlanConflict"
+            },
+            "description": "冲突清单（存在未决阻断性冲突时不可执行）。"
+          },
+          "disk_sufficient": {
+            "type": "boolean",
+            "description": "磁盘空间是否满足估算。"
+          },
+          "estimated_disk_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "目标空间估算（字节，含安全系数与保留量，NFR-12）。"
+          },
+          "mappings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoMapping"
+            },
+            "description": "纳入执行的仓库映射。"
+          },
+          "object_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "对象总数。"
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "计划标识（创建任务时引用）。"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "字节总数。"
+          },
+          "unsupported": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedItem"
+            },
+            "description": "不支持项清单。"
+          }
+        }
+      },
+      "MigrationReport": {
+        "type": "object",
+        "description": "迁移任务报告。",
+        "required": [
+          "task_id",
+          "status",
+          "repositories",
+          "failures",
+          "failures_omitted",
+          "unsupported",
+          "excluded"
+        ],
+        "properties": {
+          "excluded": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "显式排除的仓库（保留在报告中，不伪装成从未发现）。"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FailureSample"
+            },
+            "description": "失败样本（有界）。"
+          },
+          "failures_omitted": {
+            "type": "integer",
+            "format": "int64",
+            "description": "因样本上限被省略的失败数。"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoReport"
+            },
+            "description": "分仓库报告。"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "description": "最终状态。"
+          },
+          "task_id": {
+            "type": "string",
+            "description": "任务标识。"
+          },
+          "unsupported": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedItem"
+            },
+            "description": "不支持/未迁移项。"
+          }
+        }
+      },
+      "MigrationSource": {
+        "type": "object",
+        "description": "迁移源配置（发现请求体）。凭据一律为运行时引用名，绝不接受明文。",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "config_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ConfigSource",
+                "description": "仓库配置来源（native-dir 必填）。"
+              }
+            ]
+          },
+          "credential_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Nexus 凭据引用名（运行时从环境取值，不落库不进日志）。"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind",
+            "description": "来源类别。"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "服务器上的路径（native-dir：Nexus 数据目录；package：包路径）；须落在 migration-workdir 白名单根内。"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Nexus 实例地址（online 或 native-dir + rest 配置源）。"
+          }
+        }
+      },
+      "OverwritePolicy": {
+        "type": "string",
+        "description": "同路径覆盖策略。",
+        "enum": [
+          "allow",
+          "deny"
+        ]
+      },
+      "Permission": {
+        "type": "string",
+        "description": "仓库 ACL 动作（向下包含：admin ⊃ write ⊃ read）。",
+        "enum": [
+          "read",
+          "write",
+          "admin"
+        ]
+      },
+      "PlanConflict": {
+        "type": "object",
+        "description": "冲突条目（默认禁止覆盖；同校验跳过，异校验阻断待显式决策）。",
+        "required": [
+          "target",
+          "path",
+          "category",
+          "detail"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "稳定类别（如「同路径同校验」「同路径不同校验」「目标仓库已存在」）。"
+          },
+          "detail": {
+            "type": "string",
+            "description": "中文说明与可选决策。"
+          },
+          "path": {
+            "type": "string",
+            "description": "冲突路径。"
+          },
+          "target": {
+            "type": "string",
+            "description": "目标仓库名。"
+          }
+        }
+      },
+      "PlanRequest": {
+        "type": "object",
+        "description": "计划请求体。",
+        "required": [
+          "discovery_id",
+          "mappings"
+        ],
+        "properties": {
+          "discovery_id": {
+            "type": "string",
+            "description": "引用的发现结果。"
+          },
+          "mappings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoMapping"
+            },
+            "description": "各仓库映射与决策。"
+          }
+        }
+      },
+      "RepoInfo": {
+        "type": "object",
+        "description": "仓库信息。",
+        "required": [
+          "name",
+          "format",
+          "repo_type",
+          "visibility",
+          "disabled",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "创建时间。"
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "是否已停用（停用后格式端点按不存在处理）。"
+          },
+          "format": {
+            "$ref": "#/components/schemas/Format",
+            "description": "制品格式。"
+          },
+          "members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "group 成员（有序，group 有效）。"
+          },
+          "name": {
+            "type": "string",
+            "description": "仓库名（全局唯一）。"
+          },
+          "overwrite_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OverwritePolicy",
+                "description": "覆盖策略（hosted 有效）。"
+              }
+            ]
+          },
+          "repo_type": {
+            "$ref": "#/components/schemas/RepoType",
+            "description": "仓库类型。"
+          },
+          "upstream_credential_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游凭据引用名（只存引用，不含凭据值）。"
+          },
+          "upstream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游地址（proxy 有效）。"
+          },
+          "version_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VersionPolicy",
+                "description": "Maven 版本策略（Maven hosted 有效）。"
+              }
+            ]
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility",
+            "description": "可见性。"
+          }
+        }
+      },
+      "RepoListResponse": {
+        "type": "object",
+        "description": "仓库列表分页响应（只含调用方可读仓库，零存在性泄露）。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RepoInfo"
+            },
+            "description": "当前页仓库。"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "description": "当前页码（从 1 起）。",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每页条数。",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总条数。"
+          }
+        }
+      },
+      "RepoMapping": {
+        "type": "object",
+        "description": "单仓库迁移映射（计划请求）。",
+        "required": [
+          "source",
+          "excluded"
+        ],
+        "properties": {
+          "excluded": {
+            "type": "boolean",
+            "description": "是否排除（显式排除保留在报告中，任务不得全量成功）。"
+          },
+          "manual_members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "手动补的 group 成员（config_source=manual 时，有序）。"
+          },
+          "manual_upstream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "手动补的 proxy 上游地址（config_source=manual 时）。"
+          },
+          "source": {
+            "type": "string",
+            "description": "源仓库名。"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "目标仓库名（缺省同名）。"
+          },
+          "upstream_credential_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游凭据引用名（manual 配置源或补凭据时提供）。"
+          }
+        }
+      },
+      "RepoReport": {
+        "type": "object",
+        "description": "单仓库迁移报告。",
+        "required": [
+          "source",
+          "target",
+          "total",
+          "done",
+          "migrated",
+          "skipped",
+          "failed",
+          "total_bytes",
+          "done_bytes",
+          "duration_ms",
+          "credential_status"
+        ],
+        "properties": {
+          "credential_status": {
+            "type": "string",
+            "description": "凭据引用状态（如「已映射」「未映射」）。"
+          },
+          "done": {
+            "type": "integer",
+            "format": "int64",
+            "description": "已完成数。"
+          },
+          "done_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "已完成字节。"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "耗时（毫秒）。"
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "失败数。"
+          },
+          "migrated": {
+            "type": "integer",
+            "format": "int64",
+            "description": "实际迁移数。"
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "已存在跳过数（幂等命中）。"
+          },
+          "source": {
+            "type": "string",
+            "description": "源仓库名。"
+          },
+          "target": {
+            "type": "string",
+            "description": "目标仓库名。"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "对象总数。"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "字节总数。"
+          }
+        }
+      },
+      "RepoType": {
+        "type": "string",
+        "description": "仓库类型。",
+        "enum": [
+          "hosted",
+          "proxy",
+          "group"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "description": "全局角色。",
+        "enum": [
+          "admin",
+          "user"
+        ]
+      },
+      "SessionToken": {
+        "type": "object",
+        "description": "登录/刷新成功返回的会话令牌。",
+        "required": [
+          "token",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "令牌有效期（秒）。"
+          },
+          "token": {
+            "type": "string",
+            "description": "JWT 会话令牌，客户端置于 `Authorization: Bearer`。"
+          }
+        }
+      },
+      "SetAclRequest": {
+        "type": "object",
+        "description": "设置 ACL 请求体。",
+        "required": [
+          "permission"
+        ],
+        "properties": {
+          "permission": {
+            "$ref": "#/components/schemas/Permission",
+            "description": "授予的动作。"
+          }
+        }
+      },
+      "SourceKind": {
+        "type": "string",
+        "description": "迁移来源类别（ADR-0015：默认离线直读原生数据目录）。",
+        "enum": [
+          "native-dir",
+          "online",
+          "package"
+        ]
+      },
+      "TaskInfo": {
+        "type": "object",
+        "description": "任务信息与节流进度。",
+        "required": [
+          "task_id",
+          "status",
+          "plan_id",
+          "done_objects",
+          "total_objects",
+          "done_bytes",
+          "total_bytes",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "创建时间。"
+          },
+          "done_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "已完成字节。"
+          },
+          "done_objects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "已完成对象数。"
+          },
+          "plan_id": {
+            "type": "string",
+            "description": "引用的计划标识。"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "description": "当前状态。"
+          },
+          "task_id": {
+            "type": "string",
+            "description": "任务标识。"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "字节总数。"
+          },
+          "total_objects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "对象总数。"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "最近更新时间。"
+          }
+        }
+      },
+      "TaskListResponse": {
+        "type": "object",
+        "description": "任务列表分页响应。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskInfo"
+            },
+            "description": "当前页任务。"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "description": "当前页码（从 1 起）。",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每页条数。",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总条数。"
+          }
+        }
+      },
+      "TaskStatus": {
+        "type": "string",
+        "description": "任务状态机十态（M1-FR-028）。",
+        "enum": [
+          "queued",
+          "running",
+          "pausing",
+          "paused",
+          "cancelling",
+          "cancelled",
+          "succeeded",
+          "partial",
+          "failed",
+          "interrupted"
+        ]
+      },
+      "TokenInfo": {
+        "type": "object",
+        "description": "Token 元数据（列表返回，永不含明文或哈希）。",
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "创建时间。"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Token 标识。"
+          },
+          "name": {
+            "type": "string",
+            "description": "Token 名称。"
+          }
+        }
+      },
+      "TokenListResponse": {
+        "type": "object",
+        "description": "Token 列表分页响应。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TokenInfo"
+            },
+            "description": "当前页 Token 元数据。"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "description": "当前页码（从 1 起）。",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每页条数。",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总条数。"
+          }
+        }
+      },
+      "UnsupportedItem": {
+        "type": "object",
+        "description": "不支持项。",
+        "required": [
+          "name",
+          "category",
+          "reason"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "description": "稳定类别（如「非受支持格式」「系统配置」）。"
+          },
+          "name": {
+            "type": "string",
+            "description": "名称或坐标。"
+          },
+          "reason": {
+            "type": "string",
+            "description": "中文说明。"
+          }
+        }
+      },
+      "UpdateRepoRequest": {
+        "type": "object",
+        "description": "编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。",
+        "properties": {
+          "disabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "停用/启用。"
+          },
+          "members": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "group 成员（整体替换，有序）。"
+          },
+          "overwrite_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OverwritePolicy",
+                "description": "覆盖策略。"
+              }
+            ]
+          },
+          "upstream_credential_ref": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游凭据引用名。"
+          },
+          "upstream_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "proxy 上游地址。"
+          },
+          "visibility": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Visibility",
+                "description": "可见性。"
+              }
+            ]
+          }
+        }
+      },
+      "UpdateUserRequest": {
+        "type": "object",
+        "description": "更新用户请求体：字段可选，只更新给出的项。",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "启用状态。"
+          },
+          "role": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Role",
+                "description": "全局角色。"
+              }
+            ]
+          }
+        }
+      },
+      "UsageSnippet": {
+        "type": "object",
+        "description": "使用方式片段。",
+        "required": [
+          "title",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "可复制的配置/命令文本，凭据一律为占位符。"
+          },
+          "title": {
+            "type": "string",
+            "description": "片段标题（如「Maven settings.xml」）。"
+          }
+        }
+      },
+      "UserInfo": {
+        "type": "object",
+        "description": "用户信息。",
+        "required": [
+          "id",
+          "username",
+          "role",
+          "enabled",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "创建时间。"
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "是否启用。"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "用户标识。"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role",
+            "description": "全局角色。"
+          },
+          "username": {
+            "type": "string",
+            "description": "用户名。"
+          }
+        }
+      },
+      "UserListResponse": {
+        "type": "object",
+        "description": "用户列表分页响应。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UserInfo"
+            },
+            "description": "当前页用户。"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "description": "当前页码（从 1 起）。",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每页条数。",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总条数。"
+          }
+        }
+      },
+      "VersionPolicy": {
+        "type": "string",
+        "description": "Maven 版本策略（仅 Maven hosted 有效）。",
+        "enum": [
+          "release",
+          "snapshot",
+          "mixed"
+        ]
+      },
+      "Visibility": {
+        "type": "string",
+        "description": "仓库可见性。",
+        "enum": [
+          "public",
+          "private"
+        ]
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "健康检查与就绪自检"
+    },
+    {
+      "name": "auth",
+      "description": "登录、会话刷新与退出"
+    },
+    {
+      "name": "tokens",
+      "description": "API Token 管理"
+    },
+    {
+      "name": "users",
+      "description": "用户管理（Admin）"
+    },
+    {
+      "name": "repos",
+      "description": "仓库生命周期、ACL、浏览与使用片段"
+    },
+    {
+      "name": "migration",
+      "description": "Nexus 迁移：发现、计划、任务与报告（Admin）"
+    }
+  ]
+}

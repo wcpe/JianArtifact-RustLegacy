@@ -6,25 +6,32 @@ set -euo pipefail
 # 切到仓库根目录（脚本所在目录的上一级），保证相对路径稳定
 cd "$(dirname "$0")/.."
 
-echo "==> [1/7] Rust 格式检查"
+echo "==> [1/8] Rust 格式检查"
 cargo fmt --all -- --check
 
-echo "==> [2/7] Rust 静态分析（警告视为错误）"
+echo "==> [2/8] Rust 静态分析（警告视为错误）"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-echo "==> [3/7] Rust 测试"
+echo "==> [3/8] Rust 测试"
 cargo test --workspace
 
-echo "==> [4/7] 依赖漏洞审计"
+echo "==> [4/8] 契约快照新鲜度（devmock 消费的 OpenAPI 与代码一致）"
+cargo run -q --bin jianartifact -- openapi > /tmp/openapi-current.json
+if ! diff -q /tmp/openapi-current.json packages/devmock/openapi.json > /dev/null 2>&1; then
+    echo "错误：契约快照 packages/devmock/openapi.json 已过期，请运行 make openapi 重新生成并提交" >&2
+    exit 1
+fi
+
+echo "==> [5/8] 依赖漏洞审计"
 cargo audit
 
-echo "==> [5/7] 依赖许可证检查"
+echo "==> [6/8] 依赖许可证检查"
 cargo deny check licenses
 
-echo "==> [6/7] 部署脚本逻辑测试"
+echo "==> [7/8] 部署脚本逻辑测试"
 bash scripts/deploy/test-remote-install.sh
 
-echo "==> [7/7] 前端质量门"
+echo "==> [8/8] 前端质量门"
 # 前端子工程清单（apps/server 是 Rust crate，不参与前端门禁判定）
 frontend_src=""
 for dir in apps/web apps/wiki packages/ui packages/devmock packages/eslint-config packages/typescript-config; do

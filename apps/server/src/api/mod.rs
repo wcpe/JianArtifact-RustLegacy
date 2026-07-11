@@ -1,6 +1,8 @@
 //! 管理 API 路由装配与 OpenAPI 文档（ADR-0012：utoipa 生成的 OpenAPI 是契约唯一真源）。
 
 pub mod auth;
+pub mod migration;
+pub mod repos;
 pub mod tokens;
 pub mod users;
 
@@ -31,12 +33,35 @@ use crate::state::AppState;
         users::list,
         users::create,
         users::update,
+        repos::list,
+        repos::create,
+        repos::detail,
+        repos::update,
+        repos::delete,
+        repos::acl_list,
+        repos::acl_set,
+        repos::acl_remove,
+        repos::files,
+        repos::search,
+        repos::usage,
+        migration::discover,
+        migration::plan,
+        migration::create_task,
+        migration::list_tasks,
+        migration::task_detail,
+        migration::pause_task,
+        migration::resume_task,
+        migration::cancel_task,
+        migration::retry_task,
+        migration::task_report,
     ),
     tags(
         (name = "health", description = "健康检查与就绪自检"),
         (name = "auth", description = "登录、会话刷新与退出"),
         (name = "tokens", description = "API Token 管理"),
         (name = "users", description = "用户管理（Admin）"),
+        (name = "repos", description = "仓库生命周期、ACL、浏览与使用片段"),
+        (name = "migration", description = "Nexus 迁移：发现、计划、任务与报告（Admin）"),
     ),
 )]
 pub struct ApiDoc;
@@ -59,6 +84,48 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tokens/{id}", delete(tokens::revoke))
         .route("/api/v1/users", get(users::list).post(users::create))
         .route("/api/v1/users/{id}", patch(users::update))
+        .route("/api/v1/repos", get(repos::list).post(repos::create))
+        .route(
+            "/api/v1/repos/{name}",
+            get(repos::detail)
+                .patch(repos::update)
+                .delete(repos::delete),
+        )
+        .route("/api/v1/repos/{name}/acl", get(repos::acl_list))
+        .route(
+            "/api/v1/repos/{name}/acl/{user_id}",
+            axum::routing::put(repos::acl_set).delete(repos::acl_remove),
+        )
+        .route("/api/v1/repos/{name}/files", get(repos::files))
+        .route("/api/v1/repos/{name}/search", get(repos::search))
+        .route("/api/v1/repos/{name}/usage", get(repos::usage))
+        .route("/api/v1/migration/discover", post(migration::discover))
+        .route("/api/v1/migration/plan", post(migration::plan))
+        .route(
+            "/api/v1/migration/tasks",
+            get(migration::list_tasks).post(migration::create_task),
+        )
+        .route("/api/v1/migration/tasks/{id}", get(migration::task_detail))
+        .route(
+            "/api/v1/migration/tasks/{id}/pause",
+            post(migration::pause_task),
+        )
+        .route(
+            "/api/v1/migration/tasks/{id}/resume",
+            post(migration::resume_task),
+        )
+        .route(
+            "/api/v1/migration/tasks/{id}/cancel",
+            post(migration::cancel_task),
+        )
+        .route(
+            "/api/v1/migration/tasks/{id}/retry",
+            post(migration::retry_task),
+        )
+        .route(
+            "/api/v1/migration/tasks/{id}/report",
+            get(migration::task_report),
+        )
         // 请求标识：入站缺失则生成 UUID，并在响应头回传，便于日志关联
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

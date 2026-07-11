@@ -1,3 +1,5 @@
 # Prettier 检查范围排除：构建产物与第三方生成文件
 dist/
 packages/devmock/public/
+# OpenAPI 契约快照为生成物（make openapi），格式由生成器决定
+packages/devmock/openapi.json

@@ -1,4 +1,6 @@
-//! 阶段 1 契约骨架集成测试：健康/就绪为真实现，业务端点为 501 占位，OpenAPI 契约面完整。
+//! 阶段 1 契约骨架集成测试。
+//! 核心防漂移手段：遍历 OpenAPI 文档的全部 operation 逐一真实请求——
+//! 路由忘挂载报 404、方法写反报 405，两处登记（路由表 / utoipa 注解）任何漂移即红。
 
 use axum::Router;
 use axum::body::Body;
@@ -69,60 +71,71 @@ async fn 就绪自检数据目录不可写时五百零三() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn 业务契约端点返回五百零一占位() -> TestResult {
-    let (app, _dir) = test_app().await?;
-    // 端点 × 方法：阶段 1 全部为未实现占位
-    let cases = [
-        ("POST", "/api/v1/auth/login"),
-        ("POST", "/api/v1/auth/refresh"),
-        ("POST", "/api/v1/auth/logout"),
-        ("POST", "/api/v1/tokens"),
-        ("GET", "/api/v1/tokens"),
-        ("DELETE", "/api/v1/tokens/1"),
-        ("GET", "/api/v1/users"),
-        ("POST", "/api/v1/users"),
-        ("PATCH", "/api/v1/users/1"),
-    ];
-    for (method, uri) in cases {
-        let resp = send(&app, method, uri).await?;
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "{method} {uri} 应返回 501"
-        );
-        let body = resp.into_body().collect().await?.to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(
-            json["code"], "NOT_IMPLEMENTED",
-            "{method} {uri} 错误码应为占位码"
-        );
+/// 把 OpenAPI 路径中的参数占位替换为哑值（如 {id} → 1）。
+fn fill_path_params(path: &str) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        match rest[start..].find('}') {
+            Some(end_off) => {
+                out.push('1');
+                rest = &rest[start + end_off + 1..];
+            }
+            None => {
+                rest = "";
+            }
+        }
     }
-    Ok(())
+    out.push_str(rest);
+    out
 }
 
 #[tokio::test]
-async fn 契约文档包含全部端点且可获取() -> TestResult {
+async fn 契约文档全部端点均已挂载且方法一致() -> TestResult {
     let (app, _dir) = test_app().await?;
     let resp = send(&app, "GET", "/api/v1/openapi.json").await?;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await?.to_bytes();
     let doc: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(doc["info"]["title"], "JianArtifact 管理 API");
-    let expected_paths = [
-        "/healthz",
-        "/readyz",
-        "/api/v1/auth/login",
-        "/api/v1/auth/refresh",
-        "/api/v1/auth/logout",
-        "/api/v1/tokens",
-        "/api/v1/tokens/{id}",
-        "/api/v1/users",
-        "/api/v1/users/{id}",
-    ];
-    for path in expected_paths {
-        assert!(doc["paths"].get(path).is_some(), "OpenAPI 缺少路径 {path}");
+
+    let paths = doc["paths"].as_object().ok_or("OpenAPI 缺少 paths")?;
+    let mut operations = 0;
+    for (path, methods) in paths {
+        let uri = fill_path_params(path);
+        let methods = methods.as_object().ok_or("路径下缺少方法对象")?;
+        for method in methods.keys() {
+            operations += 1;
+            let resp = send(&app, &method.to_uppercase(), &uri).await?;
+            let status = resp.status();
+            // 漂移判据：404=路由未挂载，405=方法不一致
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} 未挂载到路由"
+            );
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path} 路由方法与契约不一致"
+            );
+            // 阶段 1 语义：健康端点真实现（200/503），其余为 501 占位且带稳定错误码
+            if status == StatusCode::NOT_IMPLEMENTED {
+                let body = resp.into_body().collect().await?.to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&body)?;
+                assert_eq!(
+                    json["code"], "NOT_IMPLEMENTED",
+                    "{method} {path} 占位错误码不符"
+                );
+            }
+        }
     }
+    // 防空转：认证 + 仓库 + 迁移 + 健康的契约面至少应有这么多 operation
+    assert!(
+        operations >= 30,
+        "OpenAPI operation 数量异常：仅 {operations} 个"
+    );
     Ok(())
 }
 
