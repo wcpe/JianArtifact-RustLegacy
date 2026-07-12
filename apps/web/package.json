@@ -7,6 +7,10 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
+    "predev": "msw init public",
+    "dev": "vite",
+    "pretest:e2e": "msw init public",
+    "test:e2e": "playwright test",
     "build": "vite build"
   },
   "dependencies": {
@@ -19,6 +23,7 @@
   "devDependencies": {
     "@jianartifact/devmock": "workspace:*",
     "@jianartifact/eslint-config": "workspace:*",
+    "@playwright/test": "1.49.1",
     "@jianartifact/typescript-config": "workspace:*",
     "@tailwindcss/vite": "^4.0.0",
     "@testing-library/dom": "^10.0.0",
@@ -29,6 +34,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "eslint": "^9.0.0",
     "jsdom": "^26.0.0",
+    "msw": "^2.0.0",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.8.0",
     "vite": "^7.0.0",

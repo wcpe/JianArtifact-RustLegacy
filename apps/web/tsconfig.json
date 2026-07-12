@@ -1,4 +1,4 @@
 {
   "extends": "@jianartifact/typescript-config/vite-react.json",
-  "include": ["src"]
+  "include": ["src", "e2e", "playwright.config.ts"]
 }

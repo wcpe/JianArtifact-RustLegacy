@@ -67,7 +67,7 @@
 ## 4. 任务拆分
 
 - [x] 阶段 1：本域契约骨架与模型（2026-07-13：repos CRUD/删除双模式与确认头/ACL/浏览/搜索/usage 共 11 个 operation 501 占位；healthz/readyz 已随 auth 域基座真实现）
-- [ ] 阶段 2：devmock 仓库场景（默认数据/空实例/权限受限/大仓库分页）+ 仓库列表、详情与文件浏览页对 mock
+- [x] 阶段 2：devmock 仓库场景（默认数据/空实例/权限受限/大仓库分页）+ 仓库列表、详情与文件浏览页对 mock（2026-07-13：DataTable 分页列表 + 新建仓库 Dialog + 详情 Tabs 文件下钻/使用片段，404 零泄露空态）
 - [ ] 阶段 3：授权纯函数 + 穷举矩阵测试（先行）→ 仓库生命周期 → BlobStore 与提交守卫 → hosted 通用机理 → proxy 单飞与错误分类 → 浏览/usage → readyz
 - [ ] 阶段 3：高风险区测试全绿（见 §5）；触发 FR-043 真机补验
 - [ ] 文档同步：PRD 状态、ARCHITECTURE §3 数据模型落定、API.md（新增跨端点约定时）、CHANGELOG
