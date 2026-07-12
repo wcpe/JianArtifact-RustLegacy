@@ -4,12 +4,13 @@
 # recipe 全部写成单条命令，保证在 cmd 与 sh 两种宿主 shell 下行为一致。
 
 .DEFAULT_GOAL := help
-.PHONY: help check release deploy rollback clean openapi
+.PHONY: help check e2e release deploy rollback clean openapi
 
 # 列出可用目标
 help:
 	@echo JianArtifact 构建入口
 	@echo   make check     质量门：格式、静态分析、测试（与 CI 同脚本，容器内）
+	@echo   make e2e       前端真实浏览器 E2E（Playwright，容器内）
 	@echo   make openapi   重新生成管理 API 契约快照 packages/devmock/openapi.json（容器内）
 	@echo   make release   发布构建：产出 Linux x86_64 tar 包到 dist/（容器内）
 	@echo   make deploy    部署到 .env 配置的目标机（自动依赖 release，rootless）
@@ -27,6 +28,11 @@ check:
 # 发布构建与打包
 release:
 	docker compose run --rm dev bash scripts/build-release.sh
+
+# 前端真实浏览器 E2E（Playwright 驱动 vite dev + devmock）。
+# make check 的第 9 步已包含 E2E；此目标供只跑 E2E 的快速迭代使用
+e2e:
+	docker compose run --rm dev bash -c "pnpm install --frozen-lockfile && pnpm --filter @jianartifact/web run test:e2e"
 
 # 部署：自动依赖 release，防止复用陈旧发布包
 deploy: release
