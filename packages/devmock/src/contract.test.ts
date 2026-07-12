@@ -1,6 +1,6 @@
-// devmock 契约比对（ADR-0012）：handlers 必须与 OpenAPI 契约快照一致，防手工漂移。
-// 阶段 1 硬断言「无幻影端点」（devmock 不得模拟契约中不存在的端点）；
-// 「全量覆盖」断言随阶段 2 场景包落地启用（见 docs/specs/m1-frontend-foundation.md FR-035）。
+// devmock 契约双向比对（ADR-0012）：handlers 与 OpenAPI 契约端点集必须完全一致。
+// 断言 A（无幻影）：每个业务 handler 都存在于契约；
+// 断言 B（全量覆盖）：契约每个 operation 都有 handler，缺失即失败并列出缺失项。
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,31 +15,35 @@ interface OpenApiDoc {
 const here = dirname(fileURLToPath(import.meta.url));
 const doc = JSON.parse(readFileSync(join(here, '..', 'openapi.json'), 'utf-8')) as OpenApiDoc;
 
-// 契约中的 (method, path) 集合
+// 归一化：OpenAPI 的 {param} 与 msw 的 :param 统一为 :param 形式
+function normalizePath(path: string): string {
+  return path.replace(/\{([^}]+)\}/g, ':$1');
+}
+
+// 契约中的 (method, path) 集合（归一化后）
 const contractOps = new Set<string>();
 for (const [path, methods] of Object.entries(doc.paths)) {
   for (const method of Object.keys(methods)) {
-    contractOps.add(`${method.toUpperCase()} ${path}`);
+    contractOps.add(`${method.toUpperCase()} ${normalizePath(path)}`);
   }
 }
 
-// devmock 业务 handler 的 (method, path) 集合；/__devmock/* 是自身探测端点，不属业务契约
-const handlerOps = handlers
-  .map((h) => ({ method: h.info.method.toString().toUpperCase(), path: String(h.info.path) }))
-  .filter((op) => !op.path.includes('/__devmock/'))
-  .map((op) => `${op.method} ${op.path.replace(/^\*/, '')}`);
+// devmock 业务 handler 的 (method, path) 集合；/__devmock/* 是 mock 基础设施端点，不属业务契约
+const handlerOps = new Set(
+  handlers
+    .map((h) => ({ method: h.info.method.toString().toUpperCase(), path: String(h.info.path) }))
+    .filter((op) => !op.path.includes('/__devmock/'))
+    .map((op) => `${op.method} ${op.path.replace(/^\*/, '')}`),
+);
 
-describe('devmock 契约比对', () => {
+describe('devmock 契约双向比对', () => {
   it('业务 handler 不得模拟契约外端点（无幻影端点）', () => {
-    for (const op of handlerOps) {
-      expect(contractOps.has(op), `handler ${op} 不存在于 OpenAPI 契约`).toBe(true);
-    }
+    const phantom = [...handlerOps].filter((op) => !contractOps.has(op));
+    expect(phantom, `以下 handler 不存在于 OpenAPI 契约：${phantom.join('、')}`).toEqual([]);
   });
 
-  it('输出契约覆盖率（全量覆盖断言随阶段 2 场景包启用）', () => {
-    const covered = handlerOps.filter((op) => contractOps.has(op)).length;
-    // 覆盖进度仅报告，不作为本阶段断言
-    console.log(`devmock 契约覆盖：${covered}/${contractOps.size} 个 operation`);
-    expect(contractOps.size).toBeGreaterThan(0);
+  it('契约每个 operation 都必须有 handler（全量覆盖）', () => {
+    const missing = [...contractOps].filter((op) => !handlerOps.has(op));
+    expect(missing, `以下契约 operation 缺少 handler：${missing.join('、')}`).toEqual([]);
   });
 });

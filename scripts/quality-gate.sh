@@ -41,6 +41,14 @@ for dir in apps/web apps/wiki packages/ui packages/devmock packages/eslint-confi
 done
 if [ -f pnpm-lock.yaml ]; then
     pnpm install --frozen-lockfile
+    # 契约类型生成物新鲜度（依赖 openapi-typescript，须在 install 之后校验）
+    if [ -f packages/devmock/src/schema.d.ts ]; then
+        pnpm --filter @jianartifact/devmock exec openapi-typescript openapi.json -o /tmp/schema-current.d.ts > /dev/null 2>&1
+        if ! diff -q /tmp/schema-current.d.ts packages/devmock/src/schema.d.ts > /dev/null 2>&1; then
+            echo "错误：契约类型 packages/devmock/src/schema.d.ts 已过期，请运行 make openapi 重新生成并提交" >&2
+            exit 1
+        fi
+    fi
     pnpm run format:check
     pnpm turbo typecheck lint test build
 elif [ -n "$frontend_src" ]; then

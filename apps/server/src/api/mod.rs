@@ -55,6 +55,8 @@ use crate::state::AppState;
         migration::retry_task,
         migration::task_report,
     ),
+    // 仅被参数引用的 schema 不会被自动收集，须显式注册，否则契约文档出现悬空 $ref
+    components(schemas(repos::DeleteMode)),
     tags(
         (name = "health", description = "健康检查与就绪自检"),
         (name = "auth", description = "登录、会话刷新与退出"),

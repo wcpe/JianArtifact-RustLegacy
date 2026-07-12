@@ -16,9 +16,9 @@ help:
 	@echo   make rollback  目标机回滚到上一发布
 	@echo   make clean     清空发布输出目录 dist/
 
-# 重新生成契约快照（devmock 与前端类型生成的消费入口，质量门校验其新鲜度）
+# 重新生成契约快照与 TypeScript 类型（devmock 与前端的消费入口，质量门校验其新鲜度）
 openapi:
-	docker compose run --rm dev bash -c "cargo run -q --bin jianartifact -- openapi > packages/devmock/openapi.json"
+	docker compose run --rm dev bash -c "cargo run -q --bin jianartifact -- openapi > packages/devmock/openapi.json && pnpm --filter @jianartifact/devmock run generate:schema"
 
 # 质量门：与 scripts/check.sh 及 CI 完全同源
 check:

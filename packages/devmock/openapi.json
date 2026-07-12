@@ -1672,6 +1672,14 @@
           }
         }
       },
+      "DeleteMode": {
+        "type": "string",
+        "description": "删除模式（高风险动作，必须显式给出）。",
+        "enum": [
+          "config",
+          "data"
+        ]
+      },
       "DeleteRepoResponse": {
         "type": "object",
         "description": "删除结果。",
