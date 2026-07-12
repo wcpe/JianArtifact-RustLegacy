@@ -61,6 +61,7 @@
 - turbo 输出证明四个应用工程的四类任务**真实运行而非空转**（每工程至少各 1 个真实测试用例）。
 - 红→绿证据（各引入一处违规、门变红、移除转绿）：TS 违规（未用变量触 `noUnusedLocals`）、ESLint 违规（触严格集规则）、Prettier 格式违规。
 - `packages/ui` 至少一个 shadcn 基础组件源码归入并被 wiki 预览页真实渲染（容器内 build 通过 + wiki 构建产物包含该页）。
+- FR-036（2026-07-13）：ui 四层组件落地——基础层 12 个 shadcn 组件（导入改相对路径）、复合层 StatusBadge/Pagination/DataTable（TanStack Table）、状态层 EmptyState/ErrorState/LoadingState+TableSkeleton/ForbiddenState、布局层 AppShell/PageHeader；wiki 重写为 21 组件 × 状态矩阵（正常/加载/空/错误/无权限/超长文本/大数据量）+ 组件索引与覆盖表；ui 34 测试 + wiki 4 测试全绿；测试基础设施补 testing-library cleanup（修跨用例 DOM 累积）。
 - devmock Node 端可启动并响应探测请求（骨架级）；浏览器 worker 文件随构建产出。
 - 宿主目录零 node_modules 内容（命名卷空挂载点豁免）；前端构建产物只落容器卷或被忽略目录。
 

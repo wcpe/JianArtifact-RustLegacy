@@ -20,7 +20,15 @@ export default defineConfig({
       fileName: 'index',
     },
     rollupOptions: {
-      external: [/^react/, 'radix-ui', 'class-variance-authority', 'clsx', 'tailwind-merge'],
+      external: [
+        /^react/,
+        'radix-ui',
+        'class-variance-authority',
+        'clsx',
+        'tailwind-merge',
+        '@tanstack/react-table',
+        'lucide-react',
+      ],
     },
   },
   test: {
