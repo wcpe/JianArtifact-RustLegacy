@@ -5,6 +5,9 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./browser": "./src/browser.ts",
+    "./node": "./src/node.ts",
+    "./scenarios": "./src/scenarios.ts",
     "./schema": "./src/schema.d.ts"
   },
   "scripts": {

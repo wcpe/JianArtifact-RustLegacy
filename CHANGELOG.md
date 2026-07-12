@@ -16,5 +16,6 @@
 - 仓库域与迁移域契约骨架：仓库 CRUD（删除双模式 + 确认头）、ACL、浏览/搜索/使用片段；迁移三类来源、发现、计划与冲突、十态任务生命周期、分仓报告——管理 API 六域契约面齐备（32 个 operation）；契约快照 `packages/devmock/openapi.json` 新鲜度校验与 devmock 无幻影端点比对测试纳入质量门（make openapi 重新生成）。
 - devmock 七类场景包与有状态内存模型（M1-FR-035）：认证/Token/用户/仓库/浏览/迁移全语义、契约双向硬断言（无幻影 + 全量覆盖）；openapi-typescript 契约类型生成接线。
 - 共享组件库四层（M1-FR-036）：基础（shadcn 源码 12 组件）、复合（StatusBadge/Pagination/DataTable 基于 TanStack Table）、状态（Empty/Error/Loading/Forbidden）、布局（AppShell/PageHeader）；wiki 重写为组件 × 状态矩阵验收站。
+- 管理端六组页面对 devmock 开发（M1-FR-034 向导 UI 等）：登录/仪表盘/仓库列表与详情（文件浏览+使用方式）/API Token（明文一次性展示）/用户管理/迁移向导（源配置→发现→计划→执行→进度轮询→报告，task_id 落 localStorage 刷新可找回）；三层守卫路由 + 会话上下文 + 契约类型 API client；mock 开关经构建期常量守卫实现生产产物零 mock 代码零测试凭据（产物 grep 为证）。
 
 > 发版时把"未发布版本"段切成 `## [X.Y.Z] - YYYY-MM-DD`，再新建空的"未发布版本"段。

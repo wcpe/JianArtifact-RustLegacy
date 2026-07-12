@@ -11,10 +11,13 @@
   },
   "dependencies": {
     "@jianartifact/ui": "workspace:*",
+    "lucide-react": "^0.400.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.0.0"
   },
   "devDependencies": {
+    "@jianartifact/devmock": "workspace:*",
     "@jianartifact/eslint-config": "workspace:*",
     "@jianartifact/typescript-config": "workspace:*",
     "@tailwindcss/vite": "^4.0.0",
