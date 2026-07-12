@@ -10,7 +10,6 @@ import {
   CardContent,
   CardDescription,
   CardHeader,
-  CardTitle,
   Input,
   Label,
 } from '@jianartifact/ui';
@@ -53,7 +52,8 @@ export function LoginPage() {
     <div className="flex min-h-svh items-center justify-center bg-background p-6">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle>登录 JianArtifact</CardTitle>
+          {/* 登录页主标题用语义 h1（无障碍：页面唯一一级标题），保留卡片标题样式 */}
+          <h1 className="leading-none font-semibold">登录 JianArtifact</h1>
           <CardDescription>请输入用户名与口令以进入管理端</CardDescription>
         </CardHeader>
         <CardContent>

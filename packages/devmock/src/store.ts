@@ -242,7 +242,8 @@ function validateSource(source: MigrationSource): StoreFailure | null {
 function sampleDiscoveredRepos(): DiscoveredRepo[] {
   return [
     {
-      name: 'maven-releases',
+      // 源 Nexus 仓库名，刻意与目标实例既有仓库不撞名（迁移是搬入新仓库，默认无冲突）
+      name: 'maven-legacy',
       format: 'maven',
       repo_type: 'hosted',
       has_credential_ref: false,
@@ -344,8 +345,54 @@ export class DevmockStore {
   private readonly plans = new Map<string, MigrationPlan>();
   private seq = 0;
 
+  // 迁移任务持久化键：模拟后端对任务的持久化（FR-029），使「刷新找回」跨页面重载成立。
+  private static readonly TASKS_KEY = 'jianartifact.devmock.tasks';
+
   constructor(scenario: ScenarioId) {
     this.resetTo(scenario);
+    // 页面重载后 rehydrate 已持久化的运行时任务（scenario 种子任务不受影响，按 id 去重）
+    this.rehydrateTasks();
+  }
+
+  /** 浏览器环境才有 localStorage；node 测试环境跳过持久化（用例不涉及重载）。 */
+  private static hasStorage(): boolean {
+    return typeof localStorage !== 'undefined' && localStorage !== null;
+  }
+
+  /** 把当前任务列表写入 localStorage，模拟后端持久化。 */
+  private persistTasks(): void {
+    if (!DevmockStore.hasStorage()) return;
+    try {
+      localStorage.setItem(DevmockStore.TASKS_KEY, JSON.stringify(this.tasks));
+    } catch {
+      // 存储不可用（隐私模式/配额）时静默降级，不影响交互
+    }
+  }
+
+  /** 从 localStorage 追加已持久化的任务（按 task_id 去重，种子任务优先保留）。 */
+  private rehydrateTasks(): void {
+    if (!DevmockStore.hasStorage()) return;
+    try {
+      const raw = localStorage.getItem(DevmockStore.TASKS_KEY);
+      if (!raw) return;
+      const persisted = JSON.parse(raw) as SeedTask[];
+      const known = new Set(this.tasks.map((t) => t.info.task_id));
+      for (const task of persisted) {
+        if (!known.has(task.info.task_id)) this.tasks.push(task);
+      }
+    } catch {
+      // 持久化内容损坏时忽略，回到纯种子状态
+    }
+  }
+
+  /** 清除持久化任务：显式切换场景视为全新后端。 */
+  clearPersistedTasks(): void {
+    if (!DevmockStore.hasStorage()) return;
+    try {
+      localStorage.removeItem(DevmockStore.TASKS_KEY);
+    } catch {
+      // 忽略清除失败
+    }
   }
 
   /** 当前场景标识。 */
@@ -783,6 +830,7 @@ export class DevmockStore {
       updated_at: now(),
     };
     this.tasks.push({ info, report: null });
+    this.persistTasks();
     return ok(info);
   }
 
@@ -801,6 +849,7 @@ export class DevmockStore {
     const task = this.tasks.find((t) => t.info.task_id === id);
     if (!task) return notFound('任务不存在');
     advanceProgress(task.info);
+    this.persistTasks();
     return ok(task.info);
   }
 
@@ -816,6 +865,7 @@ export class DevmockStore {
     }
     task.info.status = rule.to;
     task.info.updated_at = now();
+    this.persistTasks();
     return ok(task.info);
   }
 
@@ -834,7 +884,8 @@ export function createStore(id: ScenarioId): DevmockStore {
   return new DevmockStore(id);
 }
 
-/** 切换场景：把持有的 store 原地重建为目标场景种子（模块级引用保持不变）。 */
+/** 切换场景：清除持久化任务（视为全新后端）并原地重建为目标场景种子（模块级引用保持不变）。 */
 export function switchScenario(store: DevmockStore, id: ScenarioId): void {
+  store.clearPersistedTasks();
   store.resetTo(id);
 }

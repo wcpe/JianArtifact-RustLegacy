@@ -17,5 +17,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # 通过 corepack 固定 pnpm 9（与根 package.json 的 packageManager 字段一致）
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
+# Playwright 浏览器与系统依赖：真实浏览器 E2E 在容器内执行（版本须与 @playwright/test 一致）
+RUN npx --yes playwright@1.49.1 install --with-deps chromium
+
+# Playwright 浏览器固定安装路径：避免运行时受宿主透传的 HOME 影响而找不到浏览器
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+# Playwright chromium 与系统依赖（版本与 apps/web 的 @playwright/test 保持一致，升级须两处同步）
+RUN npx -y playwright@1.49.1 install --with-deps chromium && rm -rf /var/lib/apt/lists/*
+
 # 统一工作目录：docker-compose 将项目根挂载到此处
 WORKDIR /workspace

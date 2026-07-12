@@ -17,6 +17,7 @@
 - devmock 七类场景包与有状态内存模型（M1-FR-035）：认证/Token/用户/仓库/浏览/迁移全语义、契约双向硬断言（无幻影 + 全量覆盖）；openapi-typescript 契约类型生成接线。
 - 共享组件库四层（M1-FR-036）：基础（shadcn 源码 12 组件）、复合（StatusBadge/Pagination/DataTable 基于 TanStack Table）、状态（Empty/Error/Loading/Forbidden）、布局（AppShell/PageHeader）；wiki 重写为组件 × 状态矩阵验收站。
 - 管理端六组页面对 devmock 开发：登录/仪表盘/仓库列表与详情（文件下钻、使用片段）/API Token（一次性明文）/用户管理/迁移向导（源配置→发现→计划→执行→轮询进度→报告，task_id 持久化刷新可找回，M1-FR-034 向导 UI）；三层守卫路由 + 统一 API client；VITE_MOCK 构建期常量守卫保证生产产物零 mock 与测试凭据。
+- Playwright 真实浏览器 E2E（9 用例，容器内 chromium）：登录鉴权、建仓、Token 一次性明文、用户管理、迁移向导五步与刷新找回，跑在 devmock 模式下并纳入质量门第 9 步（ROADMAP 阶段 2 收口）。
 - 管理端六组页面对 devmock 开发（M1-FR-034 向导 UI 等）：登录/仪表盘/仓库列表与详情（文件浏览+使用方式）/API Token（明文一次性展示）/用户管理/迁移向导（源配置→发现→计划→执行→进度轮询→报告，task_id 落 localStorage 刷新可找回）；三层守卫路由 + 会话上下文 + 契约类型 API client；mock 开关经构建期常量守卫实现生产产物零 mock 代码零测试凭据（产物 grep 为证）。
 
 > 发版时把"未发布版本"段切成 `## [X.Y.Z] - YYYY-MM-DD`，再新建空的"未发布版本"段。

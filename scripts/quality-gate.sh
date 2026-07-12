@@ -31,7 +31,7 @@ cargo deny check licenses
 echo "==> [7/8] 部署脚本逻辑测试"
 bash scripts/deploy/test-remote-install.sh
 
-echo "==> [8/8] 前端质量门"
+echo "==> [8/9] 前端质量门"
 # 前端子工程清单（apps/server 是 Rust crate，不参与前端门禁判定）
 frontend_src=""
 for dir in apps/web apps/wiki packages/ui packages/devmock packages/eslint-config packages/typescript-config; do
@@ -51,12 +51,19 @@ if [ -f pnpm-lock.yaml ]; then
     fi
     pnpm run format:check
     pnpm turbo typecheck lint test build
+
+    echo "==> [9/9] 浏览器 E2E（真实 chromium 驱动 web 对 devmock）"
+    if [ -d apps/web/e2e ]; then
+        pnpm --filter @jianartifact/web run test:e2e
+    else
+        echo "web E2E 尚未落地，跳过"
+    fi
 elif [ -n "$frontend_src" ]; then
     # 防静默漏检：已有前端源码却缺锁文件时必须失败，不得绿灯放行
     echo "错误：检测到前端源码但缺少 pnpm-lock.yaml，前端门禁无法执行" >&2
     exit 1
 else
-    echo "前端子工程尚未落地，跳过前端门禁"
+    echo "前端子工程尚未落地，跳过前端门禁与 E2E"
 fi
 
 echo "质量门全部通过"

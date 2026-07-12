@@ -35,8 +35,14 @@ Thumbs.db
 .env.*
 !.env.example
 
-# MSW 浏览器 worker（构建期由 msw init 生成，第三方生成文件不入库）
+# MSW 浏览器 worker（由 msw init 生成，第三方生成文件不入库）
 packages/devmock/public/
+apps/web/public/
+
+# Playwright E2E 运行产物
+test-results/
+playwright-report/
+.last-run.json
 
 # 本地数据：SQLite 元数据库与 blob 数据目录
 *.db

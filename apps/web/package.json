@@ -7,9 +7,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
-    "predev": "msw init public",
+    "predev": "rm -rf public && msw init public --no-save",
     "dev": "vite",
-    "pretest:e2e": "msw init public",
+    "pretest:e2e": "rm -rf public && msw init public --no-save",
     "test:e2e": "playwright test",
     "build": "vite build"
   },

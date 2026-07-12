@@ -37,7 +37,8 @@ export function ReportStep({ taskId, onRestart }: { taskId: string; onRestart: (
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3">
-        <span className="text-sm text-muted-foreground">最终状态</span>
+        {/* 报告步顶层标题用语义 h2（向导内的区段标题） */}
+        <h2 className="text-lg font-semibold">迁移报告</h2>
         <StatusBadge kind="task-status" value={report.status} />
       </div>
 
