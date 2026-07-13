@@ -38,6 +38,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 修改本人口令：旧口令验证通过后生效，旧口令立即失效。 */
+        post: operations["change_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/refresh": {
         parameters: {
             query?: never;
@@ -452,11 +469,13 @@ export interface components {
             /** @description 用户名。 */
             username: string;
         };
-        /**
-         * @description 仓库配置的来源（native-dir 源使用）。
-         * @enum {string}
-         */
-        ConfigSource: "rest" | "manual";
+        /** @description 修改本人口令请求体（M1-FR-045）。新旧口令均不落日志与响应。 */
+        ChangePasswordRequest: {
+            /** @description 新口令。 */
+            new_password: string;
+            /** @description 当前口令（校验通过才允许修改）。 */
+            old_password: string;
+        };
         /** @description 创建仓库请求体。 */
         CreateRepoRequest: {
             /** @description 制品格式（创建后不可变）。 */
@@ -582,12 +601,20 @@ export interface components {
         };
         /** @description 浏览条目（目录或文件）。 */
         FileEntry: {
+            /** @description 内容类型（文件）。 */
+            content_type?: string | null;
             /** @description 是否目录。 */
             is_dir: boolean;
+            /** @description md5 校验和（文件，Maven 生态）。 */
+            md5?: string | null;
             /** @description 条目名。 */
             name: string;
+            /** @description sha1 校验和（文件，Maven 生态）。 */
+            sha1?: string | null;
             /** @description sha256 校验和（文件）。 */
             sha256?: string | null;
+            /** @description sha512 校验和（文件，npm integrity）。 */
+            sha512?: string | null;
             /**
              * Format: int64
              * @description 文件大小（字节，目录为空）。
@@ -678,17 +705,21 @@ export interface components {
             /** @description 不支持/未迁移项。 */
             unsupported: components["schemas"]["UnsupportedItem"][];
         };
-        /** @description 迁移源配置（发现请求体）。凭据一律为运行时引用名，绝不接受明文。 */
+        /**
+         * @description 迁移源配置（发现请求体）。Nexus 账号口令仅用于传输与内存中的在线拉取，
+         *     绝不落库、不进日志、不进任务参数快照与报告（持久化只存安全运行时引用）。
+         */
         MigrationSource: {
-            config_source?: null | components["schemas"]["ConfigSource"];
-            /** @description Nexus 凭据引用名（运行时从环境取值，不落库不进日志）。 */
-            credential_ref?: string | null;
             /** @description 来源类别。 */
             kind: components["schemas"]["SourceKind"];
+            /** @description Nexus 口令（明文仅传输与内存使用，不落库不进日志）。 */
+            password?: string | null;
             /** @description 服务器上的路径（native-dir：Nexus 数据目录；package：包路径）；须落在 migration-workdir 白名单根内。 */
             path?: string | null;
-            /** @description Nexus 实例地址（online 或 native-dir + rest 配置源）。 */
+            /** @description Nexus 实例地址。online 必填；native-dir 选填——填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。 */
             url?: string | null;
+            /** @description Nexus 用户名（配合 url 做在线拉取时提供）。 */
+            username?: string | null;
         };
         /**
          * @description 同路径覆盖策略。
@@ -730,9 +761,19 @@ export interface components {
             members?: string[] | null;
             /** @description 仓库名（全局唯一）。 */
             name: string;
+            /**
+             * Format: int64
+             * @description 制品数（仓库内文件总数，列表与详情展示）。
+             */
+            object_count: number;
             overwrite_policy?: null | components["schemas"]["OverwritePolicy"];
             /** @description 仓库类型。 */
             repo_type: components["schemas"]["RepoType"];
+            /**
+             * Format: int64
+             * @description 总大小（仓库内文件字节合计）。
+             */
+            total_bytes: number;
             /** @description proxy 上游凭据引用名（只存引用，不含凭据值）。 */
             upstream_credential_ref?: string | null;
             /** @description proxy 上游地址（proxy 有效）。 */
@@ -765,15 +806,15 @@ export interface components {
         RepoMapping: {
             /** @description 是否排除（显式排除保留在报告中，任务不得全量成功）。 */
             excluded: boolean;
-            /** @description 手动补的 group 成员（config_source=manual 时，有序）。 */
+            /** @description 手动补的 group 成员（源配置未提供 Nexus 地址、配置缺失时，有序）。 */
             manual_members?: string[] | null;
-            /** @description 手动补的 proxy 上游地址（config_source=manual 时）。 */
+            /** @description 手动补的 proxy 上游地址（源配置未提供 Nexus 地址、配置缺失时）。 */
             manual_upstream_url?: string | null;
             /** @description 源仓库名。 */
             source: string;
             /** @description 目标仓库名（缺省同名）。 */
             target?: string | null;
-            /** @description proxy 上游凭据引用名（manual 配置源或补凭据时提供）。 */
+            /** @description proxy 上游凭据引用名（手动补配置或补凭据时提供）。 */
             upstream_credential_ref?: string | null;
         };
         /** @description 单仓库迁移报告。 */
@@ -971,6 +1012,8 @@ export interface components {
         UpdateUserRequest: {
             /** @description 启用状态。 */
             enabled?: boolean | null;
+            /** @description 重置口令为该明文（M1-FR-045，Admin 专属；不进日志与响应，提交后旧口令立即失效）。 */
+            password?: string | null;
             role?: null | components["schemas"]["Role"];
         };
         /** @description 使用方式片段。 */
@@ -1085,6 +1128,37 @@ export interface operations {
                 content?: never;
             };
             /** @description 会话无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    change_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChangePasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description 修改成功，旧口令立即失效 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 未认证或旧口令错误 */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1482,6 +1556,8 @@ export interface operations {
                 page?: number;
                 /** @description 每页条数，最大 200 */
                 page_size?: number;
+                /** @description 按仓库名子串筛选（可选） */
+                q?: string;
             };
             header?: never;
             path?: never;
@@ -1876,6 +1952,8 @@ export interface operations {
                 page?: number;
                 /** @description 每页条数，最大 200 */
                 page_size?: number;
+                /** @description 按 Token 名子串筛选（可选） */
+                q?: string;
             };
             header?: never;
             path?: never;
@@ -1982,6 +2060,8 @@ export interface operations {
                 page?: number;
                 /** @description 每页条数，最大 200 */
                 page_size?: number;
+                /** @description 按用户名子串筛选（可选） */
+                q?: string;
             };
             header?: never;
             path?: never;

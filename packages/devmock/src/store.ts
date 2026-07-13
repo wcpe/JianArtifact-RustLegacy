@@ -50,6 +50,10 @@ export interface SeedFile {
   path: string;
   size: number;
   sha256: string;
+  sha1: string;
+  md5: string;
+  sha512: string;
+  content_type: string;
   updated_at: string;
 }
 
@@ -139,6 +143,13 @@ function paginate<T>(all: T[], page?: number, pageSize?: number): Paged<T> {
   };
 }
 
+/** 名称子串筛选（大小写不敏感）：q 为空或未提供时原样返回全部候选。 */
+function filterByName<T>(items: T[], q: string | undefined, nameOf: (item: T) => string): T[] {
+  if (!q) return items;
+  const needle = q.toLowerCase();
+  return items.filter((item) => nameOf(item).toLowerCase().includes(needle));
+}
+
 /** 当前时间戳（新建实体用）。 */
 function now(): string {
   return new Date().toISOString();
@@ -170,6 +181,10 @@ function listDirectory(files: SeedFile[], dir: string): FileEntry[] {
         is_dir: false,
         size: file.size,
         sha256: file.sha256,
+        sha1: file.sha1,
+        md5: file.md5,
+        sha512: file.sha512,
+        content_type: file.content_type,
         updated_at: file.updated_at,
       });
     } else {
@@ -181,22 +196,36 @@ function listDirectory(files: SeedFile[], dir: string): FileEntry[] {
   return [...dirEntries, ...fileEntries];
 }
 
+/** 仓库对外视图：制品数与总大小由文件列表实时汇总（单一真源），不在种子中维护。 */
+function repoView(record: SeedRepo): RepoInfo {
+  return {
+    ...record.info,
+    object_count: record.files.length,
+    total_bytes: record.files.reduce((sum, file) => sum + file.size, 0),
+  };
+}
+
 /** 按格式生成使用方式片段：凭据一律 <令牌> 占位，不出现任何真实凭据。 */
 function usageSnippets(repo: RepoInfo): UsageSnippet[] {
-  const base = `https://<服务器地址>/repos/${repo.name}`;
+  // 格式协议端点基址（与文件下载、前端安装命令一致，见 docs/API.md §2.1）
+  const base = `https://<服务器地址>/repository/${repo.name}`;
   if (repo.format === 'maven') {
     return [
-      {
-        title: 'Maven settings.xml',
-        content: `<server>\n  <id>${repo.name}</id>\n  <username><用户名></username>\n  <password><令牌></password>\n</server>`,
-      },
       {
         title: 'pom.xml 仓库配置',
         content: `<repository>\n  <id>${repo.name}</id>\n  <url>${base}</url>\n</repository>`,
       },
       {
-        title: 'mvn 部署命令',
-        content: `mvn deploy -DaltDeploymentRepository=${repo.name}::${base}`,
+        title: 'settings.xml 凭据',
+        content: `<server>\n  <id>${repo.name}</id>\n  <username><用户名></username>\n  <password><令牌></password>\n</server>`,
+      },
+      {
+        title: 'build.gradle（Groovy DSL）',
+        content: `maven {\n  url '${base}'\n  credentials {\n    username '<用户名>'\n    password '<令牌>'\n  }\n}`,
+      },
+      {
+        title: 'build.gradle.kts（Kotlin DSL）',
+        content: `maven {\n  url = uri("${base}")\n  credentials {\n    username = "<用户名>"\n    password = "<令牌>"\n  }\n}`,
       },
     ];
   }
@@ -204,7 +233,11 @@ function usageSnippets(repo: RepoInfo): UsageSnippet[] {
     return [
       {
         title: '.npmrc 配置',
-        content: `registry=${base}/\n//<服务器地址>/repos/${repo.name}/:_authToken=<令牌>`,
+        content: `registry=${base}/\n//<服务器地址>/repository/${repo.name}/:_authToken=<令牌>`,
+      },
+      {
+        title: '.yarnrc.yml 配置',
+        content: `npmRegistryServer: "${base}"\nnpmAuthToken: "<令牌>"`,
       },
       {
         title: 'npm 安装与发布',
@@ -224,10 +257,10 @@ function usageSnippets(repo: RepoInfo): UsageSnippet[] {
   ];
 }
 
-/** 来源必填项校验：native-dir 需 path 与 config_source，online 需 url，package 需 path。 */
+/** 来源必填项校验：native-dir 需 path（url 选填），online 需 url，package 需 path。 */
 function validateSource(source: MigrationSource): StoreFailure | null {
-  if (source.kind === 'native-dir' && (!source.path || !source.config_source)) {
-    return fail(400, 'INVALID_SOURCE', 'native-dir 来源必须提供 path 与 config_source');
+  if (source.kind === 'native-dir' && !source.path) {
+    return fail(400, 'INVALID_SOURCE', 'native-dir 来源必须提供 path');
   }
   if (source.kind === 'online' && !source.url) {
     return fail(400, 'INVALID_SOURCE', 'online 来源必须提供 url');
@@ -476,12 +509,13 @@ export class DevmockStore {
 
   // —— Token ——
 
-  /** 列出本人 Token 元数据（分页）。 */
-  listTokens(page?: number, pageSize?: number): StoreResult<TokenListResponse> {
+  /** 列出本人 Token 元数据（分页，可选按名称子串筛选）。 */
+  listTokens(page?: number, pageSize?: number, q?: string): StoreResult<TokenListResponse> {
     const user = this.requireUser();
     if (!user.ok) return user;
     const own = this.tokens.filter((t) => t.userId === user.value.info.id).map((t) => t.info);
-    return ok(paginate(own, page, pageSize));
+    const filtered = filterByName(own, q, (t) => t.name);
+    return ok(paginate(filtered, page, pageSize));
   }
 
   /** 签发 Token：明文仅在本次返回中出现一次，存储只留元数据。 */
@@ -510,12 +544,13 @@ export class DevmockStore {
 
   // —— 用户管理（Admin）——
 
-  /** 列出用户（分页，Admin）。 */
-  listUsers(page?: number, pageSize?: number): StoreResult<UserListResponse> {
+  /** 列出用户（分页，可选按用户名子串筛选，Admin）。 */
+  listUsers(page?: number, pageSize?: number, q?: string): StoreResult<UserListResponse> {
     const admin = this.requireAdmin();
     if (!admin.ok) return admin;
     const items = this.users.map((u) => u.info);
-    return ok(paginate(items, page, pageSize));
+    const filtered = filterByName(items, q, (u) => u.username);
+    return ok(paginate(filtered, page, pageSize));
   }
 
   /** 新增用户（Admin）。 */
@@ -548,7 +583,20 @@ export class DevmockStore {
     }
     if (req.enabled != null) user.info.enabled = req.enabled;
     if (req.role != null) user.info.role = req.role;
+    // Admin 重置口令（M1-FR-045）：直接生效，旧口令立即失效
+    if (req.password != null) user.password = req.password;
     return ok(user.info);
+  }
+
+  /** 修改本人口令（M1-FR-045）：旧口令验证通过后生效，旧口令立即失效。 */
+  changePassword(oldPassword: string, newPassword: string): StoreResult<null> {
+    const current = this.requireUser();
+    if (!current.ok) return current;
+    if (current.value.password !== oldPassword) {
+      return fail(401, 'INVALID_CREDENTIALS', '旧口令错误');
+    }
+    current.value.password = newPassword;
+    return ok(null);
   }
 
   /** 判断该更新是否会移除最后一名启用管理员。 */
@@ -583,16 +631,26 @@ export class DevmockStore {
     return ok(repo);
   }
 
-  /** 仓库列表：只含调用方可读仓库（分页）。 */
-  listRepos(page?: number, pageSize?: number): StoreResult<RepoListResponse> {
-    const visible = this.repos.filter((r) => this.permissionFor(r) !== null).map((r) => r.info);
-    return ok(paginate(visible, page, pageSize));
+  /** 文件下载（格式协议端点 mock）：校验可读与文件存在，返回伪内容字节。 */
+  downloadFile(name: string, path: string): StoreResult<string> {
+    const repo = this.requireRepo(name, 'read');
+    if (!repo.ok) return repo;
+    const file = repo.value.files.find((f) => f.path === path);
+    if (!file) return notFound('文件不存在或无权访问');
+    return ok(`devmock 伪内容：${path}（真实字节由后端实现提供）`);
+  }
+
+  /** 仓库列表：只含调用方可读仓库（分页，可选按仓库名子串筛选）。 */
+  listRepos(page?: number, pageSize?: number, q?: string): StoreResult<RepoListResponse> {
+    const visible = this.repos.filter((r) => this.permissionFor(r) !== null).map(repoView);
+    const filtered = filterByName(visible, q, (r) => r.name);
+    return ok(paginate(filtered, page, pageSize));
   }
 
   /** 仓库详情。 */
   getRepo(name: string): StoreResult<RepoInfo> {
     const repo = this.requireRepo(name, 'read');
-    return repo.ok ? ok(repo.value.info) : repo;
+    return repo.ok ? ok(repoView(repo.value)) : repo;
   }
 
   /** 创建仓库（Admin）。 */
@@ -614,9 +672,12 @@ export class DevmockStore {
       upstream_credential_ref: req.upstream_credential_ref ?? null,
       overwrite_policy: req.overwrite_policy ?? null,
       version_policy: req.version_policy ?? null,
+      object_count: 0,
+      total_bytes: 0,
     };
-    this.repos.push({ info, acl: [], files: [] });
-    return ok(info);
+    const record: SeedRepo = { info, acl: [], files: [] };
+    this.repos.push(record);
+    return ok(repoView(record));
   }
 
   /** 编辑仓库：只更新给出的字段；format 与 repo_type 不可变。 */
@@ -632,7 +693,7 @@ export class DevmockStore {
       info.upstream_credential_ref = req.upstream_credential_ref;
     }
     if (req.overwrite_policy != null) info.overwrite_policy = req.overwrite_policy;
-    return ok(info);
+    return ok(repoView(repo.value));
   }
 
   /** 删除仓库：需显式模式与确认头（X-Confirm-Repository=仓库名）。 */
@@ -748,11 +809,18 @@ export class DevmockStore {
       return fail(502, 'UPSTREAM_UNAVAILABLE', '无法连接 Nexus 实例，在线发现失败');
     }
     this.seq += 1;
+    // native-dir 未提供 Nexus 地址时无法在线拉取配置：proxy/group 仓库配置缺失，须在映射步手动补
+    const restAvailable = source.kind !== 'native-dir' || Boolean(source.url);
+    const repositories = sampleDiscoveredRepos().map((repo) =>
+      restAvailable || repo.repo_type === 'hosted'
+        ? repo
+        : { ...repo, config_complete: false, has_credential_ref: false, upstream_url: null },
+    );
     const result: DiscoveryResult = {
       discovery_id: `disc_${String(this.seq)}`,
       snapshot_time: now(),
       degraded_bare_blob: false,
-      repositories: sampleDiscoveredRepos(),
+      repositories,
       unsupported: [
         {
           name: 'docker-local',

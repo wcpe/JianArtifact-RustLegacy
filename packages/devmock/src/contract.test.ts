@@ -28,11 +28,12 @@ for (const [path, methods] of Object.entries(doc.paths)) {
   }
 }
 
-// devmock 业务 handler 的 (method, path) 集合；/__devmock/* 是 mock 基础设施端点，不属业务契约
+// devmock 业务 handler 的 (method, path) 集合；/__devmock/* 是 mock 基础设施端点，
+// /repository/* 是格式协议端点（独立于管理 API 契约，见 docs/API.md §2.1），均不参与比对
 const handlerOps = new Set(
   handlers
     .map((h) => ({ method: h.info.method.toString().toUpperCase(), path: String(h.info.path) }))
-    .filter((op) => !op.path.includes('/__devmock/'))
+    .filter((op) => !op.path.includes('/__devmock/') && !op.path.includes('/repository/'))
     .map((op) => `${op.method} ${op.path.replace(/^\*/, '')}`),
 );
 

@@ -97,6 +97,10 @@ pub struct RepoInfo {
     pub upstream_credential_ref: Option<String>,
     /// group 成员（有序，group 有效）。
     pub members: Option<Vec<String>>,
+    /// 制品数（仓库内文件总数，列表与详情展示）。
+    pub object_count: i64,
+    /// 总大小（仓库内文件字节合计）。
+    pub total_bytes: i64,
     /// 创建时间。
     pub created_at: String,
 }
@@ -202,6 +206,14 @@ pub struct FileEntry {
     pub size: Option<i64>,
     /// sha256 校验和（文件）。
     pub sha256: Option<String>,
+    /// sha1 校验和（文件，Maven 生态）。
+    pub sha1: Option<String>,
+    /// md5 校验和（文件，Maven 生态）。
+    pub md5: Option<String>,
+    /// sha512 校验和（文件，npm integrity）。
+    pub sha512: Option<String>,
+    /// 内容类型（文件）。
+    pub content_type: Option<String>,
     /// 更新时间。
     pub updated_at: Option<String>,
 }
@@ -236,6 +248,7 @@ pub struct UsageSnippet {
     params(
         ("page" = Option<u32>, Query, description = "页码，从 1 起"),
         ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
+        ("q" = Option<String>, Query, description = "按仓库名子串筛选（可选）"),
     ),
     responses(
         (status = 200, description = "仓库分页（只含调用方可读仓库）", body = RepoListResponse),

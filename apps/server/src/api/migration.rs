@@ -20,29 +20,20 @@ pub enum SourceKind {
     Package,
 }
 
-/// 仓库配置的来源（native-dir 源使用）。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ConfigSource {
-    /// Nexus 可达时经 REST 一次性拉取。
-    Rest,
-    /// 管理员在向导手动补（proxy 上游、group 成员）。
-    Manual,
-}
-
-/// 迁移源配置（发现请求体）。凭据一律为运行时引用名，绝不接受明文。
+/// 迁移源配置（发现请求体）。Nexus 账号口令仅用于传输与内存中的在线拉取，
+/// 绝不落库、不进日志、不进任务参数快照与报告（持久化只存安全运行时引用）。
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct MigrationSource {
     /// 来源类别。
     pub kind: SourceKind,
     /// 服务器上的路径（native-dir：Nexus 数据目录；package：包路径）；须落在 migration-workdir 白名单根内。
     pub path: Option<String>,
-    /// Nexus 实例地址（online 或 native-dir + rest 配置源）。
+    /// Nexus 实例地址。online 必填；native-dir 选填——填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。
     pub url: Option<String>,
-    /// Nexus 凭据引用名（运行时从环境取值，不落库不进日志）。
-    pub credential_ref: Option<String>,
-    /// 仓库配置来源（native-dir 必填）。
-    pub config_source: Option<ConfigSource>,
+    /// Nexus 用户名（配合 url 做在线拉取时提供）。
+    pub username: Option<String>,
+    /// Nexus 口令（明文仅传输与内存使用，不落库不进日志）。
+    pub password: Option<String>,
 }
 
 /// 发现到的源仓库。
@@ -103,11 +94,11 @@ pub struct RepoMapping {
     pub target: Option<String>,
     /// 是否排除（显式排除保留在报告中，任务不得全量成功）。
     pub excluded: bool,
-    /// proxy 上游凭据引用名（manual 配置源或补凭据时提供）。
+    /// proxy 上游凭据引用名（手动补配置或补凭据时提供）。
     pub upstream_credential_ref: Option<String>,
-    /// 手动补的 proxy 上游地址（config_source=manual 时）。
+    /// 手动补的 proxy 上游地址（源配置未提供 Nexus 地址、配置缺失时）。
     pub manual_upstream_url: Option<String>,
-    /// 手动补的 group 成员（config_source=manual 时，有序）。
+    /// 手动补的 group 成员（源配置未提供 Nexus 地址、配置缺失时，有序）。
     pub manual_members: Option<Vec<String>>,
 }
 

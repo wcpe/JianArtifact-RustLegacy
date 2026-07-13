@@ -73,6 +73,7 @@ pub async fn create() -> ApiError {
     params(
         ("page" = Option<u32>, Query, description = "页码，从 1 起"),
         ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
+        ("q" = Option<String>, Query, description = "按 Token 名子串筛选（可选）"),
     ),
     responses(
         (status = 200, description = "Token 元数据分页", body = TokenListResponse),

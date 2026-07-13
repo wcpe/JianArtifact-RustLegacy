@@ -1,5 +1,5 @@
 // 数据模型与场景行为测试（M1-FR-035）：会话、Token、用户保护、仓库权限、分页与迁移状态机。
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { createStore, type StoreResult } from './store';
 
 /** 断言成功结果并取出载荷。 */
@@ -63,6 +63,24 @@ describe('用户管理', () => {
     expect(unwrapError(store.listUsers()).status).toBe(403);
     const created = store.createUser({ username: 'x', password: 'p', role: 'user' });
     expect(unwrapError(created).status).toBe(403);
+  });
+
+  it('修改本人口令：旧口令错误 401，成功后旧口令立即失效（M1-FR-045）', () => {
+    const store = createStore('default');
+    expect(unwrapError(store.changePassword('错误口令', 'new-pass')).status).toBe(401);
+    expect(store.changePassword('admin123', 'new-pass').ok).toBe(true);
+    // 旧口令立即失效，新口令可登录
+    store.logout();
+    expect(unwrapError(store.login('admin', 'admin123')).status).toBe(401);
+    expect(store.login('admin', 'new-pass').ok).toBe(true);
+  });
+
+  it('Admin 重置用户口令后立即生效（M1-FR-045）', () => {
+    const store = createStore('default');
+    expect(store.updateUser(2, { password: 'reset-pass' }).ok).toBe(true);
+    store.logout();
+    expect(unwrapError(store.login('dev', 'dev123')).status).toBe(401);
+    expect(store.login('dev', 'reset-pass').ok).toBe(true);
   });
 });
 
@@ -136,11 +154,36 @@ describe('大仓库分页（NFR-16）', () => {
   });
 });
 
+describe('stress 压测场景（分页/筛选/性能）', () => {
+  // 压测场景需构建百万级文件对象，整组共用一次构建，避免逐用例重复重建
+  let store: ReturnType<typeof createStore>;
+  beforeAll(() => {
+    store = createStore('stress');
+  });
+
+  it('规模达标：仓库 100、单仓文件 ≥1w、Token 1000、用户 100', () => {
+    expect(unwrap(store.listRepos()).total).toBe(100);
+    // repo-000 为 raw 格式，1w 文件集中在 dir-0 目录，翻页可见其总数
+    expect(unwrap(store.listFiles('repo-000', 'dir-0')).total).toBeGreaterThanOrEqual(10_000);
+    expect(unwrap(store.listTokens()).total).toBe(1000);
+    expect(unwrap(store.listUsers()).total).toBe(100);
+  });
+
+  it('q 名称筛选：仓库/用户/Token 各按子串命中', () => {
+    // repo-010..repo-019 共 10 个
+    expect(unwrap(store.listRepos(1, 50, 'repo-01')).total).toBe(10);
+    // user-010..user-019 共 10 个
+    expect(unwrap(store.listUsers(1, 50, 'user-01')).total).toBe(10);
+    // token-0010..token-0019 共 10 个
+    expect(unwrap(store.listTokens(1, 50, 'token-001')).total).toBe(10);
+  });
+});
+
 describe('迁移发现与计划', () => {
   it('同名目标仓库产生阻断冲突，改名映射后可创建任务', () => {
     const store = createStore('default');
     const discovery = unwrap(
-      store.discover({ kind: 'native-dir', path: 'nexus-data', config_source: 'rest' }),
+      store.discover({ kind: 'native-dir', path: 'nexus-data', url: 'https://nexus.example.com' }),
     );
     expect(discovery.repositories.length).toBeGreaterThan(0);
     const blocked = unwrap(
@@ -166,6 +209,24 @@ describe('迁移发现与计划', () => {
     const store = createStore('default');
     const result = store.plan({ discovery_id: 'disc_ghost', mappings: [] });
     expect(unwrapError(result).status).toBe(400);
+  });
+
+  it('native-dir 未填 Nexus 地址时 proxy 仓库配置缺失（须手动补），填了则齐全', () => {
+    const store = createStore('default');
+    const offline = unwrap(store.discover({ kind: 'native-dir', path: 'nexus-data' }));
+    const proxyOffline = offline.repositories.find((repo) => repo.repo_type === 'proxy');
+    expect(proxyOffline?.config_complete).toBe(false);
+    const online = unwrap(
+      store.discover({
+        kind: 'native-dir',
+        path: 'nexus-data',
+        url: 'https://nexus.example.com',
+        username: 'nexus-admin',
+        password: 'nexus-pass',
+      }),
+    );
+    const proxyOnline = online.repositories.find((repo) => repo.repo_type === 'proxy');
+    expect(proxyOnline?.config_complete).toBe(true);
   });
 });
 

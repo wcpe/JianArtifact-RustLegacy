@@ -14,6 +14,7 @@ import {
 type Schemas = components['schemas'];
 type ErrorBody = Schemas['ErrorBody'];
 type LoginRequest = Schemas['LoginRequest'];
+type ChangePasswordRequest = Schemas['ChangePasswordRequest'];
 type CreateTokenRequest = Schemas['CreateTokenRequest'];
 type CreateUserRequest = Schemas['CreateUserRequest'];
 type UpdateUserRequest = Schemas['UpdateUserRequest'];
@@ -99,11 +100,17 @@ export function createHandlers(getStore: () => DevmockStore) {
     }),
     http.post('*/api/v1/auth/logout', () => emptyOf(getStore().logout())),
     http.post('*/api/v1/auth/refresh', () => jsonOf(getStore().refresh())),
+    http.post('*/api/v1/auth/password', async ({ request }) => {
+      const body = (await request.json()) as ChangePasswordRequest;
+      return emptyOf(getStore().changePassword(body.old_password, body.new_password));
+    }),
 
     // —— tokens ——
     http.get('*/api/v1/tokens', ({ request }) => {
+      const url = new URL(request.url);
       const { page, pageSize } = pageQuery(request);
-      return jsonOf(getStore().listTokens(page, pageSize));
+      const q = url.searchParams.get('q') ?? undefined;
+      return jsonOf(getStore().listTokens(page, pageSize, q));
     }),
     http.post('*/api/v1/tokens', async ({ request }) => {
       const body = (await request.json()) as CreateTokenRequest;
@@ -115,8 +122,10 @@ export function createHandlers(getStore: () => DevmockStore) {
 
     // —— users ——
     http.get('*/api/v1/users', ({ request }) => {
+      const url = new URL(request.url);
       const { page, pageSize } = pageQuery(request);
-      return jsonOf(getStore().listUsers(page, pageSize));
+      const q = url.searchParams.get('q') ?? undefined;
+      return jsonOf(getStore().listUsers(page, pageSize, q));
     }),
     http.post('*/api/v1/users', async ({ request }) => {
       const body = (await request.json()) as CreateUserRequest;
@@ -129,8 +138,10 @@ export function createHandlers(getStore: () => DevmockStore) {
 
     // —— repos ——
     http.get('*/api/v1/repos', ({ request }) => {
+      const url = new URL(request.url);
       const { page, pageSize } = pageQuery(request);
-      return jsonOf(getStore().listRepos(page, pageSize));
+      const q = url.searchParams.get('q') ?? undefined;
+      return jsonOf(getStore().listRepos(page, pageSize, q));
     }),
     http.post('*/api/v1/repos', async ({ request }) => {
       const body = (await request.json()) as CreateRepoRequest;
@@ -175,6 +186,20 @@ export function createHandlers(getStore: () => DevmockStore) {
     http.get('*/api/v1/repos/:name/usage', ({ params }) =>
       jsonOf(getStore().usage(stringOf(params.name))),
     ),
+
+    // —— 格式协议端点（独立于管理 API 契约，见 docs/API.md §2.1）：仅供开发预览下载 ——
+    http.get('*/repository/:name/*', ({ params, request }) => {
+      const name = stringOf(params.name);
+      const pathname = new URL(request.url).pathname;
+      const prefix = `/repository/${name}/`;
+      const path = decodeURIComponent(pathname.slice(pathname.indexOf(prefix) + prefix.length));
+      const result = getStore().downloadFile(name, path);
+      if (!result.ok) return errorOf(result.error);
+      return new HttpResponse(result.value, {
+        status: 200,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
+    }),
 
     // —— migration ——
     http.post('*/api/v1/migration/discover', async ({ request }) => {

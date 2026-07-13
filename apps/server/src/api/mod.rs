@@ -27,6 +27,7 @@ use crate::state::AppState;
         auth::login,
         auth::refresh,
         auth::logout,
+        auth::change_password,
         tokens::create,
         tokens::list,
         tokens::revoke,
@@ -82,6 +83,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/refresh", post(auth::refresh))
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/password", post(auth::change_password))
         .route("/api/v1/tokens", post(tokens::create).get(tokens::list))
         .route("/api/v1/tokens/{id}", delete(tokens::revoke))
         .route("/api/v1/users", get(users::list).post(users::create))

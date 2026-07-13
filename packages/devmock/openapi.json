@@ -75,6 +75,40 @@
         }
       }
     },
+    "/api/v1/auth/password": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "修改本人口令：旧口令验证通过后生效，旧口令立即失效。",
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "修改成功，旧口令立即失效"
+          },
+          "401": {
+            "description": "未认证或旧口令错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/refresh": {
       "post": {
         "tags": [
@@ -593,6 +627,15 @@
               "type": "integer",
               "format": "int32",
               "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "按仓库名子串筛选（可选）",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1189,6 +1232,15 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "按 Token 名子串筛选（可选）",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1328,6 +1380,15 @@
               "type": "integer",
               "format": "int32",
               "minimum": 0
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "按用户名子串筛选（可选）",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1525,13 +1586,23 @@
           }
         }
       },
-      "ConfigSource": {
-        "type": "string",
-        "description": "仓库配置的来源（native-dir 源使用）。",
-        "enum": [
-          "rest",
-          "manual"
-        ]
+      "ChangePasswordRequest": {
+        "type": "object",
+        "description": "修改本人口令请求体（M1-FR-045）。新旧口令均不落日志与响应。",
+        "required": [
+          "old_password",
+          "new_password"
+        ],
+        "properties": {
+          "new_password": {
+            "type": "string",
+            "description": "新口令。"
+          },
+          "old_password": {
+            "type": "string",
+            "description": "当前口令（校验通过才允许修改）。"
+          }
+        }
       },
       "CreateRepoRequest": {
         "type": "object",
@@ -1855,13 +1926,34 @@
           "is_dir"
         ],
         "properties": {
+          "content_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "内容类型（文件）。"
+          },
           "is_dir": {
             "type": "boolean",
             "description": "是否目录。"
           },
+          "md5": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "md5 校验和（文件，Maven 生态）。"
+          },
           "name": {
             "type": "string",
             "description": "条目名。"
+          },
+          "sha1": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "sha1 校验和（文件，Maven 生态）。"
           },
           "sha256": {
             "type": [
@@ -1869,6 +1961,13 @@
               "null"
             ],
             "description": "sha256 校验和（文件）。"
+          },
+          "sha512": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "sha512 校验和（文件，npm integrity）。"
           },
           "size": {
             "type": [
@@ -2073,32 +2172,21 @@
       },
       "MigrationSource": {
         "type": "object",
-        "description": "迁移源配置（发现请求体）。凭据一律为运行时引用名，绝不接受明文。",
+        "description": "迁移源配置（发现请求体）。Nexus 账号口令仅用于传输与内存中的在线拉取，\n绝不落库、不进日志、不进任务参数快照与报告（持久化只存安全运行时引用）。",
         "required": [
           "kind"
         ],
         "properties": {
-          "config_source": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ConfigSource",
-                "description": "仓库配置来源（native-dir 必填）。"
-              }
-            ]
+          "kind": {
+            "$ref": "#/components/schemas/SourceKind",
+            "description": "来源类别。"
           },
-          "credential_ref": {
+          "password": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Nexus 凭据引用名（运行时从环境取值，不落库不进日志）。"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/SourceKind",
-            "description": "来源类别。"
+            "description": "Nexus 口令（明文仅传输与内存使用，不落库不进日志）。"
           },
           "path": {
             "type": [
@@ -2112,7 +2200,14 @@
               "string",
               "null"
             ],
-            "description": "Nexus 实例地址（online 或 native-dir + rest 配置源）。"
+            "description": "Nexus 实例地址。online 必填；native-dir 选填——填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。"
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Nexus 用户名（配合 url 做在线拉取时提供）。"
           }
         }
       },
@@ -2191,6 +2286,8 @@
           "repo_type",
           "visibility",
           "disabled",
+          "object_count",
+          "total_bytes",
           "created_at"
         ],
         "properties": {
@@ -2220,6 +2317,11 @@
             "type": "string",
             "description": "仓库名（全局唯一）。"
           },
+          "object_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "制品数（仓库内文件总数，列表与详情展示）。"
+          },
           "overwrite_policy": {
             "oneOf": [
               {
@@ -2234,6 +2336,11 @@
           "repo_type": {
             "$ref": "#/components/schemas/RepoType",
             "description": "仓库类型。"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "总大小（仓库内文件字节合计）。"
           },
           "upstream_credential_ref": {
             "type": [
@@ -2322,14 +2429,14 @@
             "items": {
               "type": "string"
             },
-            "description": "手动补的 group 成员（config_source=manual 时，有序）。"
+            "description": "手动补的 group 成员（源配置未提供 Nexus 地址、配置缺失时，有序）。"
           },
           "manual_upstream_url": {
             "type": [
               "string",
               "null"
             ],
-            "description": "手动补的 proxy 上游地址（config_source=manual 时）。"
+            "description": "手动补的 proxy 上游地址（源配置未提供 Nexus 地址、配置缺失时）。"
           },
           "source": {
             "type": "string",
@@ -2347,7 +2454,7 @@
               "string",
               "null"
             ],
-            "description": "proxy 上游凭据引用名（manual 配置源或补凭据时提供）。"
+            "description": "proxy 上游凭据引用名（手动补配置或补凭据时提供）。"
           }
         }
       },
@@ -2741,6 +2848,13 @@
               "null"
             ],
             "description": "启用状态。"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "重置口令为该明文（M1-FR-045，Admin 专属；不进日志与响应，提交后旧口令立即失效）。"
           },
           "role": {
             "oneOf": [

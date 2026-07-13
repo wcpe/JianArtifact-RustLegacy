@@ -1,12 +1,12 @@
 // 场景标识与种子数据（M1-FR-035）：每个场景是一份可整体重建的初始状态。
 // 本文件只产出数据，业务语义在 store.ts；测试凭据只存在于本包。
 import type { components } from './schema';
-import type { SeedData, SeedFile, SeedRepo, SeedTask, SeedUser } from './store';
+import type { SeedData, SeedFile, SeedRepo, SeedTask, SeedToken, SeedUser } from './store';
 
 type RepoInfo = components['schemas']['RepoInfo'];
 type TaskInfo = components['schemas']['TaskInfo'];
 
-/** 七类场景标识。 */
+/** 八类场景标识。 */
 export type ScenarioId =
   | 'default'
   | 'empty'
@@ -14,7 +14,8 @@ export type ScenarioId =
   | 'upstream-failure'
   | 'migration-running'
   | 'migration-partial'
-  | 'large-repo';
+  | 'large-repo'
+  | 'stress';
 
 /** 场景清单：中文标题与说明（供切换界面展示）。 */
 export const SCENARIOS: Record<ScenarioId, { title: string; description: string }> = {
@@ -46,6 +47,10 @@ export const SCENARIOS: Record<ScenarioId, { title: string; description: string 
     title: '大仓库分页',
     description: '单个 raw 仓库含 130 个文件条目，超过两个默认分页页',
   },
+  stress: {
+    title: '压测大数据',
+    description: '100 个仓库各含上万文件、1000 个 Token、100 名用户，用于分页、筛选与性能压测',
+  },
 };
 
 /** 场景标识类型守卫（切换端点入参校验用）。 */
@@ -72,7 +77,7 @@ function devUser(): SeedUser {
   };
 }
 
-/** 构造仓库信息：补齐公共缺省字段，减少重复。 */
+/** 构造仓库信息：补齐公共缺省字段，减少重复（统计字段由 store 按文件列表实时汇总）。 */
 function repoInfo(
   partial: Pick<RepoInfo, 'name' | 'format' | 'repo_type' | 'visibility'> & Partial<RepoInfo>,
 ): RepoInfo {
@@ -84,18 +89,40 @@ function repoInfo(
     upstream_credential_ref: null,
     overwrite_policy: null,
     version_policy: null,
+    object_count: 0,
+    total_bytes: 0,
     ...partial,
   };
 }
 
-/** 伪造 sha256（确定性、显然非真实值）。 */
-function fakeSha(index: number): string {
-  return index.toString(16).padStart(64, '0');
+/** 伪造指定十六进制长度的校验和（确定性、显然非真实值）。 */
+function fakeHash(index: number, length: number): string {
+  return index.toString(16).padStart(length, '0');
+}
+
+/** 按扩展名推内容类型（mock 展示用途，不求全）。 */
+function contentTypeOf(path: string): string {
+  if (path.endsWith('.pdf')) return 'application/pdf';
+  if (path.endsWith('.zip')) return 'application/zip';
+  if (path.endsWith('.tar.gz') || path.endsWith('.tgz')) return 'application/gzip';
+  if (path.endsWith('.jar') || path.endsWith('.war')) return 'application/java-archive';
+  if (path.endsWith('.pom') || path.endsWith('.xml')) return 'application/xml';
+  if (path.endsWith('.json')) return 'application/json';
+  return 'application/octet-stream';
 }
 
 /** 构造文件条目。 */
 function file(path: string, size: number, index: number): SeedFile {
-  return { path, size, sha256: fakeSha(index), updated_at: SEED_TIME };
+  return {
+    path,
+    size,
+    sha256: fakeHash(index, 64),
+    sha1: fakeHash(index, 40),
+    md5: fakeHash(index, 32),
+    sha512: fakeHash(index, 128),
+    content_type: contentTypeOf(path),
+    updated_at: SEED_TIME,
+  };
 }
 
 /** 默认场景的六个仓库：三格式 × hosted/proxy，公私混搭。 */
@@ -324,6 +351,105 @@ function largeRepo(): SeedRepo {
   };
 }
 
+// —— 压测场景规模常量（用于分页、筛选与性能压测）——
+// 仓库总数
+const STRESS_REPO_COUNT = 100;
+// 每个仓库的文件条目数（100 仓库 × 1w = 100 万文件对象）
+const STRESS_FILES_PER_REPO = 10_000;
+// Token 总数（全部归属管理员，便于本人 Token 列表压测）
+const STRESS_TOKEN_COUNT = 1_000;
+// 普通用户数；另加 1 名管理员，合计 100 名
+const STRESS_NORMAL_USER_COUNT = 99;
+// raw 仓库文件归拢的目录基数（同一仓库的文件集中在 dir-(i % 该值) 目录下）
+const STRESS_RAW_DIR_BASE = 50;
+
+/** 压测仓库的格式：raw/maven/npm 三格式按仓库序号轮换。 */
+function stressFormat(index: number): RepoInfo['format'] {
+  const remainder = index % 3;
+  if (remainder === 0) return 'raw';
+  if (remainder === 1) return 'maven';
+  return 'npm';
+}
+
+/** 压测仓库单个文件的路径：按格式产出层次化路径（i 为仓库序号，j 为文件序号）。 */
+function stressFilePath(format: RepoInfo['format'], i: number, j: number): string {
+  if (format === 'maven') return `com/example/demo${i}/1.${j}.0/demo${i}-1.${j}.0.jar`;
+  if (format === 'npm') return `pkg${i}/-/pkg${i}-1.${j}.0.tgz`;
+  // raw：同一仓库的文件集中在 dir-(i % STRESS_RAW_DIR_BASE) 目录下
+  return `dir-${i % STRESS_RAW_DIR_BASE}/file-${j}.bin`;
+}
+
+/** 压测场景的 100 个仓库：格式/类型/可见性轮换，每仓上万文件（确定性生成）。 */
+function stressRepos(): SeedRepo[] {
+  const repos: SeedRepo[] = [];
+  for (let i = 0; i < STRESS_REPO_COUNT; i += 1) {
+    const format = stressFormat(i);
+    const isProxy = i % 2 === 1;
+    const name = `repo-${String(i).padStart(3, '0')}`;
+    const files: SeedFile[] = [];
+    for (let j = 0; j < STRESS_FILES_PER_REPO; j += 1) {
+      // 校验和索引在全场景内唯一且确定，避免随机；大小随文件序号线性变化
+      files.push(file(stressFilePath(format, i, j), 1_024 + j, i * STRESS_FILES_PER_REPO + j));
+    }
+    repos.push({
+      info: repoInfo({
+        name,
+        format,
+        repo_type: isProxy ? 'proxy' : 'hosted',
+        visibility: i % 2 === 0 ? 'public' : 'private',
+        // proxy 仓库配上游地址，hosted 无
+        upstream_url: isProxy ? `https://upstream.example.com/${name}` : null,
+      }),
+      acl: [],
+      files,
+    });
+  }
+  return repos;
+}
+
+/** 压测场景的 1000 个 Token：token-0000..token-0999，全部归属管理员。 */
+function stressTokens(): SeedToken[] {
+  const tokens: SeedToken[] = [];
+  for (let i = 0; i < STRESS_TOKEN_COUNT; i += 1) {
+    tokens.push({
+      info: { id: i + 1, name: `token-${String(i).padStart(4, '0')}`, created_at: SEED_TIME },
+      userId: 1,
+    });
+  }
+  return tokens;
+}
+
+/** 压测场景的 100 名用户：1 名管理员 + user-000..user-098 普通用户（口令 devpass）。 */
+function stressUsers(): SeedUser[] {
+  const users: SeedUser[] = [adminUser()];
+  for (let i = 0; i < STRESS_NORMAL_USER_COUNT; i += 1) {
+    // 管理员占用 id=1，普通用户从 id=2 起顺延
+    users.push({
+      info: {
+        id: i + 2,
+        username: `user-${String(i).padStart(3, '0')}`,
+        role: 'user',
+        enabled: true,
+        created_at: SEED_TIME,
+      },
+      password: 'devpass',
+    });
+  }
+  return users;
+}
+
+/** 压测场景种子：大规模仓库/文件/Token/用户，管理员登录以便访问全部数据。 */
+function stressSeed(): SeedData {
+  return {
+    users: stressUsers(),
+    tokens: stressTokens(),
+    repos: stressRepos(),
+    tasks: [],
+    session: { userId: 1 },
+    upstreamDown: false,
+  };
+}
+
 /** default 场景的完整种子（多数场景在此基础上微调）。 */
 function defaultSeed(): SeedData {
   return {
@@ -383,5 +509,7 @@ export function seedFor(id: ScenarioId): SeedData {
         session: { userId: 1 },
         upstreamDown: false,
       };
+    case 'stress':
+      return stressSeed();
   }
 }

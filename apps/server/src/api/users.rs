@@ -49,6 +49,8 @@ pub struct UpdateUserRequest {
     pub enabled: Option<bool>,
     /// 全局角色。
     pub role: Option<Role>,
+    /// 重置口令为该明文（M1-FR-045，Admin 专属；不进日志与响应，提交后旧口令立即失效）。
+    pub password: Option<String>,
 }
 
 /// 用户列表分页响应。
@@ -72,6 +74,7 @@ pub struct UserListResponse {
     params(
         ("page" = Option<u32>, Query, description = "页码，从 1 起"),
         ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
+        ("q" = Option<String>, Query, description = "按用户名子串筛选（可选）"),
     ),
     responses(
         (status = 200, description = "用户分页", body = UserListResponse),
