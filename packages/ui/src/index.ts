@@ -53,6 +53,14 @@ export {
 } from './components/ui/select';
 export { Tabs, TabsContent, TabsList, TabsTrigger, tabsListVariants } from './components/ui/tabs';
 export { Separator } from './components/ui/separator';
+export {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from './components/ui/dropdown-menu';
 
 // 状态占位层
 export { EmptyState } from './components/status/empty-state';

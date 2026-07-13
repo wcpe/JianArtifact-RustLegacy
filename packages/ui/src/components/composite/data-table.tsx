@@ -65,46 +65,53 @@ export function DataTable<TData>({
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <Table>
-        <TableHeader>
-          {table.getHeaderGroups().map((headerGroup) => (
-            <TableRow key={headerGroup.id}>
-              {headerGroup.headers.map((header) => (
-                <TableHead key={header.id} scope="col">
-                  {header.isPlaceholder
-                    ? null
-                    : flexRender(header.column.columnDef.header, header.getContext())}
-                </TableHead>
-              ))}
-            </TableRow>
-          ))}
-        </TableHeader>
-        <TableBody>
-          {rows.map((row) => (
-            <TableRow key={row.id}>
-              {row.getVisibleCells().map((cell) => (
-                <TableCell key={cell.id}>
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-      {/* 分页三要素与翻页回调齐备时才渲染分页栏（内联判空以让类型收窄为非空） */}
+    // 根撑满父级高度并纵向布局：表格区可滚、分页栏固定底部
+    <div className="flex h-full flex-col">
+      {/* 表格滚动区：父级给定高度时内部纵向滚动，列表变长不撑破布局 */}
+      <div className="min-h-0 flex-1 overflow-auto">
+        <Table>
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <TableRow key={headerGroup.id}>
+                {headerGroup.headers.map((header) => (
+                  <TableHead key={header.id} scope="col">
+                    {header.isPlaceholder
+                      ? null
+                      : flexRender(header.column.columnDef.header, header.getContext())}
+                  </TableHead>
+                ))}
+              </TableRow>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.id}>
+                {row.getVisibleCells().map((cell) => (
+                  <TableCell key={cell.id}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      {/* 分页三要素与翻页回调齐备时才渲染分页栏（内联判空以让类型收窄为非空）
+          shrink-0 使其固定在底部、铺满宽度、不随表格滚动 */}
       {onPageChange !== undefined &&
       page !== undefined &&
       pageSize !== undefined &&
       total !== undefined ? (
-        <Pagination
-          page={page}
-          pageSize={pageSize}
-          total={total}
-          onPageChange={onPageChange}
-          onPageSizeChange={onPageSizeChange}
-          pageSizeOptions={pageSizeOptions}
-        />
+        <div className="shrink-0 pt-4">
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={total}
+            onPageChange={onPageChange}
+            onPageSizeChange={onPageSizeChange}
+            pageSizeOptions={pageSizeOptions}
+          />
+        </div>
       ) : null}
     </div>
   );

@@ -61,4 +61,28 @@ describe('DataTable 数据表格', () => {
     render(<DataTable columns={columns} data={data} />);
     expect(screen.queryByRole('navigation', { name: '分页' })).not.toBeInTheDocument();
   });
+
+  it('分页栏固定在滚动区之外（表格内滚、分页固定底部）', () => {
+    const { container } = render(
+      <DataTable
+        columns={columns}
+        data={data}
+        page={1}
+        pageSize={20}
+        total={40}
+        onPageChange={() => undefined}
+      />,
+    );
+    // 根为撑满父级高度的纵向布局
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.className).toContain('h-full');
+    // 表格滚动区：包裹 table 且可纵向滚动
+    const tableContainer = container.querySelector('[data-slot="table-container"]');
+    const scrollArea = tableContainer?.parentElement as HTMLElement;
+    expect(scrollArea.className).toContain('overflow-auto');
+    // 分页栏在滚动区之外（不随表格滚动），但仍属于根
+    const nav = screen.getByRole('navigation', { name: '分页' });
+    expect(scrollArea.contains(nav)).toBe(false);
+    expect(root.contains(nav)).toBe(true);
+  });
 });

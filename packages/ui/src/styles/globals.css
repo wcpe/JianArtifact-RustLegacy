@@ -5,7 +5,7 @@
 /* 暗色变体：祖先元素带 .dark 类时生效 */
 @custom-variant dark (&:is(.dark *));
 
-/* 亮色主题变量（shadcn 官方 neutral 基色 oklch 值） */
+/* 亮色主题变量（shadcn 官方 neutral 基色 oklch 值；主色取蓝色系，对齐管理端品牌观感） */
 :root {
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -14,7 +14,7 @@
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
+  --primary: oklch(0.546 0.245 262.881);
   --primary-foreground: oklch(0.985 0 0);
   --secondary: oklch(0.97 0 0);
   --secondary-foreground: oklch(0.205 0 0);
@@ -25,7 +25,7 @@
   --destructive: oklch(0.577 0.245 27.325);
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --ring: oklch(0.623 0.214 259.815);
 }
 
 /* 暗色主题变量 */
@@ -36,8 +36,8 @@
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
+  --primary: oklch(0.623 0.214 259.815);
+  --primary-foreground: oklch(0.985 0 0);
   --secondary: oklch(0.269 0 0);
   --secondary-foreground: oklch(0.985 0 0);
   --muted: oklch(0.269 0 0);
@@ -47,7 +47,7 @@
   --destructive: oklch(0.704 0.191 22.216);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --ring: oklch(0.623 0.214 259.815);
 }
 
 /* 把主题变量映射为 Tailwind 设计令牌（--color-* 与 --radius-*），供工具类引用 */
