@@ -23,11 +23,11 @@ test('登录后浏览仓库列表并进入详情', async ({ page }) => {
   await page.getByRole('link', { name: '仓库' }).click();
   await expect(page.getByRole('heading', { name: '仓库', exact: true })).toBeVisible();
   // default 场景含 raw-hosted 仓库
-  const repoLink = page.getByRole('link', { name: 'raw-hosted' });
+  const repoLink = page.getByRole('link', { name: 'raw-hosted', exact: true });
   await expect(repoLink).toBeVisible();
   await repoLink.click();
-  // 详情页展示文件浏览标签
-  await expect(page.getByRole('tab', { name: '文件浏览' })).toBeVisible();
+  // 详情页展示浏览标签
+  await expect(page.getByRole('tab', { name: '浏览' })).toBeVisible();
 });
 
 test('管理员新建仓库后出现在列表', async ({ page }) => {
@@ -38,5 +38,5 @@ test('管理员新建仓库后出现在列表', async ({ page }) => {
   await page.fill('#repo-name', name);
   // 表单默认 raw/hosted/public 即可，直接提交
   await page.getByRole('button', { name: '创建', exact: true }).click();
-  await expect(page.getByRole('link', { name })).toBeVisible();
+  await expect(page.getByRole('link', { name, exact: true })).toBeVisible();
 });

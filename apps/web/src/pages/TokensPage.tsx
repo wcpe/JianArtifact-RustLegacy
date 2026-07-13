@@ -26,7 +26,9 @@ import {
 import { ApiClientError } from '../api/client';
 import { tokenApi } from '../api/endpoints';
 import { useAsync } from '../lib/useAsync';
+import { useRegisterRefresh } from '../routes/RefreshContext';
 import { formatDateTime } from '../lib/format';
+import { NameFilterInput } from '../components/NameFilterInput';
 
 type TokenInfo = components['schemas']['TokenInfo'];
 type CreatedToken = components['schemas']['CreatedToken'];
@@ -180,9 +182,20 @@ function CreateTokenDialog({ onCreated }: { onCreated: () => void }) {
 export function TokensPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
+  const [q, setQ] = useState('');
 
-  const loader = useCallback(() => tokenApi.list({ page, page_size: pageSize }), [page, pageSize]);
+  const loader = useCallback(
+    () => tokenApi.list({ page, page_size: pageSize, q: q === '' ? undefined : q }),
+    [page, pageSize, q],
+  );
   const { data, error, loading, reload } = useAsync(loader);
+  useRegisterRefresh(reload);
+
+  // 筛选值落定后传 q 并回到第 1 页
+  const handleFilter = useCallback((value: string) => {
+    setQ(value.trim());
+    setPage(1);
+  }, []);
 
   const columns: ColumnDef<TokenInfo>[] = [
     { accessorKey: 'name', header: '名称' },
@@ -199,31 +212,35 @@ export function TokensPage() {
   ];
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex h-full flex-col gap-6">
       <PageHeader
         title="API Token"
         description="用于 CLI 与原生客户端鉴权"
         actions={<CreateTokenDialog onCreated={reload} />}
       />
+      <NameFilterInput onDebouncedChange={handleFilter} />
       {error ? (
         <ErrorState message={error.message} onRetry={reload} />
       ) : (
-        <DataTable
-          columns={columns}
-          data={data?.items ?? []}
-          isLoading={loading}
-          emptyState={
-            <EmptyState title="暂无 Token" description="点击右上角新建你的第一个 Token" />
-          }
-          page={page}
-          pageSize={pageSize}
-          total={data?.total ?? 0}
-          onPageChange={setPage}
-          onPageSizeChange={(size) => {
-            setPageSize(size);
-            setPage(1);
-          }}
-        />
+        // 表格区固定高度、由 DataTable 内部管理滚动：表格内滚、分页固定底部
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <DataTable
+            columns={columns}
+            data={data?.items ?? []}
+            isLoading={loading}
+            emptyState={
+              <EmptyState title="暂无 Token" description="点击右上角新建你的第一个 Token" />
+            }
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
+        </div>
       )}
     </div>
   );

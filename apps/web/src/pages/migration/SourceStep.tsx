@@ -1,6 +1,8 @@
 // 迁移向导 · 步骤一：配置迁移源并发起发现。
 // 三类来源：native-dir（离线直读数据目录）、online（在线 Nexus）、package（离线迁移包）。
-import { useState, type FormEvent } from 'react';
+// native-dir 的 Nexus 地址选填：填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。
+// 表单值随输入缓存供刷新/回退恢复；口令绝不写入任何缓存。
+import { useEffect, useState, type FormEvent } from 'react';
 import type { components } from '@jianartifact/devmock/schema';
 import {
   Alert,
@@ -21,30 +23,84 @@ import {
 } from '@jianartifact/ui';
 import { ApiClientError } from '../../api/client';
 import { migrationApi } from '../../api/endpoints';
+import { StepLoading } from './StepLoading';
+import { SOURCE_FORM_KEY, isSourceFormCache, loadCache, saveCache } from './wizardCache';
 
 type MigrationSource = components['schemas']['MigrationSource'];
 type SourceKind = components['schemas']['SourceKind'];
-type ConfigSource = components['schemas']['ConfigSource'];
 type DiscoveryResult = components['schemas']['DiscoveryResult'];
 
+// 账号口令输入的统一帮助文案（M1-FR-032：口令仅传输与内存使用，不落库不进日志与报告）
+const CREDENTIAL_HELP = '账号口令仅用于本次在线拉取，服务端不保存、不写入日志与迁移报告';
+
+// Nexus 账号口令输入：online 与 native-dir（填了地址时）共用
+function CredentialFields({
+  idPrefix,
+  username,
+  password,
+  onUsernameChange,
+  onPasswordChange,
+}: {
+  idPrefix: string;
+  username: string;
+  password: string;
+  onUsernameChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+}) {
+  return (
+    <>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor={`${idPrefix}-username`}>Nexus 用户名</Label>
+        <Input
+          id={`${idPrefix}-username`}
+          value={username}
+          autoComplete="off"
+          onChange={(event) => onUsernameChange(event.target.value)}
+        />
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label htmlFor={`${idPrefix}-password`}>Nexus 口令</Label>
+        <Input
+          id={`${idPrefix}-password`}
+          type="password"
+          value={password}
+          autoComplete="new-password"
+          onChange={(event) => onPasswordChange(event.target.value)}
+        />
+        <p className="text-xs text-muted-foreground">{CREDENTIAL_HELP}</p>
+      </div>
+    </>
+  );
+}
+
 export function SourceStep({ onDiscovered }: { onDiscovered: (result: DiscoveryResult) => void }) {
-  const [kind, setKind] = useState<SourceKind>('native-dir');
-  const [path, setPath] = useState('');
-  const [url, setUrl] = useState('');
-  const [credentialRef, setCredentialRef] = useState('');
-  const [configSource, setConfigSource] = useState<ConfigSource>('rest');
+  // 挂载时从缓存恢复表单值（步骤条回退 / 刷新场景）；口令不缓存，恢复后须重新输入
+  const [cached] = useState(() => loadCache(SOURCE_FORM_KEY, isSourceFormCache));
+  const [kind, setKind] = useState<SourceKind>(cached?.kind ?? 'native-dir');
+  const [path, setPath] = useState(cached?.path ?? '');
+  const [url, setUrl] = useState(cached?.url ?? '');
+  const [username, setUsername] = useState(cached?.username ?? '');
+  const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  // 按来源类别组装请求体：仅带该类别需要的字段
+  // 表单值变化即缓存（刷新/回退时原样恢复）；口令绝不写入缓存
+  useEffect(() => {
+    saveCache(SOURCE_FORM_KEY, { kind, path, url, username });
+  }, [kind, path, url, username]);
+
+  // 按来源类别组装请求体：仅带该类别需要的字段；未填地址时不携带账号口令
   const buildSource = (): MigrationSource => {
     if (kind === 'online') {
-      return { kind, url, credential_ref: credentialRef || null };
+      return { kind, url, username: username || null, password: password || null };
     }
     if (kind === 'package') {
       return { kind, path };
     }
-    return { kind, path, config_source: configSource };
+    if (url) {
+      return { kind, path, url, username: username || null, password: password || null };
+    }
+    return { kind, path };
   };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -60,6 +116,11 @@ export function SourceStep({ onDiscovered }: { onDiscovered: (result: DiscoveryR
       setSubmitting(false);
     }
   };
+
+  // 发现进行中：以处理态卡片替换表单，明确告知正在解析（native-dir 大数据目录尤其耗时）
+  if (submitting) {
+    return <StepLoading message="正在解析数据目录并枚举可迁对象…" />;
+  }
 
   return (
     <Card>
@@ -101,20 +162,26 @@ export function SourceStep({ onDiscovered }: { onDiscovered: (result: DiscoveryR
                 />
               </div>
               <div className="flex flex-col gap-2">
-                <Label htmlFor="source-config">配置来源</Label>
-                <Select
-                  value={configSource}
-                  onValueChange={(value) => setConfigSource(value as ConfigSource)}
-                >
-                  <SelectTrigger id="source-config" className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="rest">从 REST 读取</SelectItem>
-                    <SelectItem value="manual">手动补充</SelectItem>
-                  </SelectContent>
-                </Select>
+                <Label htmlFor="source-rest-url">Nexus 地址（选填）</Label>
+                <Input
+                  id="source-rest-url"
+                  value={url}
+                  placeholder="https://nexus.example.com"
+                  onChange={(event) => setUrl(event.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  填写后用账号口令在线拉取仓库配置；留空则发现后手动补充 proxy 上游与 group 成员
+                </p>
               </div>
+              {url ? (
+                <CredentialFields
+                  idPrefix="source-rest"
+                  username={username}
+                  password={password}
+                  onUsernameChange={setUsername}
+                  onPasswordChange={setPassword}
+                />
+              ) : null}
             </>
           ) : null}
 
@@ -130,15 +197,13 @@ export function SourceStep({ onDiscovered }: { onDiscovered: (result: DiscoveryR
                   required
                 />
               </div>
-              <div className="flex flex-col gap-2">
-                <Label htmlFor="source-credential">凭据引用名（可选）</Label>
-                <Input
-                  id="source-credential"
-                  value={credentialRef}
-                  placeholder="运行时凭据引用名，不接受明文"
-                  onChange={(event) => setCredentialRef(event.target.value)}
-                />
-              </div>
+              <CredentialFields
+                idPrefix="source-online"
+                username={username}
+                password={password}
+                onUsernameChange={setUsername}
+                onPasswordChange={setPassword}
+              />
             </>
           ) : null}
 
@@ -155,9 +220,7 @@ export function SourceStep({ onDiscovered }: { onDiscovered: (result: DiscoveryR
             </div>
           ) : null}
 
-          <Button type="submit" disabled={submitting}>
-            {submitting ? '发现中…' : '开始发现'}
-          </Button>
+          <Button type="submit">开始发现</Button>
         </form>
       </CardContent>
     </Card>

@@ -1,5 +1,6 @@
 // 迁移向导 · 步骤二：展示发现结果，勾选纳入的仓库并可改目标名，据此生成计划。
-import { useState, type FormEvent } from 'react';
+// 勾选/改名随操作缓存到 sessionStorage，刷新或步骤条回退时原样恢复。
+import { useEffect, useState, type FormEvent } from 'react';
 import type { components } from '@jianartifact/devmock/schema';
 import {
   Alert,
@@ -22,16 +23,18 @@ import {
 import { ApiClientError } from '../../api/client';
 import { migrationApi } from '../../api/endpoints';
 import { formatBytes } from '../../lib/format';
+import { StepLoading } from './StepLoading';
+import {
+  SELECTIONS_KEY,
+  isSelectionsCache,
+  loadCache,
+  saveCache,
+  type RepoSelection,
+} from './wizardCache';
 
 type DiscoveryResult = components['schemas']['DiscoveryResult'];
 type MigrationPlan = components['schemas']['MigrationPlan'];
 type RepoMapping = components['schemas']['RepoMapping'];
-
-// 单仓库的迁移选择：是否纳入 + 目标仓库名
-interface Selection {
-  included: boolean;
-  target: string;
-}
 
 export function DiscoveryStep({
   discovery,
@@ -42,19 +45,25 @@ export function DiscoveryStep({
   onBack: () => void;
   onPlanned: (plan: MigrationPlan) => void;
 }) {
-  // 初始：全部纳入，目标名默认同源名
-  const [selections, setSelections] = useState<Record<string, Selection>>(() =>
-    Object.fromEntries(
-      discovery.repositories.map((repo): [string, Selection] => [
+  // 初始：优先取缓存（刷新/回退恢复），否则全部纳入、目标名默认同源名
+  const [selections, setSelections] = useState<Record<string, RepoSelection>>(() => {
+    const cached = loadCache(SELECTIONS_KEY, isSelectionsCache);
+    return Object.fromEntries(
+      discovery.repositories.map((repo): [string, RepoSelection] => [
         repo.name,
-        { included: true, target: repo.name },
+        cached?.[repo.name] ?? { included: true, target: repo.name },
       ]),
-    ),
-  );
+    );
+  });
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const patch = (name: string, next: Partial<Selection>) => {
+  // 勾选/改名变化即缓存
+  useEffect(() => {
+    saveCache(SELECTIONS_KEY, selections);
+  }, [selections]);
+
+  const patch = (name: string, next: Partial<RepoSelection>) => {
     setSelections((current) => {
       const base = current[name] ?? { included: true, target: name };
       return { ...current, [name]: { ...base, ...next } };
@@ -78,6 +87,11 @@ export function DiscoveryStep({
       setSubmitting(false);
     }
   };
+
+  // 生成计划进行中：以处理态卡片替换发现表，明确告知正在计算映射与冲突
+  if (submitting) {
+    return <StepLoading message="正在计算映射与冲突、估算目标空间…" />;
+  }
 
   return (
     <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
@@ -171,9 +185,7 @@ export function DiscoveryStep({
         <Button type="button" variant="outline" onClick={onBack}>
           上一步
         </Button>
-        <Button type="submit" disabled={submitting}>
-          {submitting ? '生成计划中…' : '生成计划'}
-        </Button>
+        <Button type="submit">生成计划</Button>
       </div>
     </form>
   );

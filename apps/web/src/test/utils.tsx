@@ -5,6 +5,7 @@ import { render } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { ScenarioId } from '@jianartifact/devmock';
 import { AuthProvider } from '../auth/AuthContext';
+import { RefreshProvider } from '../routes/RefreshContext';
 import { authApi } from '../api/endpoints';
 import { setSessionToken } from '../api/client';
 
@@ -21,7 +22,9 @@ export function renderWithProviders(ui: ReactElement, options: RenderOptions = {
   const { route = '/' } = options;
   return render(
     <AuthProvider>
-      <MemoryRouter initialEntries={[route]}>{ui}</MemoryRouter>
+      <MemoryRouter initialEntries={[route]}>
+        <RefreshProvider>{ui}</RefreshProvider>
+      </MemoryRouter>
     </AuthProvider>,
   );
 }

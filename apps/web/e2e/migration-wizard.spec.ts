@@ -8,8 +8,9 @@ test('迁移向导从源配置走到报告', async ({ page }) => {
   await page.getByRole('link', { name: '迁移' }).click();
   await expect(page.getByRole('heading', { name: 'Nexus 迁移' })).toBeVisible();
 
-  // 步骤一 源配置：默认 native-dir，填数据目录路径（config_source 默认 rest）
+  // 步骤一 源配置：默认 native-dir + rest 配置源，填数据目录路径与 Nexus 地址
   await page.fill('#source-path', '/srv/nexus/data');
+  await page.fill('#source-rest-url', 'https://nexus.example.com');
   await page.getByRole('button', { name: '开始发现' }).click();
 
   // 步骤二 发现：默认全选，生成计划
@@ -33,6 +34,7 @@ test('刷新页面在进度阶段可找回任务', async ({ page }) => {
   await login(page);
   await page.goto('/migration');
   await page.fill('#source-path', '/srv/nexus/data');
+  await page.fill('#source-rest-url', 'https://nexus.example.com');
   await page.getByRole('button', { name: '开始发现' }).click();
   await page.getByRole('button', { name: '生成计划' }).click();
   await page.getByRole('button', { name: '开始迁移' }).click();

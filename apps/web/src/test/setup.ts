@@ -6,6 +6,21 @@ import { createDevmockServer } from '@jianartifact/devmock/node';
 import { cleanup } from '@testing-library/react';
 import { afterAll, afterEach, beforeAll } from 'vitest';
 
+// Radix Select（item-aligned 定位与指针捕获）依赖的 DOM API 在 jsdom 中缺失，补空实现；
+// 逐一判空避免覆盖将来 jsdom 提供的真实实现
+if (typeof Element.prototype.scrollIntoView !== 'function') {
+  Element.prototype.scrollIntoView = () => {};
+}
+if (typeof Element.prototype.hasPointerCapture !== 'function') {
+  Element.prototype.hasPointerCapture = () => false;
+}
+if (typeof Element.prototype.setPointerCapture !== 'function') {
+  Element.prototype.setPointerCapture = () => {};
+}
+if (typeof Element.prototype.releasePointerCapture !== 'function') {
+  Element.prototype.releasePointerCapture = () => {};
+}
+
 const server = createDevmockServer();
 
 beforeAll(() => {

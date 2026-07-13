@@ -1,217 +1,132 @@
-// 仓库详情：信息卡 + 文件浏览 / 使用方式两个标签页。404 视为不存在或无权访问。
-import { useCallback, useState, type ReactNode } from 'react';
-import { useParams } from 'react-router-dom';
-import { ChevronLeft, File, Folder } from 'lucide-react';
-import type { components } from '@jianartifact/devmock/schema';
+// 仓库详情：返回链接 + 标题徽标组 + 浏览/配置/权限三标签页。
+// 标签页与选中文件均以 URL 查询参数（?tab=&file=）为真源，支持前进/后退与刷新恢复；
+// 404 视为不存在或无权访问（private 零存在性泄露）。
+import { useCallback } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { ArrowLeft } from 'lucide-react';
 import {
-  Button,
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  DataTable,
+  Badge,
   EmptyState,
   ErrorState,
-  PageHeader,
   Skeleton,
   StatusBadge,
   Tabs,
   TabsContent,
   TabsList,
   TabsTrigger,
-  type ColumnDef,
 } from '@jianartifact/ui';
 import { repoApi } from '../api/endpoints';
 import { useAsync } from '../lib/useAsync';
-import { formatBytes, formatDateTime } from '../lib/format';
+import { useRegisterRefresh } from '../routes/RefreshContext';
+import { FileBrowser } from './repository/FileBrowser';
+import { RepoConfigPanel } from './repository/RepoConfigPanel';
+import { AclPanel } from './repository/AclPanel';
+import type { components } from '@jianartifact/devmock/schema';
 
 type RepoInfo = components['schemas']['RepoInfo'];
-type FileEntry = components['schemas']['FileEntry'];
 
-// 信息卡的一行「标签 - 值」
-function InfoRow({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="text-sm">{children}</dd>
-    </div>
-  );
+// 三个标签页标识，与 URL hash 一一对应（#browse/#config/#acl）
+const TAB_IDS = ['browse', 'config', 'acl'] as const;
+type TabId = (typeof TAB_IDS)[number];
+
+// 标签页标识类型守卫
+function isTabId(value: string): value is TabId {
+  return (TAB_IDS as readonly string[]).includes(value);
 }
 
-// 仓库信息卡：格式、类型、可见性、状态与（按类型）上游/成员
-function RepoInfoCard({ repo }: { repo: RepoInfo }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>仓库信息</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <dl className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-          <InfoRow label="格式">{repo.format}</InfoRow>
-          <InfoRow label="类型">
-            <StatusBadge kind="repo-type" value={repo.repo_type} />
-          </InfoRow>
-          <InfoRow label="可见性">
-            <StatusBadge kind="visibility" value={repo.visibility} />
-          </InfoRow>
-          <InfoRow label="状态">{repo.disabled ? '已停用' : '正常'}</InfoRow>
-          <InfoRow label="创建时间">{formatDateTime(repo.created_at)}</InfoRow>
-          {repo.repo_type === 'proxy' ? (
-            <InfoRow label="上游地址">{repo.upstream_url ?? '—'}</InfoRow>
-          ) : null}
-          {repo.repo_type === 'group' ? (
-            <InfoRow label="成员">{repo.members?.join('、') ?? '—'}</InfoRow>
-          ) : null}
-        </dl>
-      </CardContent>
-    </Card>
-  );
-}
-
-// 文件浏览：目录逐级下钻，分页展示条目
-function FilesBrowser({ name }: { name: string }) {
-  const [path, setPath] = useState('');
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
-
-  const loader = useCallback(
-    () => repoApi.files(name, { path, page, page_size: pageSize }),
-    [name, path, page, pageSize],
-  );
-  const { data, error, loading, reload } = useAsync(loader);
-
-  const enterDir = (dirName: string) => {
-    setPath(path ? `${path}/${dirName}` : dirName);
-    setPage(1);
-  };
-  const goUp = () => {
-    const parts = path.split('/');
-    parts.pop();
-    setPath(parts.join('/'));
-    setPage(1);
-  };
-
-  const columns: ColumnDef<FileEntry>[] = [
-    {
-      accessorKey: 'name',
-      header: '名称',
-      cell: ({ row }) =>
-        row.original.is_dir ? (
-          <button
-            type="button"
-            onClick={() => enterDir(row.original.name)}
-            className="flex items-center gap-2 font-medium text-primary underline-offset-4 hover:underline"
-          >
-            <Folder className="size-4" aria-hidden />
-            {row.original.name}
-          </button>
-        ) : (
-          <span className="flex items-center gap-2">
-            <File className="size-4 text-muted-foreground" aria-hidden />
-            {row.original.name}
-          </span>
-        ),
-    },
-    {
-      accessorKey: 'size',
-      header: '大小',
-      cell: ({ row }) => (row.original.is_dir ? '—' : formatBytes(row.original.size ?? 0)),
-    },
-    {
-      accessorKey: 'updated_at',
-      header: '更新时间',
-      cell: ({ row }) => formatDateTime(row.original.updated_at),
-    },
-  ];
-
-  if (error) {
-    return <ErrorState message={error.message} onRetry={reload} />;
-  }
-
+// 详情页头：返回列表链接 + 仓库名大标题 + 徽标组（格式/类型/可见性/停用态）
+function DetailHeader({ repo }: { repo: RepoInfo }) {
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <Button variant="ghost" size="sm" disabled={path === ''} onClick={goUp}>
-          <ChevronLeft className="size-4" aria-hidden />
-          上级
-        </Button>
-        <span>当前路径：/{path}</span>
-      </div>
-      <DataTable
-        columns={columns}
-        data={data?.items ?? []}
-        isLoading={loading}
-        emptyState={<EmptyState title="空目录" description="该目录下暂无条目" />}
-        page={page}
-        pageSize={pageSize}
-        total={data?.total ?? 0}
-        onPageChange={setPage}
-        onPageSizeChange={(size) => {
-          setPageSize(size);
-          setPage(1);
-        }}
-      />
-    </div>
-  );
-}
-
-// 使用方式：按格式罗列可复制的客户端配置片段
-function UsagePanel({ name }: { name: string }) {
-  const loader = useCallback(() => repoApi.usage(name), [name]);
-  const { data, error, loading, reload } = useAsync(loader);
-
-  if (loading) {
-    return <Skeleton className="h-40 w-full" />;
-  }
-  if (error) {
-    return <ErrorState message={error.message} onRetry={reload} />;
-  }
-  return (
-    <div className="flex flex-col gap-4">
-      {(data ?? []).map((snippet) => (
-        <div key={snippet.title} className="flex flex-col gap-2">
-          <h3 className="text-sm font-medium">{snippet.title}</h3>
-          <pre className="overflow-x-auto rounded-md border bg-muted p-3 text-xs">
-            {snippet.content}
-          </pre>
+      <Link
+        to="/repos"
+        className="flex w-fit items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ArrowLeft className="size-4" aria-hidden />
+        返回仓库列表
+      </Link>
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="text-2xl font-semibold tracking-tight text-foreground">{repo.name}</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline">{repo.format.toUpperCase()}</Badge>
+          <StatusBadge kind="repo-type" value={repo.repo_type} />
+          <StatusBadge kind="visibility" value={repo.visibility} />
+          {repo.disabled ? <Badge variant="destructive">已停用</Badge> : null}
         </div>
-      ))}
+      </div>
     </div>
   );
 }
 
 export function RepositoryDetailPage() {
   const { name = '' } = useParams();
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const loader = useCallback(() => repoApi.detail(name), [name]);
-  const { data: repo, error, loading, reload } = useAsync(loader);
+  const { data: repo, error, reload } = useAsync(loader);
+  useRegisterRefresh(reload);
+  // 标签页与选中文件以 URL 查询参数为真源：切换/选中即入历史，前进后退与刷新可恢复
+  const tabParam = searchParams.get('tab');
+  const tab: TabId = tabParam && isTabId(tabParam) ? tabParam : 'browse';
+  const filePath = searchParams.get('file');
 
-  if (loading) {
-    return <Skeleton className="h-64 w-full" />;
-  }
+  const changeTab = (value: string) => {
+    if (!isTabId(value)) return;
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', value);
+      return next;
+    });
+  };
+
+  // 选中文件：写入 URL 并切到浏览页签，push 历史以支持前进/后退在文件间导航
+  const selectFile = (path: string | null) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('tab', 'browse');
+      if (path) next.set('file', path);
+      else next.delete('file');
+      return next;
+    });
+  };
+
   // 404：仓库不存在或对当前用户不可见（private 零存在性泄露）
   if (error?.status === 404) {
     return (
       <EmptyState title="仓库不存在或无权访问" description="请确认仓库名，或联系管理员授予权限" />
     );
   }
-  if (error || !repo) {
-    return <ErrorState message={error?.message ?? '加载仓库详情失败'} onRetry={reload} />;
+  if (error) {
+    return <ErrorState message={error.message} onRetry={reload} />;
+  }
+  // 仅首次加载展示骨架；保存后的刷新沿用已有数据，避免整页闪烁与标签页状态丢失
+  if (!repo) {
+    return <Skeleton className="h-64 w-full" />;
   }
 
   return (
-    <div className="flex flex-col gap-6">
-      <PageHeader title={repo.name} description="仓库详情与文件浏览" />
-      <RepoInfoCard repo={repo} />
-      <Tabs defaultValue="files">
-        <TabsList>
-          <TabsTrigger value="files">文件浏览</TabsTrigger>
-          <TabsTrigger value="usage">使用方式</TabsTrigger>
+    <div className="flex h-full flex-col gap-5">
+      <DetailHeader repo={repo} />
+      <Tabs value={tab} onValueChange={changeTab} className="flex min-h-0 flex-1 flex-col gap-4">
+        <TabsList className="shrink-0 self-start">
+          <TabsTrigger value="browse">浏览</TabsTrigger>
+          <TabsTrigger value="config">配置</TabsTrigger>
+          <TabsTrigger value="acl">权限</TabsTrigger>
         </TabsList>
-        <TabsContent value="files">
-          <FilesBrowser name={repo.name} />
+        {/* 浏览页签内部滚动（左树右详情各自滚），页面不整体滚 */}
+        <TabsContent value="browse" className="min-h-0 flex-1 overflow-hidden">
+          <FileBrowser
+            name={repo.name}
+            format={repo.format}
+            selectedPath={filePath}
+            onSelectFile={selectFile}
+          />
         </TabsContent>
-        <TabsContent value="usage">
-          <UsagePanel name={repo.name} />
+        <TabsContent value="config" className="min-h-0 flex-1 overflow-y-auto">
+          <RepoConfigPanel repo={repo} onSaved={reload} onDeleted={() => navigate('/repos')} />
+        </TabsContent>
+        <TabsContent value="acl" className="min-h-0 flex-1 overflow-y-auto">
+          <AclPanel repoName={repo.name} />
         </TabsContent>
       </Tabs>
     </div>

@@ -4,6 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ForbiddenState } from '@jianartifact/ui';
 import { AuthProvider } from './auth/AuthContext';
 import { AuthenticatedLayout } from './routes/AuthenticatedLayout';
+import { RefreshProvider } from './routes/RefreshContext';
 import { RequireAdmin, RequireAuth } from './routes/guards';
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
@@ -30,7 +31,9 @@ export default function App() {
           <Route
             element={
               <RequireAuth>
-                <AuthenticatedLayout />
+                <RefreshProvider>
+                  <AuthenticatedLayout />
+                </RefreshProvider>
               </RequireAuth>
             }
           >

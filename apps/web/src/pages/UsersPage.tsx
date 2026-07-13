@@ -1,4 +1,4 @@
-// 用户管理（Admin）：用户列表 + 新增用户 + 启停切换与角色调整。
+// 用户管理（Admin）：用户列表 + 新增用户 + 启停切换、角色调整与口令重置（M1-FR-045）。
 // 后端拒绝（如最后一名管理员保护 403）以其返回消息在页首提示。
 import { useCallback, useState, type FormEvent } from 'react';
 import { Plus } from 'lucide-react';
@@ -31,20 +31,94 @@ import {
 import { ApiClientError } from '../api/client';
 import { userApi } from '../api/endpoints';
 import { useAsync } from '../lib/useAsync';
+import { useRegisterRefresh } from '../routes/RefreshContext';
 import { formatDateTime } from '../lib/format';
+import { NameFilterInput } from '../components/NameFilterInput';
 
 type UserInfo = components['schemas']['UserInfo'];
 type Role = components['schemas']['Role'];
 type UpdateUserRequest = components['schemas']['UpdateUserRequest'];
 
-// 行内用户操作：启停切换与角色调整；失败上抛消息由页首统一提示
+// 重置口令对话框（Admin 专属）：输入新口令提交，成功后关闭并在页首提示
+function ResetPasswordDialog({
+  user,
+  onDone,
+  onError,
+}: {
+  user: UserInfo;
+  onDone: () => void;
+  onError: (message: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (!next) setPassword('');
+  };
+
+  const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSubmitting(true);
+    try {
+      await userApi.update(user.id, { password });
+      handleOpenChange(false);
+      onDone();
+    } catch (err) {
+      handleOpenChange(false);
+      onError(err instanceof ApiClientError ? err.message : '重置口令失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm">
+          重置口令
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>重置 {user.username} 的口令</DialogTitle>
+          <DialogDescription>
+            提交后旧口令立即失效；新口令仅用于传输，落库为哈希。
+          </DialogDescription>
+        </DialogHeader>
+        <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={`reset-password-${user.id}`}>新口令</Label>
+            <Input
+              id={`reset-password-${user.id}`}
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+            />
+          </div>
+          <DialogFooter>
+            <Button type="submit" disabled={submitting || password === ''}>
+              {submitting ? '重置中…' : '重置'}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// 行内用户操作：启停切换、角色调整与口令重置；失败上抛消息由页首统一提示
 function UserActions({
   user,
   onChanged,
+  onNotice,
   onError,
 }: {
   user: UserInfo;
   onChanged: () => void;
+  onNotice: (message: string) => void;
   onError: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -79,6 +153,11 @@ function UserActions({
       >
         {user.role === 'admin' ? '降为普通' : '升为管理员'}
       </Button>
+      <ResetPasswordDialog
+        user={user}
+        onDone={() => onNotice(`已重置 ${user.username} 的口令`)}
+        onError={onError}
+      />
     </div>
   );
 }
@@ -185,10 +264,22 @@ function CreateUserDialog({ onCreated }: { onCreated: () => void }) {
 export function UsersPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
+  const [q, setQ] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
 
-  const loader = useCallback(() => userApi.list({ page, page_size: pageSize }), [page, pageSize]);
+  const loader = useCallback(
+    () => userApi.list({ page, page_size: pageSize, q: q === '' ? undefined : q }),
+    [page, pageSize, q],
+  );
   const { data, error, loading, reload } = useAsync(loader);
+  useRegisterRefresh(reload);
+
+  // 筛选值落定后传 q 并回到第 1 页
+  const handleFilter = useCallback((value: string) => {
+    setQ(value.trim());
+    setPage(1);
+  }, []);
 
   const columns: ColumnDef<UserInfo>[] = [
     { accessorKey: 'username', header: '用户名' },
@@ -225,43 +316,61 @@ export function UsersPage() {
           user={row.original}
           onChanged={() => {
             setActionError(null);
+            setActionNotice(null);
             reload();
           }}
-          onError={setActionError}
+          onNotice={(message) => {
+            setActionError(null);
+            setActionNotice(message);
+          }}
+          onError={(message) => {
+            setActionNotice(null);
+            setActionError(message);
+          }}
         />
       ),
     },
   ];
 
   return (
-    <div className="flex flex-col gap-6">
+    <div className="flex h-full flex-col gap-6">
       <PageHeader
         title="用户管理"
         description="管理用户角色与启停状态"
         actions={<CreateUserDialog onCreated={reload} />}
       />
+      <NameFilterInput onDebouncedChange={handleFilter} />
       {actionError ? (
         <Alert variant="destructive">
           <AlertTitle>操作被拒绝</AlertTitle>
           <AlertDescription>{actionError}</AlertDescription>
         </Alert>
       ) : null}
+      {actionNotice ? (
+        <Alert>
+          <AlertTitle>操作成功</AlertTitle>
+          <AlertDescription>{actionNotice}</AlertDescription>
+        </Alert>
+      ) : null}
       {error ? (
         <ErrorState message={error.message} onRetry={reload} />
       ) : (
-        <DataTable
-          columns={columns}
-          data={data?.items ?? []}
-          isLoading={loading}
-          page={page}
-          pageSize={pageSize}
-          total={data?.total ?? 0}
-          onPageChange={setPage}
-          onPageSizeChange={(size) => {
-            setPageSize(size);
-            setPage(1);
-          }}
-        />
+        // 表格区固定高度、由 DataTable 内部管理滚动：表格内滚、分页固定底部
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <DataTable
+            columns={columns}
+            data={data?.items ?? []}
+            isLoading={loading}
+            page={page}
+            pageSize={pageSize}
+            total={data?.total ?? 0}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
+        </div>
       )}
     </div>
   );

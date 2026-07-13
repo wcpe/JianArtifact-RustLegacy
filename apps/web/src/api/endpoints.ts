@@ -9,6 +9,8 @@ type Schemas = components['schemas'];
 export type PageQuery = {
   page?: number;
   page_size?: number;
+  // 名称子串筛选（可选）：缺省或空串表示不筛选，由后端做子串匹配
+  q?: string;
 };
 
 // 认证
@@ -18,6 +20,9 @@ export const authApi = {
   refresh: () => apiRequest<Schemas['SessionToken']>('/api/v1/auth/refresh', { method: 'POST' }),
   // 204 无内容响应：返回值实际为 undefined
   logout: () => apiRequest<undefined>('/api/v1/auth/logout', { method: 'POST' }),
+  // 修改本人口令（M1-FR-045）：旧口令校验通过后生效，204 无内容
+  changePassword: (body: Schemas['ChangePasswordRequest']) =>
+    apiRequest<undefined>('/api/v1/auth/password', { method: 'POST', body }),
 };
 
 // API Token
@@ -46,6 +51,22 @@ export const repoApi = {
   detail: (name: string) => apiRequest<Schemas['RepoInfo']>(`/api/v1/repos/${name}`),
   update: (name: string, body: Schemas['UpdateRepoRequest']) =>
     apiRequest<Schemas['RepoInfo']>(`/api/v1/repos/${name}`, { method: 'PATCH', body }),
+  // 删除仓库（M1-FR-009）：显式模式（仅删配置/删除数据）+ 确认头原样携带仓库名防误触
+  remove: (name: string, mode: 'config' | 'data', confirmName: string) =>
+    apiRequest<Schemas['DeleteRepoResponse']>(`/api/v1/repos/${name}`, {
+      method: 'DELETE',
+      query: { mode },
+      headers: { 'X-Confirm-Repository': confirmName },
+    }),
+  // 仓库 ACL（M1-FR-008）：列出 / 设置 / 移除某用户的授权
+  aclList: (name: string) => apiRequest<Schemas['AclEntry'][]>(`/api/v1/repos/${name}/acl`),
+  aclSet: (name: string, userId: number, permission: Schemas['Permission']) =>
+    apiRequest<Schemas['AclEntry']>(`/api/v1/repos/${name}/acl/${userId}`, {
+      method: 'PUT',
+      body: { permission },
+    }),
+  aclRemove: (name: string, userId: number) =>
+    apiRequest<undefined>(`/api/v1/repos/${name}/acl/${userId}`, { method: 'DELETE' }),
   files: (name: string, query?: PageQuery & { path?: string }) =>
     apiRequest<Schemas['FileListResponse']>(`/api/v1/repos/${name}/files`, { query }),
   search: (name: string, query: PageQuery & { q: string }) =>
@@ -69,4 +90,13 @@ export const migrationApi = {
   taskDetail: (id: string) => apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}`),
   report: (id: string) =>
     apiRequest<Schemas['MigrationReport']>(`/api/v1/migration/tasks/${id}/report`),
+  // 任务控制四动作（M1-FR-034）：非法状态转移由后端返回 409
+  pause: (id: string) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/pause`, { method: 'POST' }),
+  resume: (id: string) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/resume`, { method: 'POST' }),
+  cancel: (id: string) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/cancel`, { method: 'POST' }),
+  retry: (id: string) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/retry`, { method: 'POST' }),
 };
