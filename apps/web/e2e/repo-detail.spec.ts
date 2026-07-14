@@ -31,8 +31,7 @@ test('详情页三标签页：浏览校验和与下载、配置保存、权限�
   await expect(page.getByText('已保存')).toBeVisible();
   // 权限：添加 dev 只读授权再移除
   await page.getByRole('tab', { name: '权限' }).click();
-  await page.getByRole('combobox', { name: '用户' }).click();
-  await page.getByRole('option', { name: 'dev' }).click();
+  await page.getByRole('textbox', { name: '用户名' }).fill('dev');
   await page.getByRole('button', { name: '添加' }).click();
   await expect(page.getByRole('cell', { name: 'dev' })).toBeVisible();
   await page.getByRole('button', { name: '移除' }).click();

@@ -1,78 +1,26 @@
-//! 仓库域契约骨架（M1-FR-007~009、019~020）：仓库生命周期、ACL、浏览、搜索与使用片段。
-//! 阶段 1 只定契约，handler 返回未实现；业务逻辑随阶段 3 落地（见 docs/specs/m1-repository-core.md）。
+//! 仓库核心管理 API：元数据生命周期、可见性、ACL 与 group 成员关系。
+//! 文件浏览、搜索、使用片段与格式协议仍保持 501，占位能力不在本批次实现。
 
+use axum::Json;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::PageQuery;
+use crate::api::extractor::{OptionalAuth, RequireAdmin};
+use crate::auth::AuthIdentity;
+use crate::domain::repository::{AclRecord, Repository, Subject};
 use crate::error::ApiError;
+use crate::repository::{self, CreateRepository, DeleteMode as ServiceDeleteMode, RepositoryPatch};
+use crate::state::AppState;
 
-/// 制品格式。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    /// 任意路径直传。
-    Raw,
-    /// Maven2 布局。
-    Maven,
-    /// npm registry 协议。
-    Npm,
-}
-
-/// 仓库类型。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum RepoType {
-    /// 托管仓库：接收上传。
-    Hosted,
-    /// 代理仓库：回源并缓存上游。
-    Proxy,
-    /// 只读聚合仓库：按序聚合成员。
-    Group,
-}
-
-/// 仓库可见性。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Visibility {
-    /// 匿名可读。
-    Public,
-    /// 仅授权用户可见，不泄露存在性。
-    Private,
-}
-
-/// 同路径覆盖策略。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum OverwritePolicy {
-    /// 允许覆盖（旧内容失去引用即回收）。
-    Allow,
-    /// 拒绝覆盖（同路径再上传返回冲突）。
-    Deny,
-}
-
-/// Maven 版本策略（仅 Maven hosted 有效）。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum VersionPolicy {
-    /// 仅 release。
-    Release,
-    /// 仅 snapshot。
-    Snapshot,
-    /// 混合。
-    Mixed,
-}
-
-/// 仓库 ACL 动作（向下包含：admin ⊃ write ⊃ read）。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Permission {
-    /// 下载、浏览、元数据。
-    Read,
-    /// 上传、覆盖、删除制品。
-    Write,
-    /// 仓库配置、可见性与 ACL 管理。
-    Admin,
-}
+/// 仓库领域枚举下移至 domain，此处重新导出以保持既有 API 引用路径。
+pub use crate::domain::repository::{
+    Format, OverwritePolicy, Permission, RepoType, VersionPolicy, Visibility,
+};
 
 /// 反序列化 PATCH 的可空字段：缺失为 None，显式 null 为 Some(None)。
 fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -81,6 +29,15 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// 反序列化可选但不可为 null 的字段：缺失为 None，显式 null 直接报错。
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// 仓库信息。
@@ -94,30 +51,51 @@ pub struct RepoInfo {
     pub repo_type: RepoType,
     /// 可见性。
     pub visibility: Visibility,
-    /// 是否已停用（停用后格式端点按不存在处理）。
+    /// 是否已停用。
     pub disabled: bool,
     /// 覆盖策略（hosted 有效）。
     pub overwrite_policy: Option<OverwritePolicy>,
     /// Maven 版本策略（Maven hosted 有效）。
     pub version_policy: Option<VersionPolicy>,
-    /// proxy 上游地址（proxy 有效）。
+    /// proxy 上游地址。
     pub upstream_url: Option<String>,
-    /// proxy 上游凭据引用名（只存引用，不含凭据值）。
+    /// proxy 上游凭据引用名。
     pub upstream_credential_ref: Option<String>,
-    /// group 成员（有序，group 有效）。
+    /// group 有序成员。
     pub members: Option<Vec<String>>,
-    /// 制品数（仓库内文件总数，列表与详情展示）。
+    /// 制品数；本批次尚无制品索引，恒为零。
     pub object_count: i64,
-    /// 总大小（仓库内文件字节合计）。
+    /// 总大小；本批次尚无制品索引，恒为零。
     pub total_bytes: i64,
     /// 创建时间。
     pub created_at: String,
 }
 
+impl From<Repository> for RepoInfo {
+    fn from(repository: Repository) -> Self {
+        let members = (repository.repo_type == RepoType::Group).then_some(repository.members);
+        Self {
+            name: repository.name,
+            format: repository.format,
+            repo_type: repository.repo_type,
+            visibility: repository.visibility,
+            disabled: repository.disabled,
+            overwrite_policy: repository.overwrite_policy,
+            version_policy: repository.version_policy,
+            upstream_url: repository.upstream_url,
+            upstream_credential_ref: repository.upstream_credential_ref,
+            members,
+            object_count: repository.object_count,
+            total_bytes: repository.total_bytes,
+            created_at: repository.created_at,
+        }
+    }
+}
+
 /// 创建仓库请求体。
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRepoRequest {
-    /// 仓库名：小写字母/数字/连字符，1–64 字符，创建后不可改。
+    /// 仓库名：小写字母/数字/连字符，1–64 字符。
     pub name: String,
     /// 制品格式（创建后不可变）。
     pub format: Format,
@@ -125,78 +103,123 @@ pub struct CreateRepoRequest {
     pub repo_type: RepoType,
     /// 可见性。
     pub visibility: Visibility,
-    /// 覆盖策略（hosted，可选按格式默认；提供时不可为 null）。
+    /// hosted 覆盖策略；缺失时默认 allow。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub overwrite_policy: Option<OverwritePolicy>,
-    /// Maven 版本策略（Maven hosted，默认 mixed；提供时不可为 null）。
+    /// Maven hosted 版本策略；缺失时默认 mixed。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub version_policy: Option<VersionPolicy>,
-    /// proxy 上游地址（proxy 必填；提供时不可为 null）。
+    /// proxy 上游地址。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub upstream_url: Option<String>,
-    /// proxy 上游凭据引用名（可选）。
+    /// proxy 上游凭据引用名。
     pub upstream_credential_ref: Option<String>,
-    /// group 成员（group 必填，有序，须同格式 hosted/proxy；提供时不可为 null）。
+    /// group 有序成员。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub members: Option<Vec<String>>,
 }
 
-/// 编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。
+impl From<CreateRepoRequest> for CreateRepository {
+    fn from(request: CreateRepoRequest) -> Self {
+        Self {
+            name: request.name,
+            format: request.format,
+            repo_type: request.repo_type,
+            visibility: request.visibility,
+            overwrite_policy: request.overwrite_policy,
+            version_policy: request.version_policy,
+            upstream_url: request.upstream_url,
+            upstream_credential_ref: request.upstream_credential_ref,
+            members: request.members,
+        }
+    }
+}
+
+/// 编辑仓库请求体：字段可选，只更新给出的项。
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepoRequest {
-    /// 可见性；提供时不可为 null。
+    /// 可见性。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub visibility: Option<Visibility>,
-    /// 停用/启用；提供时不可为 null。
+    /// 停用/启用状态。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub disabled: Option<bool>,
-    /// hosted 覆盖策略；提供时不可为 null。
+    /// hosted 覆盖策略。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub overwrite_policy: Option<OverwritePolicy>,
-    /// Maven hosted 版本策略；提供时不可为 null。
+    /// Maven hosted 版本策略。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub version_policy: Option<VersionPolicy>,
-    /// proxy 上游地址；提供时不可为 null。
+    /// proxy 上游地址。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub upstream_url: Option<String>,
     /// proxy 上游凭据引用名：缺失不更新，字符串替换，显式 null 清空。
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     #[schema(nullable = true)]
     pub upstream_credential_ref: Option<Option<String>>,
-    /// group 成员（整体替换且保持顺序；空数组清空，提供时不可为 null）。
+    /// group 成员整体替换并保持顺序。
+    #[serde(default, deserialize_with = "deserialize_optional_non_null")]
     #[schema(nullable = false)]
     pub members: Option<Vec<String>>,
 }
 
-/// 仓库列表分页响应（只含调用方可读仓库，零存在性泄露）。
+impl From<UpdateRepoRequest> for RepositoryPatch {
+    fn from(request: UpdateRepoRequest) -> Self {
+        Self {
+            visibility: request.visibility,
+            disabled: request.disabled,
+            overwrite_policy: request.overwrite_policy,
+            version_policy: request.version_policy,
+            upstream_url: request.upstream_url,
+            upstream_credential_ref: request.upstream_credential_ref,
+            members: request.members,
+        }
+    }
+}
+
+/// 仓库列表分页响应。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepoListResponse {
     /// 当前页仓库。
     pub items: Vec<RepoInfo>,
-    /// 当前页码（从 1 起）。
+    /// 当前页码。
     pub page: u32,
     /// 每页条数。
     pub page_size: u32,
-    /// 总条数。
+    /// 权限过滤后的总条数。
     pub total: i64,
 }
 
-/// 删除模式（高风险动作，必须显式给出）。
-#[derive(Debug, Deserialize, ToSchema)]
+/// 删除模式。
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DeleteMode {
-    /// 删除配置、ACL 与制品索引，blob 本体保留（数量入响应，物理回收待后续 GC）。
+    /// 仅删除配置；本批次计数固定为零。
     Config,
-    /// 在 config 基础上物理删除无其他引用的 blob。
+    /// 数据物理删除尚未实现，稳定返回 501。
     Data,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteQuery {
+    mode: DeleteMode,
 }
 
 /// 删除结果。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteRepoResponse {
-    /// 因本次删除失去全部引用而遗留的 blob 数（mode=config 时非零有意义）。
+    /// 因删除失去引用的 blob 数；本批次恒为零。
     pub orphaned_blobs: i64,
-    /// 被物理回收的 blob 数（mode=data 时有意义）。
+    /// 被物理回收的 blob 数；本批次恒为零。
     pub reclaimed_blobs: i64,
 }
 
@@ -205,39 +228,49 @@ pub struct DeleteRepoResponse {
 pub struct AclEntry {
     /// 用户标识。
     pub user_id: i64,
-    /// 用户名。
+    /// 精确用户名。
     pub username: String,
-    /// 授予的动作（向下包含）。
+    /// 授予权限。
     pub permission: Permission,
+}
+
+impl From<AclRecord> for AclEntry {
+    fn from(record: AclRecord) -> Self {
+        Self {
+            user_id: record.user_id,
+            username: record.username,
+            permission: record.permission,
+        }
+    }
 }
 
 /// 设置 ACL 请求体。
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetAclRequest {
-    /// 授予的动作。
+    /// 授予权限。
     pub permission: Permission,
 }
 
 /// 浏览条目（目录或文件）。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FileEntry {
-    /// 条目名（不含父目录）。
+    /// 条目名。
     pub name: String,
-    /// 仓库根相对完整路径；客户端不得自行拼接。
+    /// 仓库根相对完整路径。
     pub path: String,
     /// 是否目录。
     pub is_dir: bool,
-    /// 文件大小（字节，目录为空）。
+    /// 文件大小。
     pub size: Option<i64>,
-    /// sha256 校验和（文件）。
+    /// sha256 校验和。
     pub sha256: Option<String>,
-    /// sha1 校验和（文件，Maven 生态）。
+    /// sha1 校验和。
     pub sha1: Option<String>,
-    /// md5 校验和（文件，Maven 生态）。
+    /// md5 校验和。
     pub md5: Option<String>,
-    /// sha512 校验和（文件，npm integrity）。
+    /// sha512 校验和。
     pub sha512: Option<String>,
-    /// 内容类型（文件）。
+    /// 内容类型。
     pub content_type: Option<String>,
     /// 更新时间。
     pub updated_at: Option<String>,
@@ -248,7 +281,7 @@ pub struct FileEntry {
 pub struct FileListResponse {
     /// 当前页条目。
     pub items: Vec<FileEntry>,
-    /// 当前页码（从 1 起）。
+    /// 当前页码。
     pub page: u32,
     /// 每页条数。
     pub page_size: u32,
@@ -259,10 +292,33 @@ pub struct FileListResponse {
 /// 使用方式片段。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UsageSnippet {
-    /// 片段标题（如「Maven settings.xml」）。
+    /// 片段标题。
     pub title: String,
-    /// 可复制的配置/命令文本，凭据一律为占位符。
+    /// 可复制内容。
     pub content: String,
+}
+
+fn subject_from_optional(auth: OptionalAuth) -> Subject {
+    match auth.0 {
+        Some(identity) => subject_from_identity(identity),
+        None => Subject::Anonymous,
+    }
+}
+
+fn subject_from_identity(identity: AuthIdentity) -> Subject {
+    Subject::Authenticated {
+        user_id: identity.user_id,
+        role: identity.role,
+        enabled: true,
+    }
+}
+
+fn invalid_json(_: JsonRejection) -> ApiError {
+    ApiError::bad_request("REPO_INVALID_CONFIG", "仓库请求字段或 JSON 格式无效")
+}
+
+fn invalid_query(_: QueryRejection) -> ApiError {
+    ApiError::bad_request("REPO_INVALID_QUERY", "仓库查询参数无效")
 }
 
 /// 仓库列表（按权限过滤，分页）。
@@ -276,15 +332,32 @@ pub struct UsageSnippet {
         ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
         ("q" = Option<String>, Query, description = "按仓库名子串筛选（可选）"),
     ),
-    responses(
-        (status = 200, description = "仓库分页（只含调用方可读仓库）", body = RepoListResponse),
-    ),
+    responses((status = 200, description = "仓库分页", body = RepoListResponse)),
 )]
-pub async fn list() -> ApiError {
-    ApiError::not_implemented("仓库列表接口待阶段 3 实现")
+pub async fn list(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    query: Result<Query<PageQuery>, QueryRejection>,
+) -> Result<Json<RepoListResponse>, ApiError> {
+    let Query(query) = query.map_err(invalid_query)?;
+    let (page, page_size) = query.resolve();
+    let (repositories, total) = repository::list_repositories(
+        &state.pool,
+        subject_from_optional(auth),
+        page,
+        page_size,
+        query.q.as_deref(),
+    )
+    .await?;
+    Ok(Json(RepoListResponse {
+        items: repositories.into_iter().map(RepoInfo::from).collect(),
+        page,
+        page_size,
+        total,
+    }))
 }
 
-/// 创建仓库（Admin）。
+/// 创建仓库（仅全局 Admin）。
 #[utoipa::path(
     post,
     operation_id = "repos_create",
@@ -293,12 +366,21 @@ pub async fn list() -> ApiError {
     request_body = CreateRepoRequest,
     responses(
         (status = 201, description = "创建成功", body = RepoInfo),
+        (status = 400, description = "类型字段或配置组合非法", body = crate::error::ErrorBody),
         (status = 403, description = "无管理员权限", body = crate::error::ErrorBody),
         (status = 409, description = "仓库名已存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn create() -> ApiError {
-    ApiError::not_implemented("仓库创建接口待阶段 3 实现")
+pub async fn create(
+    RequireAdmin(identity): RequireAdmin,
+    State(state): State<AppState>,
+    body: Result<Json<CreateRepoRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(request) = body.map_err(invalid_json)?;
+    let repository =
+        repository::create_repository(&state.pool, subject_from_identity(identity), request.into())
+            .await?;
+    Ok((StatusCode::CREATED, Json(RepoInfo::from(repository))))
 }
 
 /// 仓库详情。
@@ -309,11 +391,17 @@ pub async fn create() -> ApiError {
     params(("name" = String, Path, description = "仓库名")),
     responses(
         (status = 200, description = "仓库详情", body = RepoInfo),
-        (status = 404, description = "仓库不存在（含无权访问的 private）", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库不存在或无权访问", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn detail() -> ApiError {
-    ApiError::not_implemented("仓库详情接口待阶段 3 实现")
+pub async fn detail(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<RepoInfo>, ApiError> {
+    let repository =
+        repository::get_repository(&state.pool, subject_from_optional(auth), &name).await?;
+    Ok(Json(RepoInfo::from(repository)))
 }
 
 /// 编辑仓库（仓库 admin）。
@@ -326,31 +414,74 @@ pub async fn detail() -> ApiError {
     request_body = UpdateRepoRequest,
     responses(
         (status = 200, description = "更新成功", body = RepoInfo),
-        (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
+        (status = 400, description = "类型字段或配置组合非法", body = crate::error::ErrorBody),
+        (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库不存在或无权访问", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn update() -> ApiError {
-    ApiError::not_implemented("仓库编辑接口待阶段 3 实现")
+pub async fn update(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: Result<Json<UpdateRepoRequest>, JsonRejection>,
+) -> Result<Json<RepoInfo>, ApiError> {
+    let Json(request) = body.map_err(invalid_json)?;
+    let repository = repository::update_repository(
+        &state.pool,
+        subject_from_optional(auth),
+        &name,
+        request.into(),
+    )
+    .await?;
+    Ok(Json(RepoInfo::from(repository)))
 }
 
-/// 删除仓库（仓库 admin，高风险，需显式模式与确认头 X-Confirm-Repository=仓库名）。
+/// 删除仓库（仓库 admin，需确认头）。
 #[utoipa::path(
     delete,
     path = "/api/v1/repos/{name}",
     tag = "repos",
     params(
         ("name" = String, Path, description = "仓库名"),
-        ("mode" = DeleteMode, Query, description = "删除模式：config 仅删配置与索引 / data 连带物理回收无引用 blob"),
-        ("X-Confirm-Repository" = String, Header, description = "防误删确认：必须与仓库名一致"),
+        ("mode" = DeleteMode, Query, description = "删除模式"),
+        ("X-Confirm-Repository" = String, Header, description = "必须与仓库名一致"),
     ),
     responses(
         (status = 200, description = "删除完成", body = DeleteRepoResponse),
-        (status = 400, description = "缺少或不匹配的确认头/模式", body = crate::error::ErrorBody),
-        (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
+        (status = 400, description = "确认头或模式无效", body = crate::error::ErrorBody),
+        (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库不存在或无权访问", body = crate::error::ErrorBody),
+        (status = 409, description = "仓库仍被 group 引用", body = crate::error::ErrorBody),
+        (status = 501, description = "数据物理删除尚未实现", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn delete() -> ApiError {
-    ApiError::not_implemented("仓库删除接口待阶段 3 实现")
+pub async fn delete(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    query: Result<Query<DeleteQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Result<Json<DeleteRepoResponse>, ApiError> {
+    let Query(query) = query.map_err(invalid_query)?;
+    let mode = match query.mode {
+        DeleteMode::Config => ServiceDeleteMode::Config,
+        DeleteMode::Data => ServiceDeleteMode::Data,
+    };
+    let confirmation = headers
+        .get("x-confirm-repository")
+        .and_then(|value| value.to_str().ok());
+    let result = repository::delete_repository(
+        &state.pool,
+        subject_from_optional(auth),
+        &name,
+        mode,
+        confirmation,
+    )
+    .await?;
+    Ok(Json(DeleteRepoResponse {
+        orphaned_blobs: result.orphaned_blobs,
+        reclaimed_blobs: result.reclaimed_blobs,
+    }))
 }
 
 /// ACL 条目列表（仓库 admin）。
@@ -361,14 +492,20 @@ pub async fn delete() -> ApiError {
     params(("name" = String, Path, description = "仓库名")),
     responses(
         (status = 200, description = "ACL 条目", body = [AclEntry]),
-        (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
+        (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库不存在或无权访问", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn acl_list() -> ApiError {
-    ApiError::not_implemented("ACL 列表接口待阶段 3 实现")
+pub async fn acl_list(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<AclEntry>>, ApiError> {
+    let entries = repository::list_acl(&state.pool, subject_from_optional(auth), &name).await?;
+    Ok(Json(entries.into_iter().map(AclEntry::from).collect()))
 }
 
-/// 按用户名设置某用户的 ACL（仓库 admin）。
+/// 按精确用户名设置 ACL（仓库 admin）。
 #[utoipa::path(
     put,
     path = "/api/v1/repos/{name}/acl/{username}",
@@ -380,14 +517,29 @@ pub async fn acl_list() -> ApiError {
     request_body = SetAclRequest,
     responses(
         (status = 200, description = "已设置", body = AclEntry),
-        (status = 404, description = "仓库或用户不存在", body = crate::error::ErrorBody),
+        (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库或目标用户不存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn acl_set() -> ApiError {
-    ApiError::not_implemented("ACL 设置接口待阶段 3 实现")
+pub async fn acl_set(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path((name, username)): Path<(String, String)>,
+    body: Result<Json<SetAclRequest>, JsonRejection>,
+) -> Result<Json<AclEntry>, ApiError> {
+    let Json(request) = body.map_err(invalid_json)?;
+    let entry = repository::set_acl(
+        &state.pool,
+        subject_from_optional(auth),
+        &name,
+        &username,
+        request.permission,
+    )
+    .await?;
+    Ok(Json(AclEntry::from(entry)))
 }
 
-/// 按用户名移除某用户的 ACL（仓库 admin）。
+/// 按精确用户名移除 ACL（仓库 admin）。
 #[utoipa::path(
     delete,
     path = "/api/v1/repos/{name}/acl/{username}",
@@ -398,34 +550,41 @@ pub async fn acl_set() -> ApiError {
     ),
     responses(
         (status = 204, description = "已移除"),
-        (status = 404, description = "仓库或条目不存在", body = crate::error::ErrorBody),
+        (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库、用户或 ACL 条目不存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn acl_remove() -> ApiError {
-    ApiError::not_implemented("ACL 移除接口待阶段 3 实现")
+pub async fn acl_remove(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path((name, username)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    repository::remove_acl(&state.pool, subject_from_optional(auth), &name, &username).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// 仓库内目录浏览（read 权限，分页）。
+/// 仓库内目录浏览（本批次不实现）。
 #[utoipa::path(
     get,
     path = "/api/v1/repos/{name}/files",
     tag = "repos",
     params(
         ("name" = String, Path, description = "仓库名"),
-        ("path" = Option<String>, Query, description = "目录路径，缺省为根"),
-        ("page" = Option<u32>, Query, description = "页码，从 1 起"),
-        ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
+        ("path" = Option<String>, Query, description = "目录路径"),
+        ("page" = Option<u32>, Query, description = "页码"),
+        ("page_size" = Option<u32>, Query, description = "每页条数"),
     ),
     responses(
         (status = 200, description = "目录条目分页", body = FileListResponse),
         (status = 404, description = "仓库或路径不存在", body = crate::error::ErrorBody),
+        (status = 501, description = "仓库浏览尚未实现", body = crate::error::ErrorBody),
     ),
 )]
 pub async fn files() -> ApiError {
-    ApiError::not_implemented("仓库浏览接口待阶段 3 实现")
+    ApiError::not_implemented("仓库浏览接口不在本批次范围")
 }
 
-/// 仓库内路径搜索（read 权限，子串匹配，分页）。
+/// 仓库内路径搜索（本批次不实现）。
 #[utoipa::path(
     get,
     path = "/api/v1/repos/{name}/search",
@@ -433,19 +592,20 @@ pub async fn files() -> ApiError {
     params(
         ("name" = String, Path, description = "仓库名"),
         ("q" = String, Query, description = "路径子串"),
-        ("page" = Option<u32>, Query, description = "页码，从 1 起"),
-        ("page_size" = Option<u32>, Query, description = "每页条数，最大 200"),
+        ("page" = Option<u32>, Query, description = "页码"),
+        ("page_size" = Option<u32>, Query, description = "每页条数"),
     ),
     responses(
         (status = 200, description = "匹配条目分页", body = FileListResponse),
         (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
+        (status = 501, description = "仓库搜索尚未实现", body = crate::error::ErrorBody),
     ),
 )]
 pub async fn search() -> ApiError {
-    ApiError::not_implemented("仓库搜索接口待阶段 3 实现")
+    ApiError::not_implemented("仓库搜索接口不在本批次范围")
 }
 
-/// 使用方式片段（read 权限）。
+/// 使用方式片段（本批次不实现）。
 #[utoipa::path(
     get,
     path = "/api/v1/repos/{name}/usage",
@@ -454,8 +614,9 @@ pub async fn search() -> ApiError {
     responses(
         (status = 200, description = "按格式生成的客户端配置片段", body = [UsageSnippet]),
         (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
+        (status = 501, description = "使用片段尚未实现", body = crate::error::ErrorBody),
     ),
 )]
 pub async fn usage() -> ApiError {
-    ApiError::not_implemented("使用片段接口待阶段 3 实现")
+    ApiError::not_implemented("使用片段接口不在本批次范围")
 }

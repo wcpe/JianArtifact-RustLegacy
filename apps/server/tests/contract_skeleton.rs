@@ -8,6 +8,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use jianartifact_server::api::repos::UpdateRepoRequest;
 use jianartifact_server::config::Config;
+use jianartifact_server::error::StartupError;
 use tower::util::ServiceExt;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -58,23 +59,68 @@ async fn 就绪自检依赖齐备时二百() -> TestResult {
 }
 
 #[tokio::test]
-async fn 就绪自检数据目录不可写时五百零三() -> TestResult {
-    // 把 data_dir 指到一个「文件」之下，create_dir_all 必然失败
+async fn 启动创建数据目录且创建失败返回_io_错误() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let blocker = dir.path().join("occupied");
-    std::fs::write(&blocker, b"x")?;
+    let data_dir = dir.path().join("blobs");
     let config = Config {
         bind: "127.0.0.1:0".to_string(),
         database_path: dir.path().join("test.db"),
-        data_dir: blocker.join("blobs"),
+        data_dir: data_dir.clone(),
         log_level: "warn".to_string(),
-        // 测试用固定 JWT 密钥（非生产凭据），满足 build_app 的密钥非空校验
         jwt_secret: "test-jwt-secret-please-change".to_string(),
         session_ttl_hours: 8,
     };
-    let app = jianartifact_server::build_app(config).await?;
+    let _app = jianartifact_server::build_app(config.clone()).await?;
+    assert!(data_dir.is_dir(), "启动时应创建数据目录");
+
+    let blocked_dir = dir.path().join("blocked");
+    std::fs::write(&blocked_dir, b"x")?;
+    let failed = jianartifact_server::build_app(Config {
+        database_path: dir.path().join("blocked.db"),
+        data_dir: blocked_dir,
+        ..config
+    })
+    .await;
+    assert!(matches!(failed, Err(StartupError::Io(_))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn 就绪自检运行期目录丢失不重建且恢复后通过() -> TestResult {
+    let (app, dir) = test_app().await?;
+    let data_dir = dir.path().join("blobs");
+    assert!(data_dir.is_dir(), "启动时应已创建数据目录");
+
+    std::fs::remove_dir(&data_dir)?;
     let resp = send(&app, "GET", "/readyz").await?;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!data_dir.exists(), "运行期探针不得自动重建数据目录");
+    assert_eq!(
+        send(&app, "GET", "/healthz").await?.status(),
+        StatusCode::OK,
+        "存活探针不得受依赖故障影响"
+    );
+
+    std::fs::create_dir(&data_dir)?;
+    assert_eq!(send(&app, "GET", "/readyz").await?.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn 并发就绪自检全部通过且随机探针无残留() -> TestResult {
+    let (app, dir) = test_app().await?;
+    let mut requests = Vec::new();
+    for _ in 0..32 {
+        let app = app.clone();
+        let request = Request::get("/readyz").body(Body::empty())?;
+        requests.push(tokio::spawn(async move { app.oneshot(request).await }));
+    }
+    for request in requests {
+        assert_eq!(request.await??.status(), StatusCode::OK);
+    }
+
+    let entries = std::fs::read_dir(dir.path().join("blobs"))?.collect::<Result<Vec<_>, _>>()?;
+    assert!(entries.is_empty(), "就绪探针文件不得残留");
     Ok(())
 }
 
@@ -116,18 +162,23 @@ async fn 契约文档全部端点均已挂载且方法一致() -> TestResult {
             operations += 1;
             let resp = send(&app, &method.to_uppercase(), &uri).await?;
             let status = resp.status();
-            // 漂移判据：404=路由未挂载，405=方法不一致
-            assert_ne!(
-                status,
-                StatusCode::NOT_FOUND,
-                "{method} {path} 未挂载到路由"
-            );
+            // 方法不一致仍可直接由 405 判定；真实资源端点允许返回结构化业务 404。
             assert_ne!(
                 status,
                 StatusCode::METHOD_NOT_ALLOWED,
                 "{method} {path} 路由方法与契约不一致"
             );
-            // 阶段 1 语义：健康端点真实现（200/503），其余为 501 占位且带稳定错误码
+            if status == StatusCode::NOT_FOUND {
+                let body = resp.into_body().collect().await?.to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|_| format!("{method} {path} 返回裸 404，疑似路由未挂载"))?;
+                assert!(
+                    json["code"].as_str().is_some(),
+                    "{method} {path} 返回无错误码的 404，疑似路由未挂载"
+                );
+                continue;
+            }
+            // 未实现端点必须带稳定错误码；HEAD 按 HTTP 语义不读取响应体。
             if status == StatusCode::NOT_IMPLEMENTED && method != "head" {
                 let body = resp.into_body().collect().await?.to_bytes();
                 let json: serde_json::Value = serde_json::from_slice(&body)?;
@@ -156,6 +207,29 @@ async fn 仓库契约体现用户名_acl_显式清空_完整路径与格式端�
     assert!(doc["paths"]["/api/v1/repos/{name}/acl/{username}"]["put"].is_object());
     assert!(doc["paths"]["/api/v1/repos/{name}/acl/{username}"]["delete"].is_object());
     assert!(doc["paths"]["/api/v1/repos/{name}/acl/{user_id}"].is_null());
+
+    for (path, method) in [
+        ("/api/v1/repos/{name}", "patch"),
+        ("/api/v1/repos/{name}", "delete"),
+        ("/api/v1/repos/{name}/acl", "get"),
+        ("/api/v1/repos/{name}/acl/{username}", "put"),
+        ("/api/v1/repos/{name}/acl/{username}", "delete"),
+    ] {
+        assert!(
+            doc["paths"][path][method]["responses"]["403"].is_object(),
+            "{method} {path} 必须声明仓库 admin 权限不足的 403"
+        );
+    }
+    for path in [
+        "/api/v1/repos/{name}/files",
+        "/api/v1/repos/{name}/search",
+        "/api/v1/repos/{name}/usage",
+    ] {
+        assert!(
+            doc["paths"][path]["get"]["responses"]["501"].is_object(),
+            "get {path} 占位实现必须声明 501"
+        );
+    }
 
     let update = &doc["components"]["schemas"]["UpdateRepoRequest"]["properties"];
     assert!(update["version_policy"].is_object());

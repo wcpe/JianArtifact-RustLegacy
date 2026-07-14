@@ -36,6 +36,9 @@ fn err_invalid() -> ApiError {
 /// 任一有效凭据（Bearer JWT / Bearer API Token / Basic 口令或 Token）均可通过，产出已认证身份。
 pub struct RequireAuth(pub AuthIdentity);
 
+/// 可选身份：无 Authorization 头时返回匿名；一旦携带头，任何无效、吊销或禁用凭据都返回 401。
+pub struct OptionalAuth(pub Option<AuthIdentity>);
+
 /// 在 `RequireAuth` 基础上要求管理员角色，否则 403。
 pub struct RequireAdmin(pub AuthIdentity);
 
@@ -50,6 +53,22 @@ impl FromRequestParts<AppState> for RequireAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         Ok(RequireAuth(resolve_identity(parts, state).await?))
+    }
+}
+
+impl FromRequestParts<AppState> for OptionalAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if !parts.headers.contains_key(AUTHORIZATION) {
+            return Ok(OptionalAuth(None));
+        }
+        resolve_identity(parts, state)
+            .await
+            .map(|identity| OptionalAuth(Some(identity)))
     }
 }
 

@@ -29,6 +29,7 @@ type RepoInfo = components['schemas']['RepoInfo'];
 type UpdateRepoRequest = components['schemas']['UpdateRepoRequest'];
 type Visibility = components['schemas']['Visibility'];
 type OverwritePolicy = components['schemas']['OverwritePolicy'];
+type VersionPolicy = components['schemas']['VersionPolicy'];
 
 interface RepoConfigPanelProps {
   // 当前仓库详情（表单初值来源）
@@ -67,6 +68,19 @@ function Field({
   );
 }
 
+// 将成员文本归一为有序名称列表，空行与两端空白不构成真实变更
+function parseMembers(text: string): string[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '');
+}
+
+// 按顺序比较成员列表，避免普通保存误提交被后端过滤后的可见子集
+function sameMembers(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((member, index) => member === right[index]);
+}
+
 // 仓库配置面板
 export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelProps) {
   const [visibility, setVisibility] = useState<Visibility>(repo.visibility);
@@ -74,6 +88,7 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
   const [overwritePolicy, setOverwritePolicy] = useState<OverwritePolicy | ''>(
     repo.overwrite_policy ?? '',
   );
+  const [versionPolicy, setVersionPolicy] = useState<VersionPolicy | ''>(repo.version_policy ?? '');
   const [upstreamUrl, setUpstreamUrl] = useState(repo.upstream_url ?? '');
   const [credentialRef, setCredentialRef] = useState(repo.upstream_credential_ref ?? '');
   const [membersText, setMembersText] = useState((repo.members ?? []).join('\n'));
@@ -81,6 +96,7 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const upstreamUrlMissing = repo.repo_type === 'proxy' && upstreamUrl.trim() === '';
 
   // 组装 PATCH 请求体：通用字段始终提交，类型相关字段仅在对应类型下提交
   const buildUpdateBody = (): UpdateRepoRequest => {
@@ -88,15 +104,16 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
     if (repo.repo_type === 'hosted' && overwritePolicy !== '') {
       body.overwrite_policy = overwritePolicy;
     }
+    if (repo.repo_type === 'hosted' && repo.format === 'maven' && versionPolicy !== '') {
+      body.version_policy = versionPolicy;
+    }
     if (repo.repo_type === 'proxy') {
-      if (upstreamUrl.trim() !== '') body.upstream_url = upstreamUrl.trim();
-      if (credentialRef.trim() !== '') body.upstream_credential_ref = credentialRef.trim();
+      body.upstream_url = upstreamUrl.trim();
+      body.upstream_credential_ref = credentialRef.trim() || null;
     }
     if (repo.repo_type === 'group') {
-      body.members = membersText
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line !== '');
+      const members = parseMembers(membersText);
+      if (!sameMembers(members, repo.members ?? [])) body.members = members;
     }
     return body;
   };
@@ -105,6 +122,10 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
     event.preventDefault();
     setError(null);
     setNotice(null);
+    if (upstreamUrlMissing) {
+      setError('上游地址不能为空');
+      return;
+    }
     setSubmitting(true);
     try {
       await repoApi.update(repo.name, buildUpdateBody());
@@ -163,20 +184,39 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
               </Select>
             </Field>
             {repo.repo_type === 'hosted' ? (
-              <Field label="覆盖策略" htmlFor="config-overwrite">
-                <Select
-                  value={overwritePolicy}
-                  onValueChange={(value) => setOverwritePolicy(value as OverwritePolicy)}
-                >
-                  <SelectTrigger id="config-overwrite" className="w-full">
-                    <SelectValue placeholder="未设置" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="allow">允许覆盖</SelectItem>
-                    <SelectItem value="deny">禁止覆盖</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
+              <>
+                <Field label="覆盖策略" htmlFor="config-overwrite">
+                  <Select
+                    value={overwritePolicy}
+                    onValueChange={(value) => setOverwritePolicy(value as OverwritePolicy)}
+                  >
+                    <SelectTrigger id="config-overwrite" className="w-full">
+                      <SelectValue placeholder="未设置" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="allow">允许覆盖</SelectItem>
+                      <SelectItem value="deny">禁止覆盖</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Field>
+                {repo.format === 'maven' ? (
+                  <Field label="Maven 版本策略" htmlFor="config-version-policy">
+                    <Select
+                      value={versionPolicy}
+                      onValueChange={(value) => setVersionPolicy(value as VersionPolicy)}
+                    >
+                      <SelectTrigger id="config-version-policy" className="w-full">
+                        <SelectValue placeholder="未设置" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="release">Release</SelectItem>
+                        <SelectItem value="snapshot">Snapshot</SelectItem>
+                        <SelectItem value="mixed">混合</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                ) : null}
+              </>
             ) : null}
             {repo.repo_type === 'proxy' ? (
               <>
@@ -186,6 +226,8 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
                     value={upstreamUrl}
                     placeholder="https://…"
                     onChange={(event) => setUpstreamUrl(event.target.value)}
+                    required
+                    aria-invalid={upstreamUrlMissing}
                   />
                 </Field>
                 <Field label="上游凭据引用" htmlFor="config-credential-ref">
@@ -226,7 +268,7 @@ export function RepoConfigPanel({ repo, onSaved, onDeleted }: RepoConfigPanelPro
               </Select>
             </Field>
             <div className="sm:col-span-2">
-              <Button type="submit" disabled={submitting}>
+              <Button type="submit" disabled={submitting || upstreamUrlMissing}>
                 {submitting ? '保存中…' : '保存'}
               </Button>
             </div>

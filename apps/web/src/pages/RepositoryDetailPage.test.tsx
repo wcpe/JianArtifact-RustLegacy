@@ -1,5 +1,5 @@
 // 仓库详情测试：三标签页与 hash 映射、文件浏览（M1-FR-019）、校验和/下载、配置保存与 ACL 增删。
-import { fireEvent, screen, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
 import { Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -31,7 +31,8 @@ function clickTab(name: string) {
 
 // jsdom 无真实指针事件：键盘打开 Radix Select 并以 Enter 选中指定选项
 async function selectOption(comboboxName: string, optionName: string) {
-  fireEvent.keyDown(screen.getByRole('combobox', { name: comboboxName }), { key: 'ArrowDown' });
+  const combobox = await screen.findByRole('combobox', { name: comboboxName });
+  fireEvent.keyDown(combobox, { key: 'ArrowDown' });
   const option = await screen.findByRole('option', { name: optionName });
   fireEvent.keyDown(option, { key: 'Enter' });
 }
@@ -194,6 +195,93 @@ describe('仓库详情', () => {
     expect(await screen.findByText('已保存')).toBeInTheDocument();
   });
 
+  it('Maven hosted 显示版本策略并随配置保存提交', async () => {
+    const updateSpy = vi.spyOn(repoApi, 'update');
+    renderDetail('/repos/maven-releases?tab=config');
+    expect(await screen.findByRole('combobox', { name: 'Maven 版本策略' })).toBeInTheDocument();
+    await selectOption('Maven 版本策略', 'Snapshot');
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith('maven-releases', {
+        visibility: 'private',
+        disabled: false,
+        overwrite_policy: 'deny',
+        version_policy: 'snapshot',
+      });
+    });
+  });
+
+  it('proxy 始终提交必填上游地址并以 null 清空凭据引用', async () => {
+    const updateSpy = vi.spyOn(repoApi, 'update');
+    renderDetail('/repos/npm-proxy?tab=config');
+    const upstreamUrl = await screen.findByLabelText('上游地址');
+    const saveButton = screen.getByRole('button', { name: '保存' });
+    expect(upstreamUrl).toBeRequired();
+    fireEvent.change(upstreamUrl, { target: { value: '   ' } });
+    expect(saveButton).toBeDisabled();
+    fireEvent.change(upstreamUrl, { target: { value: 'https://registry.npmjs.org' } });
+    fireEvent.change(screen.getByLabelText('上游凭据引用'), { target: { value: '   ' } });
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(updateSpy).toHaveBeenCalledWith('npm-proxy', {
+        visibility: 'public',
+        disabled: false,
+        upstream_url: 'https://registry.npmjs.org',
+        upstream_credential_ref: null,
+      });
+    });
+  });
+
+  it('group 普通保存不提交响应中被过滤的成员，仅真实编辑后整体提交', async () => {
+    await loginAs('dev', 'dev123');
+    const fullMembers = ['visible-member', 'hidden-member'];
+    const updateBodies: Record<string, unknown>[] = [];
+    const repo = {
+      name: 'filtered-group',
+      format: 'raw',
+      repo_type: 'group',
+      visibility: 'private',
+      disabled: false,
+      overwrite_policy: null,
+      version_policy: null,
+      upstream_url: null,
+      upstream_credential_ref: null,
+      members: ['visible-member'],
+      object_count: 0,
+      total_bytes: 0,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    server.use(
+      http.get('*/api/v1/repos/filtered-group', () => HttpResponse.json(repo)),
+      http.patch('*/api/v1/repos/filtered-group', async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        updateBodies.push(body);
+        if (Array.isArray(body.members)) fullMembers.splice(0, fullMembers.length, ...body.members);
+        return HttpResponse.json({ ...repo, ...body, members: ['visible-member'] });
+      }),
+    );
+
+    renderDetail('/repos/filtered-group?tab=config');
+    await selectOption('可见性', '公开');
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(updateBodies).toHaveLength(1));
+    expect(updateBodies[0]).toEqual({ visibility: 'public', disabled: false });
+    expect(fullMembers).toEqual(['visible-member', 'hidden-member']);
+
+    fireEvent.change(screen.getByLabelText('成员（每行一个）'), {
+      target: { value: 'visible-member\nreplacement-member\n' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(updateBodies).toHaveLength(2));
+    expect(updateBodies[1]).toEqual({
+      visibility: 'public',
+      disabled: false,
+      members: ['visible-member', 'replacement-member'],
+    });
+  });
+
   it('非管理员访问权限标签页时按后端 403 展示无权占位', async () => {
     // 以普通用户 dev 登录：raw-hosted 为 public 仅有 read，ACL 端点被后端拒绝
     await loginAs('dev', 'dev123');
@@ -201,21 +289,41 @@ describe('仓库详情', () => {
     expect(await screen.findByText('仅仓库管理员可查看与管理访问授权')).toBeInTheDocument();
   });
 
-  it('权限标签页按用户名添加并移除授权', async () => {
+  it('仓库 admin 普通用户无需全局用户列表即可按精确用户名管理授权', async () => {
+    // beforeEach 当前为全局管理员会话，先真实授予 dev 仓库 admin，再切换为普通用户执行页面操作。
+    await repoApi.aclSet('raw-hosted', 'dev', 'admin');
+    await loginAs('dev', 'dev123');
     const setSpy = vi.spyOn(repoApi, 'aclSet');
     const removeSpy = vi.spyOn(repoApi, 'aclRemove');
+    let usersRequested = false;
+    server.use(
+      http.get('*/api/v1/users', () => {
+        usersRequested = true;
+        return HttpResponse.json({ code: 'FORBIDDEN', message: '仅管理员可用' }, { status: 403 });
+      }),
+    );
+
     renderDetail('/repos/raw-hosted?tab=acl');
-    expect(await screen.findByText(/暂无授权/)).toBeInTheDocument();
-    // 选择用户 dev（默认权限档位 read）后添加
-    await selectOption('用户', 'dev');
-    fireEvent.click(screen.getByRole('button', { name: '添加' }));
-    const table = screen.getByRole('table');
-    expect(await within(table).findByText('dev')).toBeInTheDocument();
-    expect(setSpy).toHaveBeenCalledWith('raw-hosted', 'dev', 'read');
-    expect(within(table).getByText('读')).toBeInTheDocument();
-    // 移除后回到空态
-    fireEvent.click(within(table).getByRole('button', { name: '移除' }));
-    expect(await screen.findByText(/暂无授权/)).toBeInTheDocument();
-    expect(removeSpy).toHaveBeenCalledWith('raw-hosted', 'dev');
+    const table = await screen.findByRole('table');
+    expect(within(table).getByRole('cell', { name: 'dev' })).toBeInTheDocument();
+    const username = screen.getByRole('textbox', { name: '用户名' });
+    const addButton = screen.getByRole('button', { name: '添加' });
+    expect(addButton).toBeDisabled();
+    fireEvent.change(username, { target: { value: '   admin   ' } });
+    expect(addButton).toBeEnabled();
+    fireEvent.click(addButton);
+
+    const adminCell = await within(table).findByRole('cell', { name: 'admin' });
+    const adminRow = adminCell.closest('tr');
+    if (!adminRow) throw new Error('未找到管理员授权行');
+    expect(within(adminRow).getByRole('cell', { name: '1' })).toBeInTheDocument();
+    expect(setSpy).toHaveBeenCalledWith('raw-hosted', 'admin', 'read');
+    expect(within(adminRow).getByText('读')).toBeInTheDocument();
+    expect(usersRequested).toBe(false);
+
+    fireEvent.click(within(adminRow).getByRole('button', { name: '移除' }));
+    await waitFor(() => expect(within(table).queryByRole('cell', { name: 'admin' })).toBeNull());
+    expect(within(table).getByRole('cell', { name: 'dev' })).toBeInTheDocument();
+    expect(removeSpy).toHaveBeenCalledWith('raw-hosted', 'admin');
   });
 });

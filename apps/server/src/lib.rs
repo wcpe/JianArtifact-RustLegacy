@@ -9,6 +9,7 @@ pub mod error;
 pub mod health;
 pub mod logging;
 pub mod persistence;
+pub mod repository;
 pub mod state;
 
 use axum::Router;
@@ -42,6 +43,7 @@ pub(crate) async fn build_app_with_bootstrap(
             "缺少 JWT 会话密钥，请经 JIANARTIFACT_JWT_SECRET 环境变量提供".to_string(),
         ));
     }
+    tokio::fs::create_dir_all(&config.data_dir).await?;
     let pool = persistence::init(&config.database_url(), &config.database_path).await?;
     // 元数据库就绪后执行管理员自举（空库且提供自举变量时创建首个 admin）
     domain::bootstrap_admin_with(&pool, username, password).await?;

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# 部署脚本逻辑测试（M1-FR-043）：在容器内用桩 systemctl/loginctl 驱动 remote-install.sh，
-# 覆盖首次部署、升级切换、sha256 校验失败、自动回滚、手动回滚、保留清理与无 sudo 断言。
+# 部署脚本逻辑测试（M1-FR-043）：在容器内用桩 systemctl/loginctl/curl 驱动 remote-install.sh，
+# 覆盖首次部署、readyz 探活、升级切换、sha256 校验失败、自动回滚、手动回滚、保留清理与无 sudo 断言。
 set -euo pipefail
+
+# Git Bash 默认会把目录符号链接退化为复制；测试需保留远端 Linux 的真实链接语义
+if [[ "${OSTYPE:-}" == msys* ]]; then
+    export MSYS=winsymlinks:sys
+fi
 
 cd "$(dirname "$0")/../.."
 
@@ -15,7 +20,7 @@ trap 'rm -rf "$WORK"' EXIT
 export HOME="$WORK/home"
 mkdir -p "$HOME"
 
-# 桩 systemctl：记录调用；SYSTEMCTL_FAIL_ACTIVE=1 时 is-active 判失败
+# 桩 systemctl 与 curl：分别模拟服务状态和 readyz 请求结果
 STUB="$WORK/stub-bin"
 mkdir -p "$STUB"
 cat > "$STUB/systemctl" <<'EOF'
@@ -30,14 +35,23 @@ cat > "$STUB/loginctl" <<'EOF'
 #!/usr/bin/env bash
 echo "Linger=yes"
 EOF
-chmod +x "$STUB/systemctl" "$STUB/loginctl"
+cat > "$STUB/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "curl $*" >> "$CURL_LOG"
+[ "${CURL_FAIL:-0}" = "1" ] && exit 22
+exit 0
+EOF
+chmod +x "$STUB/systemctl" "$STUB/loginctl" "$STUB/curl"
 export PATH="$STUB:$PATH"
 export SYSTEMCTL_LOG="$WORK/systemctl.log"
+export CURL_LOG="$WORK/curl.log"
 : > "$SYSTEMCTL_LOG"
+: > "$CURL_LOG"
 
 export DEPLOY_DIR="$HOME/jianartifact"
 export DEPLOY_SERVICE="jianartifact"
 export DEPLOY_KEEP_RELEASES="3"
+export DEPLOY_HEALTH_URL="/readyz"
 export HEALTH_RETRIES="1"
 export HEALTH_INTERVAL="0"
 
@@ -84,7 +98,8 @@ grep -q "ExecStart=$DEPLOY_DIR/current/bin/jianartifact" "$HOME/.config/systemd/
     || die "unit 的 ExecStart 未改写为部署目录路径"
 grep -q -- "--user daemon-reload" "$SYSTEMCTL_LOG" || die "未执行 daemon-reload"
 grep -q -- "--user restart" "$SYSTEMCTL_LOG" || die "未重启服务"
-ok "首次部署：current 就位、unit 安装、服务重启"
+grep -q -- "/readyz" "$CURL_LOG" || die "部署成功前未请求 readyz"
+ok "首次部署：current 就位、unit 安装、服务重启且 readyz 通过"
 
 # ---------- 3. 升级切换与幂等 ----------
 CUR1="$(current)"
@@ -107,15 +122,17 @@ fi
 [ "$(current)" = "$CUR_BEFORE" ] || die "校验失败后 current 被改动"
 ok "sha256 校验失败：拒绝部署且 current 不受影响"
 
-# ---------- 5. 自动回滚 ----------
+# ---------- 5. readyz 失败自动回滚 ----------
 CUR_GOOD="$(current)"
 PKG_FAIL="$(make_pkg 0.1.0 vbad)"
-if SYSTEMCTL_FAIL_ACTIVE=1 deploy "$PKG_FAIL" > "$WORK/autoroll.log" 2>&1; then
-    die "健康确认失败的部署未以非零退出"
+: > "$CURL_LOG"
+if CURL_FAIL=1 deploy "$PKG_FAIL" > "$WORK/autoroll.log" 2>&1; then
+    die "systemd active 但 readyz 失败的部署未以非零退出"
 fi
 [ "$(current)" = "$CUR_GOOD" ] || die "自动回滚未把 current 切回上一发布"
+grep -q -- "/readyz" "$CURL_LOG" || die "失败部署未请求 readyz"
 grep -q "自动回滚" "$WORK/autoroll.log" || die "输出未报告自动回滚"
-ok "自动回滚：健康确认失败自动切回上一发布并非零退出"
+ok "自动回滚：systemd active 但 readyz 失败时切回上一发布并非零退出"
 
 # ---------- 6. 手动回滚 ----------
 CUR_NOW="$(current)"

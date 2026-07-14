@@ -2,17 +2,17 @@
 
 > 系统当前真貌（HOW）。始终原地更新到现状；结构 / 机制变了就改它。
 >
-> 当前状态：阶段 3 已完成认证与用户域真连，并完成仓库/格式协议契约纠偏与真实后端浏览器测试通道；仓库核心及后续业务域仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
+> 当前状态：阶段 3 已完成认证与用户域真连、仓库可见性/ACL/配置生命周期真实后端与就绪探针硬化；格式协议、制品索引/blob 存储、浏览与迁移仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
 
 ## 1. 定位与边界
 
 JianArtifact 是一个以低运维成本为目标的自托管制品仓库，统一管理 Raw、Maven、npm 三种格式的 hosted、proxy 与只读 group 仓库，并承接存量 Nexus Repository OSS 3.70.x 中上述仓库的全量迁移与切换。
 
-第一期目标运行形态（阶段 3 当前仅 Rust 管理 API、SQLite 认证元数据与独立前端构建已落地）：
+第一期目标运行形态（阶段 3 当前已落地 Rust 管理 API、SQLite 认证与仓库配置元数据、就绪探针及独立前端构建）：
 
-- **一个 Rust 服务进程**：当前承载管理 API；格式协议、blob 存储与迁移随对应业务域接入同一进程。
-- **一个 SQLite 元数据库**：当前已作为认证与用户元数据唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
-- **一个本地文件系统 blob 数据目录**：制品内容本体按内容寻址存放，随存储域落地。
+- **一个 Rust 服务进程**：当前承载认证、用户、仓库配置/ACL 管理 API 与健康探针；格式协议、blob 存储与迁移随对应业务域接入同一进程。
+- **一个 SQLite 元数据库**：当前已作为认证、用户、仓库配置、ACL 与 group 成员关系的唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
+- **一个本地文件系统 blob 数据目录**：当前由 `/readyz` 验证挂载可写，制品内容本体与内容寻址布局随存储域落地。
 - **前端最终内嵌交付**：当前 React 管理端独立构建，尚未接入 Rust 静态资源路由；后续以编译期内嵌方式收敛为单二进制交付。
 - **TLS 在反向代理终止**：服务本身只监听明文 HTTP，可置于任意反向代理之后。
 
@@ -36,7 +36,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ### 2.2 `apps/server` 内部分层
 
-当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`state`；其中认证域遵循 `api → domain → persistence` 单向依赖。`api::formats` 目前只承载 `/repository/{name}/{path}` 的 OpenAPI 与 501 路由占位，真实协议逻辑仍须落入独立 `protocol` 模块。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
+当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`repository`、`state`；认证与仓库域均遵循 `api → domain/repository → persistence` 单向依赖。`api::formats` 目前只承载 `/repository/{name}/{path}` 的 OpenAPI 与 501 路由占位，真实协议逻辑仍须落入独立 `protocol` 模块。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
 
 ```text
         ┌───────────────┐      ┌───────────────┐
@@ -108,9 +108,9 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API；认证、用户与 Token 已真实现，仓库、ACL、浏览与迁移目前为契约骨架。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期与 ACL 已真实现，仓库内浏览/搜索/使用片段及迁移目前仍为契约骨架。仓库列表在 SQL 中按 read 权限过滤，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
 - **格式协议端点**：通用 GET/HEAD/PUT/DELETE 路径已进入同一 utoipa OpenAPI 并挂载 501 占位；后续按域实现 Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，并接入已具备 Basic 与 Bearer/API Token 能力的统一鉴权提取器。真实协议实现必须从 `api::formats` 占位迁移到 `protocol` 层，不得在 API handler 内堆业务逻辑。
-- **健康检查**：进程健康与基本就绪状态，响应不泄露路径、凭据或内部拓扑。
+- **健康检查**：`/healthz` 只报告进程存活；`/readyz` 以临时事务写入并回滚探测 SQLite，以随机且排他创建的临时文件探测 blob 目录，运行期挂载丢失时不自愈重建，响应不泄露路径、凭据或内部拓扑。
 
 ## 6. 关键机制
 

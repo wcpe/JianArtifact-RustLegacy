@@ -27,6 +27,33 @@ async function login(page: Page, username: string, password: string): Promise<vo
   await expect(page.getByRole('heading', { name: '仪表盘' })).toBeVisible();
 }
 
+async function changePassword(
+  page: Page,
+  username: string,
+  oldPassword: string,
+  newPassword: string,
+): Promise<void> {
+  await page.getByRole('button', { name: new RegExp(username) }).click();
+  await page.getByRole('menuitem', { name: '修改口令' }).click();
+  await expect(page.locator('#password-old')).toHaveAttribute(
+    'autocomplete',
+    'section-change-password current-password',
+  );
+  await expect(page.locator('#password-new')).toHaveAttribute(
+    'autocomplete',
+    'section-change-password new-password',
+  );
+  await expect(page.locator('#password-confirm')).toHaveAttribute(
+    'autocomplete',
+    'section-change-password new-password',
+  );
+  await page.fill('#password-old', oldPassword);
+  await page.fill('#password-new', newPassword);
+  await page.fill('#password-confirm', newPassword);
+  await page.getByRole('button', { name: '确认修改' }).click();
+  await expect(page.getByRole('heading', { name: '登录 JianArtifact' })).toBeVisible();
+}
+
 test('真实后端完成认证与管理闭环', async ({ page, request }) => {
   const autocompleteWarnings: string[] = [];
   page.on('console', (message) => {
@@ -62,25 +89,7 @@ test('真实后端完成认证与管理闭环', async ({ page, request }) => {
   await page.getByRole('button', { name: '创建', exact: true }).click();
   await expect(page.getByRole('cell', { name: userName, exact: true })).toBeVisible();
 
-  await page.getByRole('button', { name: new RegExp(credentials.username) }).click();
-  await page.getByRole('menuitem', { name: '修改口令' }).click();
-  await expect(page.locator('#password-old')).toHaveAttribute(
-    'autocomplete',
-    'section-change-password current-password',
-  );
-  await expect(page.locator('#password-new')).toHaveAttribute(
-    'autocomplete',
-    'section-change-password new-password',
-  );
-  await expect(page.locator('#password-confirm')).toHaveAttribute(
-    'autocomplete',
-    'section-change-password new-password',
-  );
-  await page.fill('#password-old', credentials.password);
-  await page.fill('#password-new', newAdminPassword);
-  await page.fill('#password-confirm', newAdminPassword);
-  await page.getByRole('button', { name: '确认修改' }).click();
-  await expect(page.getByRole('heading', { name: '登录 JianArtifact' })).toBeVisible();
+  await changePassword(page, credentials.username, credentials.password, newAdminPassword);
 
   await page.fill('#login-username', credentials.username);
   await page.fill('#login-password', credentials.password);
@@ -88,5 +97,7 @@ test('真实后端完成认证与管理闭环', async ({ page, request }) => {
   await expect(page.getByText('用户名或口令无效')).toBeVisible();
 
   await login(page, credentials.username, newAdminPassword);
+  await changePassword(page, credentials.username, newAdminPassword, credentials.password);
+  await login(page, credentials.username, credentials.password);
   expect(autocompleteWarnings).toEqual([]);
 });

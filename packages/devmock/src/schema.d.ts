@@ -253,7 +253,7 @@ export interface paths {
         /** 仓库列表（按权限过滤，分页）。 */
         get: operations["repos_list"];
         put?: never;
-        /** 创建仓库（Admin）。 */
+        /** 创建仓库（仅全局 Admin）。 */
         post: operations["repos_create"];
         delete?: never;
         options?: never;
@@ -272,7 +272,7 @@ export interface paths {
         get: operations["detail"];
         put?: never;
         post?: never;
-        /** 删除仓库（仓库 admin，高风险，需显式模式与确认头 X-Confirm-Repository=仓库名）。 */
+        /** 删除仓库（仓库 admin，需确认头）。 */
         delete: operations["delete"];
         options?: never;
         head?: never;
@@ -305,10 +305,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** 按用户名设置某用户的 ACL（仓库 admin）。 */
+        /** 按精确用户名设置 ACL（仓库 admin）。 */
         put: operations["acl_set"];
         post?: never;
-        /** 按用户名移除某用户的 ACL（仓库 admin）。 */
+        /** 按精确用户名移除 ACL（仓库 admin）。 */
         delete: operations["acl_remove"];
         options?: never;
         head?: never;
@@ -322,7 +322,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 仓库内目录浏览（read 权限，分页）。 */
+        /** 仓库内目录浏览（本批次不实现）。 */
         get: operations["files"];
         put?: never;
         post?: never;
@@ -339,7 +339,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 仓库内路径搜索（read 权限，子串匹配，分页）。 */
+        /** 仓库内路径搜索（本批次不实现）。 */
         get: operations["search"];
         put?: never;
         post?: never;
@@ -356,7 +356,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 使用方式片段（read 权限）。 */
+        /** 使用方式片段（本批次不实现）。 */
         get: operations["usage"];
         put?: never;
         post?: never;
@@ -496,14 +496,14 @@ export interface components {
     schemas: {
         /** @description ACL 条目。 */
         AclEntry: {
-            /** @description 授予的动作（向下包含）。 */
+            /** @description 授予权限。 */
             permission: components["schemas"]["Permission"];
             /**
              * Format: int64
              * @description 用户标识。
              */
             user_id: number;
-            /** @description 用户名。 */
+            /** @description 精确用户名。 */
             username: string;
         };
         /** @description 修改本人口令请求体（M1-FR-045）。新旧口令均不落日志与响应。 */
@@ -517,19 +517,19 @@ export interface components {
         CreateRepoRequest: {
             /** @description 制品格式（创建后不可变）。 */
             format: components["schemas"]["Format"];
-            /** @description group 成员（group 必填，有序，须同格式 hosted/proxy；提供时不可为 null）。 */
+            /** @description group 有序成员。 */
             members?: string[];
-            /** @description 仓库名：小写字母/数字/连字符，1–64 字符，创建后不可改。 */
+            /** @description 仓库名：小写字母/数字/连字符，1–64 字符。 */
             name: string;
-            /** @description 覆盖策略（hosted，可选按格式默认；提供时不可为 null）。 */
+            /** @description hosted 覆盖策略；缺失时默认 allow。 */
             overwrite_policy?: components["schemas"]["OverwritePolicy"];
             /** @description 仓库类型（创建后不可变）。 */
             repo_type: components["schemas"]["RepoType"];
-            /** @description proxy 上游凭据引用名（可选）。 */
+            /** @description proxy 上游凭据引用名。 */
             upstream_credential_ref?: string | null;
-            /** @description proxy 上游地址（proxy 必填；提供时不可为 null）。 */
+            /** @description proxy 上游地址。 */
             upstream_url?: string;
-            /** @description Maven 版本策略（Maven hosted，默认 mixed；提供时不可为 null）。 */
+            /** @description Maven hosted 版本策略；缺失时默认 mixed。 */
             version_policy?: components["schemas"]["VersionPolicy"];
             /** @description 可见性。 */
             visibility: components["schemas"]["Visibility"];
@@ -563,7 +563,7 @@ export interface components {
             token: string;
         };
         /**
-         * @description 删除模式（高风险动作，必须显式给出）。
+         * @description 删除模式。
          * @enum {string}
          */
         DeleteMode: "config" | "data";
@@ -571,12 +571,12 @@ export interface components {
         DeleteRepoResponse: {
             /**
              * Format: int64
-             * @description 因本次删除失去全部引用而遗留的 blob 数（mode=config 时非零有意义）。
+             * @description 因删除失去引用的 blob 数；本批次恒为零。
              */
             orphaned_blobs: number;
             /**
              * Format: int64
-             * @description 被物理回收的 blob 数（mode=data 时有意义）。
+             * @description 被物理回收的 blob 数；本批次恒为零。
              */
             reclaimed_blobs: number;
         };
@@ -640,25 +640,25 @@ export interface components {
         };
         /** @description 浏览条目（目录或文件）。 */
         FileEntry: {
-            /** @description 内容类型（文件）。 */
+            /** @description 内容类型。 */
             content_type?: string | null;
             /** @description 是否目录。 */
             is_dir: boolean;
-            /** @description md5 校验和（文件，Maven 生态）。 */
+            /** @description md5 校验和。 */
             md5?: string | null;
-            /** @description 条目名（不含父目录）。 */
+            /** @description 条目名。 */
             name: string;
-            /** @description 仓库根相对完整路径；客户端不得自行拼接。 */
+            /** @description 仓库根相对完整路径。 */
             path: string;
-            /** @description sha1 校验和（文件，Maven 生态）。 */
+            /** @description sha1 校验和。 */
             sha1?: string | null;
-            /** @description sha256 校验和（文件）。 */
+            /** @description sha256 校验和。 */
             sha256?: string | null;
-            /** @description sha512 校验和（文件，npm integrity）。 */
+            /** @description sha512 校验和。 */
             sha512?: string | null;
             /**
              * Format: int64
-             * @description 文件大小（字节，目录为空）。
+             * @description 文件大小。
              */
             size?: number | null;
             /** @description 更新时间。 */
@@ -670,7 +670,7 @@ export interface components {
             items: components["schemas"]["FileEntry"][];
             /**
              * Format: int32
-             * @description 当前页码（从 1 起）。
+             * @description 当前页码。
              */
             page: number;
             /**
@@ -763,12 +763,12 @@ export interface components {
             username?: string | null;
         };
         /**
-         * @description 同路径覆盖策略。
+         * @description hosted 同路径覆盖策略。
          * @enum {string}
          */
         OverwritePolicy: "allow" | "deny";
         /**
-         * @description 仓库 ACL 动作（向下包含：admin ⊃ write ⊃ read）。
+         * @description 仓库 ACL 动作，权限向下包含。
          * @enum {string}
          */
         Permission: "read" | "write" | "admin";
@@ -794,17 +794,17 @@ export interface components {
         RepoInfo: {
             /** @description 创建时间。 */
             created_at: string;
-            /** @description 是否已停用（停用后格式端点按不存在处理）。 */
+            /** @description 是否已停用。 */
             disabled: boolean;
             /** @description 制品格式。 */
             format: components["schemas"]["Format"];
-            /** @description group 成员（有序，group 有效）。 */
+            /** @description group 有序成员。 */
             members?: string[] | null;
             /** @description 仓库名（全局唯一）。 */
             name: string;
             /**
              * Format: int64
-             * @description 制品数（仓库内文件总数，列表与详情展示）。
+             * @description 制品数；本批次尚无制品索引，恒为零。
              */
             object_count: number;
             overwrite_policy?: null | components["schemas"]["OverwritePolicy"];
@@ -812,24 +812,24 @@ export interface components {
             repo_type: components["schemas"]["RepoType"];
             /**
              * Format: int64
-             * @description 总大小（仓库内文件字节合计）。
+             * @description 总大小；本批次尚无制品索引，恒为零。
              */
             total_bytes: number;
-            /** @description proxy 上游凭据引用名（只存引用，不含凭据值）。 */
+            /** @description proxy 上游凭据引用名。 */
             upstream_credential_ref?: string | null;
-            /** @description proxy 上游地址（proxy 有效）。 */
+            /** @description proxy 上游地址。 */
             upstream_url?: string | null;
             version_policy?: null | components["schemas"]["VersionPolicy"];
             /** @description 可见性。 */
             visibility: components["schemas"]["Visibility"];
         };
-        /** @description 仓库列表分页响应（只含调用方可读仓库，零存在性泄露）。 */
+        /** @description 仓库列表分页响应。 */
         RepoListResponse: {
             /** @description 当前页仓库。 */
             items: components["schemas"]["RepoInfo"][];
             /**
              * Format: int32
-             * @description 当前页码（从 1 起）。
+             * @description 当前页码。
              */
             page: number;
             /**
@@ -839,7 +839,7 @@ export interface components {
             page_size: number;
             /**
              * Format: int64
-             * @description 总条数。
+             * @description 权限过滤后的总条数。
              */
             total: number;
         };
@@ -929,7 +929,7 @@ export interface components {
         };
         /** @description 设置 ACL 请求体。 */
         SetAclRequest: {
-            /** @description 授予的动作。 */
+            /** @description 授予权限。 */
             permission: components["schemas"]["Permission"];
         };
         /**
@@ -1036,21 +1036,21 @@ export interface components {
             /** @description 中文说明。 */
             reason: string;
         };
-        /** @description 编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。 */
+        /** @description 编辑仓库请求体：字段可选，只更新给出的项。 */
         UpdateRepoRequest: {
-            /** @description 停用/启用；提供时不可为 null。 */
+            /** @description 停用/启用状态。 */
             disabled?: boolean;
-            /** @description group 成员（整体替换且保持顺序；空数组清空，提供时不可为 null）。 */
+            /** @description group 成员整体替换并保持顺序。 */
             members?: string[];
-            /** @description hosted 覆盖策略；提供时不可为 null。 */
+            /** @description hosted 覆盖策略。 */
             overwrite_policy?: components["schemas"]["OverwritePolicy"];
             /** @description proxy 上游凭据引用名：缺失不更新，字符串替换，显式 null 清空。 */
             upstream_credential_ref?: string | null;
-            /** @description proxy 上游地址；提供时不可为 null。 */
+            /** @description proxy 上游地址。 */
             upstream_url?: string;
-            /** @description Maven hosted 版本策略；提供时不可为 null。 */
+            /** @description Maven hosted 版本策略。 */
             version_policy?: components["schemas"]["VersionPolicy"];
-            /** @description 可见性；提供时不可为 null。 */
+            /** @description 可见性。 */
             visibility?: components["schemas"]["Visibility"];
         };
         /** @description 更新用户请求体：字段可选，只更新给出的项。 */
@@ -1063,9 +1063,9 @@ export interface components {
         };
         /** @description 使用方式片段。 */
         UsageSnippet: {
-            /** @description 可复制的配置/命令文本，凭据一律为占位符。 */
+            /** @description 可复制内容。 */
             content: string;
-            /** @description 片段标题（如「Maven settings.xml」）。 */
+            /** @description 片段标题。 */
             title: string;
         };
         /** @description 用户信息。 */
@@ -1105,7 +1105,7 @@ export interface components {
             total: number;
         };
         /**
-         * @description Maven 版本策略（仅 Maven hosted 有效）。
+         * @description Maven hosted 版本策略。
          * @enum {string}
          */
         VersionPolicy: "release" | "snapshot" | "mixed";
@@ -1639,7 +1639,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 仓库分页（只含调用方可读仓库） */
+            /** @description 仓库分页 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1670,6 +1670,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RepoInfo"];
+                };
+            };
+            /** @description 类型字段或配置组合非法 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description 无管理员权限 */
@@ -1713,7 +1722,7 @@ export interface operations {
                     "application/json": components["schemas"]["RepoInfo"];
                 };
             };
-            /** @description 仓库不存在（含无权访问的 private） */
+            /** @description 仓库不存在或无权访问 */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1727,11 +1736,11 @@ export interface operations {
     delete: {
         parameters: {
             query: {
-                /** @description 删除模式：config 仅删配置与索引 / data 连带物理回收无引用 blob */
+                /** @description 删除模式 */
                 mode: components["schemas"]["DeleteMode"];
             };
             header: {
-                /** @description 防误删确认：必须与仓库名一致 */
+                /** @description 必须与仓库名一致 */
                 "X-Confirm-Repository": string;
             };
             path: {
@@ -1751,7 +1760,7 @@ export interface operations {
                     "application/json": components["schemas"]["DeleteRepoResponse"];
                 };
             };
-            /** @description 缺少或不匹配的确认头/模式 */
+            /** @description 确认头或模式无效 */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1760,8 +1769,35 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 仓库不存在 */
+            /** @description 已有读取权限但无仓库管理权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权访问 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库仍被 group 引用 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 数据物理删除尚未实现 */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1796,7 +1832,25 @@ export interface operations {
                     "application/json": components["schemas"]["RepoInfo"];
                 };
             };
-            /** @description 仓库不存在 */
+            /** @description 类型字段或配置组合非法 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 已有读取权限但无仓库管理权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权访问 */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1828,7 +1882,16 @@ export interface operations {
                     "application/json": components["schemas"]["AclEntry"][];
                 };
             };
-            /** @description 仓库不存在 */
+            /** @description 已有读取权限但无仓库管理权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权访问 */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1866,7 +1929,16 @@ export interface operations {
                     "application/json": components["schemas"]["AclEntry"];
                 };
             };
-            /** @description 仓库或用户不存在 */
+            /** @description 已有读取权限但无仓库管理权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库或目标用户不存在 */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1898,7 +1970,16 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description 仓库或条目不存在 */
+            /** @description 已有读取权限但无仓库管理权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库、用户或 ACL 条目不存在 */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1912,11 +1993,11 @@ export interface operations {
     files: {
         parameters: {
             query?: {
-                /** @description 目录路径，缺省为根 */
+                /** @description 目录路径 */
                 path?: string;
-                /** @description 页码，从 1 起 */
+                /** @description 页码 */
                 page?: number;
-                /** @description 每页条数，最大 200 */
+                /** @description 每页条数 */
                 page_size?: number;
             };
             header?: never;
@@ -1946,6 +2027,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
+            /** @description 仓库浏览尚未实现 */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
         };
     };
     search: {
@@ -1953,9 +2043,9 @@ export interface operations {
             query: {
                 /** @description 路径子串 */
                 q: string;
-                /** @description 页码，从 1 起 */
+                /** @description 页码 */
                 page?: number;
-                /** @description 每页条数，最大 200 */
+                /** @description 每页条数 */
                 page_size?: number;
             };
             header?: never;
@@ -1978,6 +2068,15 @@ export interface operations {
             };
             /** @description 仓库不存在 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库搜索尚未实现 */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2010,6 +2109,15 @@ export interface operations {
             };
             /** @description 仓库不存在 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 使用片段尚未实现 */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };

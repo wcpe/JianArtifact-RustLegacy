@@ -1,6 +1,8 @@
 //! 领域服务层：角色类型与用户服务（自举、增改查、口令修改与最后 Admin 保护）。
 //! 依赖方向：domain（领域）→ auth（认证原语）/ persistence（基础设施），不反向依赖 api 入口层。
 
+pub mod repository;
+
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
@@ -10,7 +12,7 @@ use crate::error::{ApiError, StartupError};
 use crate::persistence::{self, User};
 
 /// 全局角色。落库为 users.role（CHECK 约束取值 'admin'/'user'），序列化为小写。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// 管理员：全局管理权限。

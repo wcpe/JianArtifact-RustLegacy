@@ -15,6 +15,7 @@ import {
   CardTitle,
   ErrorState,
   ForbiddenState,
+  Input,
   Label,
   Select,
   SelectContent,
@@ -30,14 +31,11 @@ import {
   TableRow,
 } from '@jianartifact/ui';
 import { ApiClientError } from '../../api/client';
-import { repoApi, userApi } from '../../api/endpoints';
+import { repoApi } from '../../api/endpoints';
 import { useAsync } from '../../lib/useAsync';
 
 type AclEntry = components['schemas']['AclEntry'];
 type Permission = components['schemas']['Permission'];
-
-// 一次取满候选用户（契约每页上限 200；M1 规模下授权对象不分页）
-const USER_PAGE_SIZE = 200;
 
 // 权限徽标语义：读为中性、写为信息蓝、管理为琥珀，与状态徽标色系一致
 const PERMISSION_META: Record<Permission, { label: string; className: string }> = {
@@ -63,13 +61,11 @@ function PermissionBadge({ permission }: { permission: Permission }) {
   );
 }
 
-// 添加授权行内表单：候选用户（过滤已授权者）+ 权限档位 + 添加
+// 添加授权行内表单：精确用户名 + 权限档位 + 添加，不依赖全局管理员用户列表。
 function AddAclForm({
-  candidates,
   busy,
   onAdd,
 }: {
-  candidates: { id: number; username: string }[];
   busy: boolean;
   onAdd: (username: string, permission: Permission) => Promise<void>;
 }) {
@@ -78,27 +74,24 @@ function AddAclForm({
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (username === '') return;
-    await onAdd(username, permission);
+    const normalized = username.trim();
+    if (normalized === '') return;
+    await onAdd(normalized, permission);
     setUsername('');
   };
 
   return (
     <form className="flex flex-wrap items-end gap-3" onSubmit={handleSubmit}>
       <div className="flex flex-col gap-2">
-        <Label htmlFor="acl-user">用户</Label>
-        <Select value={username} onValueChange={setUsername}>
-          <SelectTrigger id="acl-user" className="w-44">
-            <SelectValue placeholder="选择用户" />
-          </SelectTrigger>
-          <SelectContent>
-            {candidates.map((user) => (
-              <SelectItem key={user.id} value={user.username}>
-                {user.username}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        <Label htmlFor="acl-user">用户名</Label>
+        <Input
+          id="acl-user"
+          className="w-52"
+          value={username}
+          placeholder="输入精确用户名"
+          autoComplete="off"
+          onChange={(event) => setUsername(event.target.value)}
+        />
       </div>
       <div className="flex flex-col gap-2">
         <Label htmlFor="acl-permission">权限</Label>
@@ -113,7 +106,7 @@ function AddAclForm({
           </SelectContent>
         </Select>
       </div>
-      <Button type="submit" disabled={busy || username === ''}>
+      <Button type="submit" disabled={busy || username.trim() === ''}>
         添加
       </Button>
     </form>
@@ -134,6 +127,7 @@ function AclTable({
     <Table>
       <TableHeader>
         <TableRow>
+          <TableHead scope="col">用户 ID</TableHead>
           <TableHead scope="col">用户名</TableHead>
           <TableHead scope="col">权限</TableHead>
           <TableHead scope="col">操作</TableHead>
@@ -142,6 +136,7 @@ function AclTable({
       <TableBody>
         {entries.map((entry) => (
           <TableRow key={entry.user_id}>
+            <TableCell>{entry.user_id}</TableCell>
             <TableCell className="font-medium">{entry.username}</TableCell>
             <TableCell>
               <PermissionBadge permission={entry.permission} />
@@ -155,7 +150,7 @@ function AclTable({
         ))}
         {entries.length === 0 ? (
           <TableRow>
-            <TableCell colSpan={3} className="text-center text-muted-foreground">
+            <TableCell colSpan={4} className="text-center text-muted-foreground">
               暂无授权；管理员对全部仓库拥有隐式权限
             </TableCell>
           </TableRow>
@@ -169,8 +164,6 @@ function AclTable({
 export function AclPanel({ repoName }: { repoName: string }) {
   const aclLoader = useCallback(() => repoApi.aclList(repoName), [repoName]);
   const acl = useAsync(aclLoader);
-  const usersLoader = useCallback(() => userApi.list({ page_size: USER_PAGE_SIZE }), []);
-  const users = useAsync(usersLoader);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -200,10 +193,6 @@ export function AclPanel({ repoName }: { repoName: string }) {
   }
 
   const entries = acl.data;
-  // 候选用户：过滤掉已有授权条目的用户
-  const candidates = (users.data?.items ?? []).filter(
-    (user) => !entries.some((entry) => entry.user_id === user.id),
-  );
 
   return (
     <Card>
@@ -221,7 +210,6 @@ export function AclPanel({ repoName }: { repoName: string }) {
           </Alert>
         ) : null}
         <AddAclForm
-          candidates={candidates}
           busy={busy}
           onAdd={(username, permission) =>
             runAction(() => repoApi.aclSet(repoName, username, permission))
