@@ -3,9 +3,10 @@
 //! 携带凭据但无效一律 401 不降级；每请求都查库校验启用 / 撤销 / 版本，这是即时失效的根本。
 //! 唯一缓存的是 Basic 口令的 Argon2 校验结果（进程内 60 秒），不缓存身份。
 
+use std::collections::HashMap;
 use std::time::Instant;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Path};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 
@@ -15,6 +16,7 @@ use crate::auth::revocation::{session_family_revoke_hash, session_revoke_hash};
 use crate::auth::token::hash_token;
 use crate::auth::{API_TOKEN_PREFIX, AuthIdentity, PASSWORD_CACHE_TTL_SECS, domain_hash};
 use crate::domain::Role;
+use crate::domain::repository::Subject;
 use crate::error::ApiError;
 use crate::persistence;
 use crate::state::AppState;
@@ -38,6 +40,54 @@ pub struct RequireAuth(pub AuthIdentity);
 
 /// 可选身份：无 Authorization 头时返回匿名；一旦携带头，任何无效、吊销或禁用凭据都返回 401。
 pub struct OptionalAuth(pub Option<AuthIdentity>);
+
+/// 将可选认证结果转换为仓库授权主体。
+pub fn subject_from_optional(auth: OptionalAuth) -> Subject {
+    match auth.0 {
+        Some(identity) => subject_from_identity(identity),
+        None => Subject::Anonymous,
+    }
+}
+
+/// 将已认证身份转换为仓库授权主体。
+pub fn subject_from_identity(identity: AuthIdentity) -> Subject {
+    Subject::Authenticated {
+        user_id: identity.user_id,
+        role: identity.role,
+        enabled: true,
+    }
+}
+
+/// Raw 协议路径：仓库名与保留尾斜杠状态。
+pub struct ArtifactRoute {
+    pub repository: String,
+    pub path: String,
+    pub trailing_slash: bool,
+}
+
+impl FromRequestParts<AppState> for ArtifactRoute {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(values) = Path::<HashMap<String, String>>::from_request_parts(parts, _state)
+            .await
+            .map_err(|_| ApiError::bad_request("ARTIFACT_INVALID_PATH", "制品路径无效"))?;
+        let repository = values
+            .get("name")
+            .cloned()
+            .ok_or_else(|| ApiError::bad_request("ARTIFACT_INVALID_PATH", "制品路径无效"))?;
+        let path = values.get("path").cloned().unwrap_or_default();
+        let trailing_slash = parts.uri.path().ends_with('/');
+        Ok(Self {
+            repository,
+            path,
+            trailing_slash,
+        })
+    }
+}
 
 /// 在 `RequireAuth` 基础上要求管理员角色，否则 403。
 pub struct RequireAdmin(pub AuthIdentity);

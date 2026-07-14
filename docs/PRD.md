@@ -137,11 +137,11 @@ JianArtifact 是一个以**低运维成本**为目标的自托管制品仓库，
 | M1-FR-007 | 仓库可见性 | public/private 两种可见性；匿名只读 public，private 对无权用户不泄露存在性 | 开发中 |
 | M1-FR-008 | 仓库 ACL | 至少支持 read、write、admin 三类仓库动作；Admin 全局可管理，普通用户按 ACL 访问；ACL 管理以精确用户名为路径键，客户端不依赖数据库用户 ID | 开发中 |
 | M1-FR-009 | 仓库管理 | Admin 可创建、编辑、停用和删除仓库；创建/编辑完整覆盖 hosted/Maven hosted/proxy/group 类型专属配置，PATCH 支持显式 null 清空可选凭据引用；删除区分“仅删配置”和“删除数据”，被 group 引用的成员删除返回 409 | 开发中 |
-| M1-FR-010 | hosted 仓库通用能力 | 接收上传、流式存储、下载、删除、浏览、校验和、覆盖策略和分页索引 | 计划 |
-| M1-FR-011 | proxy 仓库通用能力 | 配置上游、缓存未命中回源、单飞合并、流式落盘、缓存命中、上游错误分类和超时 | 计划 |
+| M1-FR-010 | hosted 仓库通用能力 | 接收上传、流式存储、下载、删除、浏览、校验和、覆盖策略和分页索引 | 开发中 |
+| M1-FR-011 | proxy 仓库通用能力 | 配置上游、缓存未命中回源、单飞合并、流式落盘、缓存命中、上游错误分类和超时 | 开发中 |
 | M1-FR-012 | group 仓库 | 先校验 group read，再只对调用方有 read 权限的成员执行 Raw 查找、Maven metadata 聚合和 npm packument 合并；无权成员的名称、坐标、版本、dist-tag、数量和错误均不泄露；不支持写入 group | 计划 |
-| M1-FR-013 | Raw hosted | curl/HTTP 上传、下载、覆盖、删除和目录浏览可用，路径必须经过规范化与越界防护 | 计划 |
-| M1-FR-014 | Raw proxy | 按路径代理任意 HTTP 上游资源并缓存，正确处理不存在、超时、上游 4xx/5xx 和断流 | 计划 |
+| M1-FR-013 | Raw hosted | curl/HTTP 上传、下载、覆盖、删除和目录浏览可用，路径必须经过规范化与越界防护 | 开发中 |
+| M1-FR-014 | Raw proxy | 按路径代理任意 HTTP 上游资源并缓存，正确处理不存在、超时、上游 4xx/5xx 和断流 | 开发中 |
 | M1-FR-015 | Maven hosted | 支持 Maven 标准布局、POM/JAR/附属文件、metadata、checksum sidecar、release/snapshot 写入语义 | 计划 |
 | M1-FR-016 | Maven proxy | Maven 客户端可通过仓库解析依赖、metadata、POM 与构件；缓存内容和校验和一致 | 计划 |
 | M1-FR-017 | npm hosted | 支持 npm publish、包元数据、tarball、scoped package、dist-tag 与不可变版本规则 | 计划 |

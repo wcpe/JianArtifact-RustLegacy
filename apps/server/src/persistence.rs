@@ -1,7 +1,7 @@
 //! 元数据库连接与迁移框架（SQLite 唯一真源，ADR-0002）。迁移脚本只向前追加。
 //! 兼含认证域仓储：用户、API Token、会话撤销的增改查，均只做数据存取、不含业务规则。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -40,6 +40,695 @@ pub async fn init(database_url: &str, database_path: &Path) -> Result<SqlitePool
     MIGRATOR.run(&pool).await?;
     tracing::info!("元数据库已就绪并完成迁移");
     Ok(pool)
+}
+
+/// 读取当前仍被制品元数据引用的全部 blob 摘要，供启动恢复判定。
+pub async fn referenced_blob_hashes(pool: &SqlitePool) -> Result<HashSet<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT DISTINCT sha256 FROM artifacts")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
+}
+
+// ==================== 制品索引仓储 ====================
+
+const ARTIFACT_COLUMNS: &str =
+    "id, repo_id, path, sha256, sha1, md5, sha512, size, cached, created_at, updated_at";
+
+/// 制品索引记录。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub path: String,
+    pub sha256: String,
+    pub sha1: String,
+    pub md5: String,
+    pub sha512: String,
+    pub size: u64,
+    pub cached: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 制品索引写入参数。
+pub struct ArtifactWriteInput {
+    pub repo_id: i64,
+    pub path: String,
+    pub sha256: String,
+    pub sha1: String,
+    pub md5: String,
+    pub sha512: String,
+    pub size: u64,
+    pub cached: bool,
+}
+
+/// 持久化 blob 回收令牌。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BlobReclamation {
+    pub sha256: String,
+    pub generation: i64,
+}
+
+/// 回收令牌的当前状态。
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlobReclamationState {
+    pub reclamation: BlobReclamation,
+    pub referenced: bool,
+}
+
+/// 原子提交结果。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactCommitResult {
+    pub artifact: ArtifactRecord,
+    pub reclamation: Option<BlobReclamation>,
+    pub created: bool,
+}
+
+/// 单个制品索引删除结果。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactDeleteResult {
+    pub artifact: ArtifactRecord,
+    pub reclamation: BlobReclamation,
+}
+
+/// 目录索引中的直接子条目。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactDirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+    pub sha1: Option<String>,
+    pub md5: Option<String>,
+    pub sha512: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ArtifactDirectoryRow {
+    name: String,
+    is_directory: bool,
+    size: Option<i64>,
+    sha256: Option<String>,
+    sha1: Option<String>,
+    md5: Option<String>,
+    sha512: Option<String>,
+    updated_at: String,
+}
+
+/// 制品提交错误，路径冲突可由调用方单独处理。
+#[derive(Debug, thiserror::Error)]
+pub enum ArtifactCommitError {
+    #[error("制品路径已存在")]
+    Conflict,
+    #[error("代理仓库配置已变化")]
+    StaleProxyConfiguration,
+    #[error("制品提交失败")]
+    Internal(ApiError),
+}
+
+#[derive(sqlx::FromRow)]
+struct BlobReclamationRow {
+    sha256: String,
+    generation: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct BlobReclamationStateRow {
+    sha256: String,
+    generation: i64,
+    referenced: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ArtifactRow {
+    id: i64,
+    repo_id: i64,
+    path: String,
+    sha256: String,
+    sha1: String,
+    md5: String,
+    sha512: String,
+    size: i64,
+    cached: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<BlobReclamationRow> for BlobReclamation {
+    fn from(row: BlobReclamationRow) -> Self {
+        Self {
+            sha256: row.sha256,
+            generation: row.generation,
+        }
+    }
+}
+
+impl From<BlobReclamationStateRow> for BlobReclamationState {
+    fn from(row: BlobReclamationStateRow) -> Self {
+        Self {
+            reclamation: BlobReclamation {
+                sha256: row.sha256,
+                generation: row.generation,
+            },
+            referenced: row.referenced,
+        }
+    }
+}
+
+impl TryFrom<ArtifactRow> for ArtifactRecord {
+    type Error = ApiError;
+
+    fn try_from(row: ArtifactRow) -> Result<Self, Self::Error> {
+        let size = u64::try_from(row.size).map_err(|_| ApiError::internal("制品大小非法"))?;
+        Ok(Self {
+            id: row.id,
+            repo_id: row.repo_id,
+            path: row.path,
+            sha256: row.sha256,
+            sha1: row.sha1,
+            md5: row.md5,
+            sha512: row.sha512,
+            size,
+            cached: row.cached,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+fn artifact_size_i64(size: u64) -> Result<i64, ApiError> {
+    i64::try_from(size).map_err(|_| ApiError::internal("制品大小超出数据库范围"))
+}
+
+fn artifact_commit_internal(
+    message: &'static str,
+) -> impl FnOnce(sqlx::Error) -> ArtifactCommitError {
+    move |_| ArtifactCommitError::Internal(ApiError::internal(message))
+}
+
+fn sorted_reclamations(rows: Vec<BlobReclamationRow>) -> Vec<BlobReclamation> {
+    let mut reclamations: Vec<_> = rows.into_iter().map(BlobReclamation::from).collect();
+    reclamations.sort_unstable_by(|left, right| left.sha256.cmp(&right.sha256));
+    reclamations
+}
+
+async fn register_blob_reclamation(
+    tx: &mut Transaction<'_, Sqlite>,
+    sha256: &str,
+) -> Result<BlobReclamation, ApiError> {
+    let row = sqlx::query_as::<_, BlobReclamationRow>(
+        "INSERT INTO blob_reclamations (sha256, generation) VALUES (?, 1) ON CONFLICT(sha256) DO UPDATE SET generation = generation + 1, updated_at = datetime('now') RETURNING sha256, generation",
+    )
+    .bind(sha256)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| ApiError::internal("登记 blob 回收意图失败"))?;
+    Ok(row.into())
+}
+
+async fn register_repository_reclamations(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+    cached_only: bool,
+) -> Result<Vec<BlobReclamation>, ApiError> {
+    let filter = if cached_only {
+        "repo_id = ? AND cached = 1"
+    } else {
+        "repo_id = ?"
+    };
+    let sql = format!(
+        "INSERT INTO blob_reclamations (sha256, generation) SELECT DISTINCT sha256, 1 FROM artifacts WHERE {filter} ON CONFLICT(sha256) DO UPDATE SET generation = generation + 1, updated_at = datetime('now') RETURNING sha256, generation"
+    );
+    let rows = sqlx::query_as::<_, BlobReclamationRow>(&sql)
+        .bind(repository_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("批量登记 blob 回收意图失败"))?;
+    Ok(sorted_reclamations(rows))
+}
+
+async fn cancel_repository_reclamations(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM blob_reclamations WHERE sha256 IN (SELECT DISTINCT sha256 FROM artifacts WHERE repo_id = ?)",
+    )
+    .bind(repository_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| ApiError::internal("取消 blob 回收意图失败"))?;
+    Ok(())
+}
+
+/// 列出全部待处理 blob 回收令牌，按摘要稳定排序。
+pub async fn pending_blob_reclamations(
+    pool: &SqlitePool,
+) -> Result<Vec<BlobReclamation>, ApiError> {
+    let rows = sqlx::query_as::<_, BlobReclamationRow>(
+        "SELECT sha256, generation FROM blob_reclamations ORDER BY sha256",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ApiError::internal("查询待处理 blob 回收意图失败"))?;
+    Ok(rows.into_iter().map(BlobReclamation::from).collect())
+}
+
+const RECLAMATION_REQUEST_CTE: &str = "WITH requested(sha256, generation) AS (SELECT json_extract(value, '$.sha256'), CAST(json_extract(value, '$.generation') AS INTEGER) FROM json_each(?))";
+
+/// 批量核对回收令牌当前代次及全局引用状态。
+pub async fn inspect_blob_reclamations(
+    pool: &SqlitePool,
+    reclamations: &[BlobReclamation],
+) -> Result<Vec<BlobReclamationState>, ApiError> {
+    if reclamations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "{RECLAMATION_REQUEST_CTE} SELECT blob_reclamations.sha256, blob_reclamations.generation, EXISTS(SELECT 1 FROM artifacts WHERE artifacts.sha256 = blob_reclamations.sha256) AS referenced FROM blob_reclamations JOIN requested ON requested.sha256 = blob_reclamations.sha256 AND requested.generation = blob_reclamations.generation ORDER BY blob_reclamations.sha256"
+    );
+    let rows = sqlx::query_as::<_, BlobReclamationStateRow>(&sql)
+        .bind(reclamation_payload(reclamations)?)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量核对 blob 回收意图失败"))?;
+    Ok(rows.into_iter().map(BlobReclamationState::from).collect())
+}
+
+/// 仅按匹配代次批量完成回收意图。
+pub async fn complete_blob_reclamations(
+    pool: &SqlitePool,
+    reclamations: &[BlobReclamation],
+) -> Result<u64, ApiError> {
+    if reclamations.is_empty() {
+        return Ok(0);
+    }
+    let sql = format!(
+        "{RECLAMATION_REQUEST_CTE} DELETE FROM blob_reclamations WHERE EXISTS (SELECT 1 FROM requested WHERE requested.sha256 = blob_reclamations.sha256 AND requested.generation = blob_reclamations.generation)"
+    );
+    let result = sqlx::query(&sql)
+        .bind(reclamation_payload(reclamations)?)
+        .execute(pool)
+        .await
+        .map_err(|_| ApiError::internal("完成 blob 回收意图失败"))?;
+    Ok(result.rows_affected())
+}
+
+fn reclamation_payload(reclamations: &[BlobReclamation]) -> Result<String, ApiError> {
+    serde_json::to_string(reclamations).map_err(|_| ApiError::internal("序列化 blob 回收意图失败"))
+}
+
+/// 按仓库与路径读取制品索引。
+pub async fn find_artifact_by_path(
+    pool: &SqlitePool,
+    repo_id: i64,
+    path: &str,
+) -> Result<Option<ArtifactRecord>, ApiError> {
+    let sql = format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE repo_id = ? AND path = ?");
+    sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询制品失败"))?
+        .map(ArtifactRecord::try_from)
+        .transpose()
+}
+
+/// 统计指定内容摘要的全局索引引用数。
+pub async fn count_artifact_references(pool: &SqlitePool, sha256: &str) -> Result<i64, ApiError> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM artifacts WHERE sha256 = ?")
+        .bind(sha256)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| ApiError::internal("统计制品引用失败"))?;
+    Ok(row.0)
+}
+
+/// 批量返回候选摘要中仍被任意制品索引引用的集合。
+pub async fn referenced_candidate_hashes(
+    pool: &SqlitePool,
+    candidates: &[String],
+) -> Result<HashSet<String>, ApiError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "WITH requested(sha256) AS (SELECT value FROM json_each(?)) SELECT DISTINCT artifacts.sha256 FROM artifacts JOIN requested ON requested.sha256 = artifacts.sha256",
+    )
+    .bind(string_list_payload(candidates)?)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ApiError::internal("批量统计制品引用失败"))?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
+}
+
+fn string_list_payload(values: &[String]) -> Result<String, ApiError> {
+    serde_json::to_string(values).map_err(|_| ApiError::internal("序列化摘要列表失败"))
+}
+
+/// 列出仓库当前引用的去重内容摘要。
+pub async fn list_repository_blob_hashes(
+    pool: &SqlitePool,
+    repo_id: i64,
+) -> Result<Vec<String>, ApiError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT sha256 FROM artifacts WHERE repo_id = ? ORDER BY sha256")
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|_| ApiError::internal("查询仓库制品摘要失败"))?;
+    Ok(rows.into_iter().map(|row| row.0).collect())
+}
+
+/// 删除单个路径，并在同一事务登记旧 blob 回收意图。
+pub async fn delete_artifact_by_path(
+    pool: &SqlitePool,
+    repo_id: i64,
+    path: &str,
+) -> Result<Option<ArtifactDeleteResult>, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启制品删除事务失败"))?;
+    let sql = format!(
+        "DELETE FROM artifacts WHERE repo_id = ? AND path = ? RETURNING {ARTIFACT_COLUMNS}"
+    );
+    let row = sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| ApiError::internal("删除制品失败"))?;
+    let Some(row) = row else {
+        tx.rollback()
+            .await
+            .map_err(|_| ApiError::internal("回滚制品删除事务失败"))?;
+        return Ok(None);
+    };
+    let artifact = ArtifactRecord::try_from(row)?;
+    let reclamation = register_blob_reclamation(&mut tx, &artifact.sha256).await?;
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交制品删除事务失败"))?;
+    Ok(Some(ArtifactDeleteResult {
+        artifact,
+        reclamation,
+    }))
+}
+
+/// 原子提交 hosted 制品索引；覆盖时同事务登记旧 blob 回收意图。
+pub async fn commit_artifact(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+    allow_overwrite: bool,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    if !allow_overwrite {
+        return insert_artifact_without_overwrite(pool, input).await;
+    }
+    upsert_artifact_in_transaction(pool, input).await
+}
+
+/// 仅当 proxy 仓库上游地址仍等于预期快照时提交正缓存。
+pub async fn commit_proxy_artifact(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+    expected_upstream_url: &str,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    let size = artifact_size_i64(input.size).map_err(ArtifactCommitError::Internal)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(artifact_commit_internal("开启代理缓存提交事务失败"))?;
+    let old = load_replaced_sha256(&mut tx, input).await?;
+    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url).await?;
+    let Some(row) = row else {
+        tx.rollback()
+            .await
+            .map_err(artifact_commit_internal("回滚过期代理缓存事务失败"))?;
+        return Err(ArtifactCommitError::StaleProxyConfiguration);
+    };
+    finish_artifact_upsert(tx, row, old, input).await
+}
+
+async fn insert_artifact_without_overwrite(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    let size = artifact_size_i64(input.size).map_err(ArtifactCommitError::Internal)?;
+    let sql = format!(
+        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {ARTIFACT_COLUMNS}"
+    );
+    let row = bind_artifact_write(sqlx::query_as::<_, ArtifactRow>(&sql), input, size)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::Database(database_error) if database_error.is_unique_violation() => {
+                ArtifactCommitError::Conflict
+            }
+            _ => ArtifactCommitError::Internal(ApiError::internal("写入制品失败")),
+        })?;
+    let artifact = ArtifactRecord::try_from(row).map_err(ArtifactCommitError::Internal)?;
+    Ok(ArtifactCommitResult {
+        artifact,
+        reclamation: None,
+        created: true,
+    })
+}
+
+async fn upsert_artifact_in_transaction(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    let size = artifact_size_i64(input.size).map_err(ArtifactCommitError::Internal)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(artifact_commit_internal("开启制品提交事务失败"))?;
+    let old = load_replaced_sha256(&mut tx, input).await?;
+    let sql = format!(
+        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(repo_id, path) DO UPDATE SET sha256 = excluded.sha256, sha1 = excluded.sha1, md5 = excluded.md5, sha512 = excluded.sha512, size = excluded.size, cached = excluded.cached, updated_at = datetime('now') RETURNING {ARTIFACT_COLUMNS}"
+    );
+    let row = bind_artifact_write(sqlx::query_as::<_, ArtifactRow>(&sql), input, size)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(artifact_commit_internal("提交制品索引失败"))?;
+    finish_artifact_upsert(tx, row, old, input).await
+}
+
+async fn load_replaced_sha256(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &ArtifactWriteInput,
+) -> Result<Option<String>, ArtifactCommitError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT sha256 FROM artifacts WHERE repo_id = ? AND path = ?")
+            .bind(input.repo_id)
+            .bind(&input.path)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(artifact_commit_internal("读取旧制品失败"))?;
+    Ok(row.map(|value| value.0))
+}
+
+async fn conditional_proxy_upsert(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &ArtifactWriteInput,
+    size: i64,
+    expected_upstream_url: &str,
+) -> Result<Option<ArtifactRow>, ArtifactCommitError> {
+    let sql = format!(
+        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM repositories WHERE id = ? AND repo_type = 'proxy' AND upstream_url = ? ON CONFLICT(repo_id, path) DO UPDATE SET sha256 = excluded.sha256, sha1 = excluded.sha1, md5 = excluded.md5, sha512 = excluded.sha512, size = excluded.size, cached = excluded.cached, updated_at = datetime('now') RETURNING {ARTIFACT_COLUMNS}"
+    );
+    bind_artifact_write(sqlx::query_as::<_, ArtifactRow>(&sql), input, size)
+        .bind(input.repo_id)
+        .bind(expected_upstream_url)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(artifact_commit_internal("提交代理缓存索引失败"))
+}
+
+fn bind_artifact_write<'q>(
+    query: sqlx::query::QueryAs<'q, Sqlite, ArtifactRow, sqlx::sqlite::SqliteArguments<'q>>,
+    input: &'q ArtifactWriteInput,
+    size: i64,
+) -> sqlx::query::QueryAs<'q, Sqlite, ArtifactRow, sqlx::sqlite::SqliteArguments<'q>> {
+    query
+        .bind(input.repo_id)
+        .bind(&input.path)
+        .bind(&input.sha256)
+        .bind(&input.sha1)
+        .bind(&input.md5)
+        .bind(&input.sha512)
+        .bind(size)
+        .bind(input.cached)
+}
+
+async fn finish_artifact_upsert(
+    mut tx: Transaction<'_, Sqlite>,
+    row: ArtifactRow,
+    old: Option<String>,
+    input: &ArtifactWriteInput,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    let reclamation = match old.as_deref() {
+        Some(sha256) if sha256 != input.sha256 => Some(
+            register_blob_reclamation(&mut tx, sha256)
+                .await
+                .map_err(ArtifactCommitError::Internal)?,
+        ),
+        _ => None,
+    };
+    tx.commit()
+        .await
+        .map_err(artifact_commit_internal("提交制品事务失败"))?;
+    let artifact = ArtifactRecord::try_from(row).map_err(ArtifactCommitError::Internal)?;
+    Ok(ArtifactCommitResult {
+        artifact,
+        reclamation,
+        created: old.is_none(),
+    })
+}
+
+/// 删除仓库内全部缓存索引，并在同一事务批量登记回收意图。
+pub async fn delete_cached_artifacts_by_repo(
+    pool: &SqlitePool,
+    repo_id: i64,
+) -> Result<Vec<BlobReclamation>, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启缓存制品删除事务失败"))?;
+    let reclamations = register_repository_reclamations(&mut tx, repo_id, true).await?;
+    sqlx::query("DELETE FROM artifacts WHERE repo_id = ? AND cached = 1")
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::internal("清理仓库缓存制品失败"))?;
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交缓存制品删除事务失败"))?;
+    Ok(reclamations)
+}
+
+fn unique_hashes(mut rows: Vec<(String,)>) -> Vec<String> {
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    rows.dedup_by(|left, right| left.0 == right.0);
+    rows.into_iter().map(|row| row.0).collect()
+}
+
+/// 分页列出目录的直接子项，目录由后续路径段实时聚合而成。
+pub async fn list_artifact_directory(
+    pool: &SqlitePool,
+    repo_id: i64,
+    prefix: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<(Vec<ArtifactDirectoryEntry>, i64), ApiError> {
+    let pattern = directory_pattern(prefix);
+    let start = i64::try_from(prefix.chars().count() + usize::from(!prefix.is_empty()) + 1)
+        .map_err(|_| ApiError::bad_request("ARTIFACT_INVALID_PATH", "制品目录路径无效"))?;
+    let offset = i64::from(page.saturating_sub(1)) * i64::from(page_size);
+    let sql = directory_entries_sql();
+    let total: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM ({sql})"))
+        .bind(start)
+        .bind(repo_id)
+        .bind(&pattern)
+        .fetch_one(pool)
+        .await
+        .map_err(|_| ApiError::internal("统计制品目录失败"))?;
+    let rows = sqlx::query_as::<_, ArtifactDirectoryRow>(&format!(
+        "SELECT name, is_directory, size, sha256, sha1, md5, sha512, updated_at FROM ({sql}) ORDER BY is_directory DESC, name LIMIT ? OFFSET ?"
+    ))
+    .bind(start)
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(i64::from(page_size))
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(|_| ApiError::internal("查询制品目录失败"))?;
+    let entries = rows
+        .into_iter()
+        .map(|row| directory_entry(prefix, row))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((entries, total.0))
+}
+
+fn directory_entries_sql() -> &'static str {
+    "WITH descendants AS (SELECT substr(path, ?) AS rest, size, sha256, sha1, md5, sha512, updated_at FROM artifacts WHERE repo_id = ? AND path LIKE ? ESCAPE '\\'), normalized AS (SELECT CASE WHEN instr(rest, '/') = 0 THEN rest ELSE substr(rest, 1, instr(rest, '/') - 1) END AS name, CASE WHEN instr(rest, '/') = 0 THEN 0 ELSE 1 END AS is_directory, size, sha256, sha1, md5, sha512, updated_at FROM descendants) SELECT name, MAX(is_directory) AS is_directory, CASE WHEN MAX(is_directory) = 1 THEN NULL ELSE MAX(size) END AS size, CASE WHEN MAX(is_directory) = 1 THEN NULL ELSE MAX(sha256) END AS sha256, CASE WHEN MAX(is_directory) = 1 THEN NULL ELSE MAX(sha1) END AS sha1, CASE WHEN MAX(is_directory) = 1 THEN NULL ELSE MAX(md5) END AS md5, CASE WHEN MAX(is_directory) = 1 THEN NULL ELSE MAX(sha512) END AS sha512, MAX(updated_at) AS updated_at FROM normalized WHERE name <> '' GROUP BY name"
+}
+
+fn directory_pattern(prefix: &str) -> String {
+    if prefix.is_empty() {
+        "%".to_string()
+    } else {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        format!("{escaped}/%")
+    }
+}
+
+/// 分页搜索仓库内路径子串，返回完整制品记录。
+pub async fn search_artifacts(
+    pool: &SqlitePool,
+    repo_id: i64,
+    query: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<(Vec<ArtifactRecord>, i64), ApiError> {
+    let pattern = like_pattern(Some(query));
+    let (limit, offset) = page_bounds(page, page_size);
+    let total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM artifacts WHERE repo_id = ? AND path LIKE ? ESCAPE '\\'",
+    )
+    .bind(repo_id)
+    .bind(&pattern)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ApiError::internal("统计制品搜索结果失败"))?;
+    let sql = format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE repo_id = ? AND path LIKE ? ESCAPE '\\' ORDER BY path LIMIT ? OFFSET ?"
+    );
+    let rows = sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id)
+        .bind(pattern)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("搜索制品失败"))?;
+    let artifacts = rows
+        .into_iter()
+        .map(ArtifactRecord::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((artifacts, total.0))
+}
+
+fn directory_entry(
+    prefix: &str,
+    row: ArtifactDirectoryRow,
+) -> Result<ArtifactDirectoryEntry, ApiError> {
+    let size = row
+        .size
+        .map(|value| u64::try_from(value).map_err(|_| ApiError::internal("制品大小非法")))
+        .transpose()?;
+    let path = if prefix.is_empty() {
+        row.name.clone()
+    } else {
+        format!("{prefix}/{}", row.name)
+    };
+    Ok(ArtifactDirectoryEntry {
+        name: row.name,
+        path,
+        is_directory: row.is_directory,
+        size,
+        sha256: row.sha256,
+        sha1: row.sha1,
+        md5: row.md5,
+        sha512: row.sha512,
+        updated_at: row.updated_at,
+    })
 }
 
 /// 用户读取列（统一列表，避免多处重复书写并保证 FromRow 列名一致）。
@@ -565,8 +1254,9 @@ pub async fn cleanup_expired_revoked(pool: &SqlitePool, now_unix: i64) -> Result
 
 // ==================== 仓库核心仓储 ====================
 
-/// 仓库读取列。本批次未建立制品索引，统计列固定为零。
-const REPOSITORY_COLUMNS: &str = "id, name, format, repo_type, visibility, disabled, overwrite_policy, version_policy, upstream_url, upstream_credential_ref, 0 AS object_count, 0 AS total_bytes, created_at";
+/// 仓库读取列，制品统计由同一聚合子查询提供。
+const REPOSITORY_COLUMNS: &str = "repositories.id, repositories.name, repositories.format, repositories.repo_type, repositories.visibility, repositories.disabled, repositories.overwrite_policy, repositories.version_policy, repositories.upstream_url, repositories.upstream_credential_ref, COALESCE(artifact_stats.object_count, 0) AS object_count, COALESCE(artifact_stats.total_bytes, 0) AS total_bytes, repositories.created_at";
+const REPOSITORY_FROM: &str = "repositories LEFT JOIN (SELECT repo_id, COUNT(*) AS object_count, SUM(size) AS total_bytes FROM artifacts GROUP BY repo_id) AS artifact_stats ON artifact_stats.repo_id = repositories.id";
 
 /// 待写入的仓库配置。
 pub(crate) struct NewRepositoryRow {
@@ -601,7 +1291,10 @@ pub(crate) struct MemberCandidate {
 
 /// 条件删除结果。
 pub(crate) enum RepositoryDeleteOutcome {
-    Deleted,
+    Deleted {
+        hashes: Vec<String>,
+        reclamations: Vec<BlobReclamation>,
+    },
     InUse,
 }
 
@@ -812,7 +1505,7 @@ pub(crate) async fn find_repository_access(
     global_admin: bool,
 ) -> Result<Option<(Repository, Option<Permission>)>, ApiError> {
     let sql = format!(
-        "SELECT {REPOSITORY_COLUMNS}, (SELECT permission FROM repository_acl WHERE repo_id = repositories.id AND user_id = ?) AS acl_permission FROM repositories WHERE name = ?"
+        "SELECT {REPOSITORY_COLUMNS}, (SELECT permission FROM repository_acl WHERE repo_id = repositories.id AND user_id = ?) AS acl_permission FROM {REPOSITORY_FROM} WHERE repositories.name = ?"
     );
     let row = sqlx::query_as::<_, RepositoryAccessRow>(&sql)
         .bind(user_id)
@@ -834,7 +1527,8 @@ async fn find_repository_by_id(
     pool: &SqlitePool,
     repository_id: i64,
 ) -> Result<Option<Repository>, ApiError> {
-    let sql = format!("SELECT {REPOSITORY_COLUMNS} FROM repositories WHERE id = ?");
+    let sql =
+        format!("SELECT {REPOSITORY_COLUMNS} FROM {REPOSITORY_FROM} WHERE repositories.id = ?");
     let row = sqlx::query_as::<_, RepositoryRow>(&sql)
         .bind(repository_id)
         .fetch_optional(pool)
@@ -861,7 +1555,7 @@ pub(crate) async fn list_repositories(
 ) -> Result<(Vec<Repository>, i64), ApiError> {
     let (limit, offset) = page_bounds(page, page_size);
     let pattern = like_pattern(q);
-    let filter = "name LIKE ? ESCAPE '\\' AND (? OR visibility = 'public' OR (? IS NOT NULL AND EXISTS (SELECT 1 FROM repository_acl WHERE repo_id = repositories.id AND user_id = ?)))";
+    let filter = "repositories.name LIKE ? ESCAPE '\\' AND (? OR repositories.visibility = 'public' OR (? IS NOT NULL AND EXISTS (SELECT 1 FROM repository_acl WHERE repo_id = repositories.id AND user_id = ?)))";
     let total_sql = format!("SELECT COUNT(*) FROM repositories WHERE {filter}");
     let total: (i64,) = sqlx::query_as(&total_sql)
         .bind(&pattern)
@@ -872,7 +1566,7 @@ pub(crate) async fn list_repositories(
         .await
         .map_err(|_| ApiError::internal("统计仓库失败"))?;
     let list_sql = format!(
-        "SELECT {REPOSITORY_COLUMNS} FROM repositories WHERE {filter} ORDER BY name, id LIMIT ? OFFSET ?"
+        "SELECT {REPOSITORY_COLUMNS} FROM {REPOSITORY_FROM} WHERE {filter} ORDER BY repositories.name, repositories.id LIMIT ? OFFSET ?"
     );
     let rows = sqlx::query_as::<_, RepositoryRow>(&list_sql)
         .bind(&pattern)
@@ -997,30 +1691,74 @@ pub(crate) async fn find_member_candidates(
         .collect()
 }
 
-/// 原子更新仓库字段，并在需要时整体替换 group 成员。
+/// 原子更新仓库字段，并在上游地址变化时登记并失效全部正缓存索引。
 pub(crate) async fn update_repository_record(
     pool: &SqlitePool,
     repository_id: i64,
     patch: &RepositoryRowPatch,
     member_ids: Option<&[i64]>,
-) -> Result<(), ApiError> {
+) -> Result<Vec<BlobReclamation>, ApiError> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|_| ApiError::internal("开启仓库更新事务失败"))?;
+    let invalidate_cache = upstream_url_changed(&mut tx, repository_id, patch).await?;
     update_repository_fields(&mut tx, repository_id, patch).await?;
+    let reclamations = if invalidate_cache {
+        delete_cached_artifacts_in_transaction(&mut tx, repository_id).await?
+    } else {
+        Vec::new()
+    };
     if let Some(ids) = member_ids {
-        sqlx::query("DELETE FROM repository_group_members WHERE group_repo_id = ?")
-            .bind(repository_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| ApiError::internal("清理旧 group 成员失败"))?;
-        insert_group_members(&mut tx, repository_id, ids).await?;
+        replace_group_members(&mut tx, repository_id, ids).await?;
     }
     tx.commit()
         .await
         .map_err(|_| ApiError::internal("提交仓库更新事务失败"))?;
-    Ok(())
+    Ok(reclamations)
+}
+
+async fn upstream_url_changed(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+    patch: &RepositoryRowPatch,
+) -> Result<bool, ApiError> {
+    let Some(next_url) = patch.upstream_url.as_deref() else {
+        return Ok(false);
+    };
+    let current: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT upstream_url FROM repositories WHERE id = ?")
+            .bind(repository_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| ApiError::internal("读取仓库上游地址失败"))?;
+    Ok(current.is_some_and(|row| row.0.as_deref() != Some(next_url)))
+}
+
+async fn delete_cached_artifacts_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+) -> Result<Vec<BlobReclamation>, ApiError> {
+    let reclamations = register_repository_reclamations(tx, repository_id, true).await?;
+    sqlx::query("DELETE FROM artifacts WHERE repo_id = ? AND cached = 1")
+        .bind(repository_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("失效仓库缓存制品失败"))?;
+    Ok(reclamations)
+}
+
+async fn replace_group_members(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+    member_ids: &[i64],
+) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM repository_group_members WHERE group_repo_id = ?")
+        .bind(repository_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("清理旧 group 成员失败"))?;
+    insert_group_members(tx, repository_id, member_ids).await
 }
 
 async fn update_repository_fields(
@@ -1053,24 +1791,64 @@ async fn update_repository_fields(
     Ok(())
 }
 
-/// 删除未被 group 引用的仓库。检查与删除由同一语句原子完成。
+/// 删除未被 group 引用的仓库，并按模式同事务登记或取消 blob 回收意图。
 pub(crate) async fn delete_repository_record(
     pool: &SqlitePool,
     repository_id: i64,
+    reclaim_blobs: bool,
 ) -> Result<RepositoryDeleteOutcome, ApiError> {
-    let result = sqlx::query(
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启仓库删除事务失败"))?;
+    let hashes = repository_blob_hashes_in_transaction(&mut tx, repository_id).await?;
+    let reclamations = if reclaim_blobs {
+        register_repository_reclamations(&mut tx, repository_id, false).await?
+    } else {
+        cancel_repository_reclamations(&mut tx, repository_id).await?;
+        Vec::new()
+    };
+    let result = delete_unreferenced_repository(&mut tx, repository_id).await?;
+    if result.rows_affected() == 0 {
+        tx.rollback()
+            .await
+            .map_err(|_| ApiError::internal("回滚仓库删除事务失败"))?;
+        return Ok(RepositoryDeleteOutcome::InUse);
+    }
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交仓库删除事务失败"))?;
+    Ok(RepositoryDeleteOutcome::Deleted {
+        hashes,
+        reclamations,
+    })
+}
+
+async fn repository_blob_hashes_in_transaction(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+) -> Result<Vec<String>, ApiError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT sha256 FROM artifacts WHERE repo_id = ?")
+            .bind(repository_id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_| ApiError::internal("读取仓库制品摘要失败"))?;
+    Ok(unique_hashes(rows))
+}
+
+async fn delete_unreferenced_repository(
+    tx: &mut Transaction<'_, Sqlite>,
+    repository_id: i64,
+) -> Result<sqlx::sqlite::SqliteQueryResult, ApiError> {
+    sqlx::query(
         "DELETE FROM repositories WHERE id = ? AND NOT EXISTS (SELECT 1 FROM repository_group_members WHERE member_repo_id = ?)",
     )
     .bind(repository_id)
     .bind(repository_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await
-    .map_err(|_| ApiError::internal("删除仓库失败"))?;
-    if result.rows_affected() == 1 {
-        Ok(RepositoryDeleteOutcome::Deleted)
-    } else {
-        Ok(RepositoryDeleteOutcome::InUse)
-    }
+    .map_err(|_| ApiError::internal("删除仓库失败"))
 }
 
 /// 列出仓库 ACL，稳定按精确用户名与用户标识排序。
@@ -1554,5 +2332,567 @@ mod tests {
         );
         assert_ne!(stored_hash.0, plain, "Token 列不得为明文");
         assert!(!stored_hash.0.starts_with("jat_"), "Token 列不得含明文前缀");
+    }
+
+    #[tokio::test]
+    async fn artifacts迁移建立唯一键摘要约束与索引() {
+        let pool = test_pool().await;
+        let repo_id: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, overwrite_policy) VALUES ('artifact-test', 'raw', 'hosted', 'private', 'allow') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let insert = "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        sqlx::query(insert)
+            .bind(repo_id.0)
+            .bind("a/file.bin")
+            .bind("a".repeat(64))
+            .bind("b".repeat(40))
+            .bind("c".repeat(32))
+            .bind("d".repeat(128))
+            .bind(3_i64)
+            .bind(false)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let duplicate = sqlx::query(insert)
+            .bind(repo_id.0)
+            .bind("a/file.bin")
+            .bind("e".repeat(64))
+            .bind("b".repeat(40))
+            .bind("c".repeat(32))
+            .bind("d".repeat(128))
+            .bind(3_i64)
+            .bind(false)
+            .execute(&pool)
+            .await;
+        assert!(duplicate.is_err(), "仓库内路径必须唯一");
+
+        for (sha256, size, cached) in [
+            ("z".repeat(64), 1_i64, 0_i64),
+            ("a".repeat(63), 1, 0),
+            ("a".repeat(64), -1, 0),
+            ("a".repeat(64), 1, 2),
+        ] {
+            let invalid = sqlx::query(insert)
+                .bind(repo_id.0)
+                .bind(format!("invalid-{sha256}-{size}-{cached}"))
+                .bind(sha256)
+                .bind("b".repeat(40))
+                .bind("c".repeat(32))
+                .bind("d".repeat(128))
+                .bind(size)
+                .bind(cached)
+                .execute(&pool)
+                .await;
+            assert!(invalid.is_err(), "摘要、大小与缓存标志约束必须生效");
+        }
+
+        for index in ["idx_artifacts_blob", "idx_artifacts_repo_path"] {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+            )
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row.0, 1, "应建立索引 {index}");
+        }
+    }
+
+    async fn 创建制品测试仓库(pool: &SqlitePool, name: &str) -> i64 {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, overwrite_policy) VALUES (?, 'raw', 'hosted', 'private', 'allow') RETURNING id",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row.0
+    }
+
+    fn 制品输入(
+        repo_id: i64,
+        path: &str,
+        marker: char,
+        cached: bool,
+        size: u64,
+    ) -> ArtifactWriteInput {
+        ArtifactWriteInput {
+            repo_id,
+            path: path.to_owned(),
+            sha256: marker.to_string().repeat(64),
+            sha1: marker.to_string().repeat(40),
+            md5: marker.to_string().repeat(32),
+            sha512: marker.to_string().repeat(128),
+            size,
+            cached,
+        }
+    }
+
+    #[tokio::test]
+    async fn 制品拒绝覆盖返回可区分冲突() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "deny-conflict").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+
+        let error = commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'b', false, 2), false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactCommitError::Conflict));
+    }
+
+    #[tokio::test]
+    async fn 制品允许覆盖返回旧摘要() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "allow-replace").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+
+        let result = commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'b', false, 2), true)
+            .await
+            .unwrap();
+
+        assert!(!result.created);
+        assert_eq!(result.reclamation.unwrap().sha256, "a".repeat(64));
+        assert_eq!(result.artifact.sha256, "b".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn 同摘要跨仓引用计数与仓库去重列表() {
+        let pool = test_pool().await;
+        let first_repo = 创建制品测试仓库(&pool, "refs-first").await;
+        let second_repo = 创建制品测试仓库(&pool, "refs-second").await;
+        for (repo_id, path) in [
+            (first_repo, "a.bin"),
+            (first_repo, "b.bin"),
+            (second_repo, "c.bin"),
+        ] {
+            commit_artifact(&pool, &制品输入(repo_id, path, 'a', false, 1), false)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            count_artifact_references(&pool, &"a".repeat(64))
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            list_repository_blob_hashes(&pool, first_repo)
+                .await
+                .unwrap(),
+            vec!["a".repeat(64)]
+        );
+    }
+
+    #[tokio::test]
+    async fn 删除制品路径返回旧记录() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "delete-path").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 7), false)
+            .await
+            .unwrap();
+
+        let deleted = delete_artifact_by_path(&pool, repo_id, "a.bin")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(deleted.artifact.path, "a.bin");
+        assert_eq!(deleted.artifact.size, 7);
+        assert!(
+            find_artifact_by_path(&pool, repo_id, "a.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn 批量删除只清理缓存制品并返回去重摘要() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "delete-cached").await;
+        for (path, marker, cached) in [
+            ("cached-a.bin", 'a', true),
+            ("cached-a-copy.bin", 'a', true),
+            ("hosted.bin", 'b', false),
+        ] {
+            commit_artifact(&pool, &制品输入(repo_id, path, marker, cached, 1), false)
+                .await
+                .unwrap();
+        }
+
+        let candidates = delete_cached_artifacts_by_repo(&pool, repo_id)
+            .await
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sha256, "a".repeat(64));
+        assert!(
+            find_artifact_by_path(&pool, repo_id, "cached-a.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_artifact_by_path(&pool, repo_id, "hosted.bin")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn 仓库列表与详情聚合制品统计且分页总数不变() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "stats-repo").await;
+        创建制品测试仓库(&pool, "stats-empty").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 3), false)
+            .await
+            .unwrap();
+        commit_artifact(&pool, &制品输入(repo_id, "b.bin", 'b', false, 5), false)
+            .await
+            .unwrap();
+
+        let (repositories, total) = list_repositories(&pool, None, true, 1, 1, Some("stats-repo"))
+            .await
+            .unwrap();
+        let detail = find_repository_access(&pool, "stats-repo", None, true)
+            .await
+            .unwrap()
+            .unwrap()
+            .0;
+
+        assert_eq!(total, 1);
+        assert_eq!(repositories[0].object_count, 2);
+        assert_eq!(repositories[0].total_bytes, 8);
+        assert_eq!(detail.object_count, 2);
+        assert_eq!(detail.total_bytes, 8);
+    }
+
+    #[tokio::test]
+    async fn 目录索引只返回直接子项并支持utf8前缀分页() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "directory-list").await;
+        for (path, marker, size) in [
+            ("根.bin", 'a', 1),
+            ("目录/甲.bin", 'b', 2),
+            ("目录/子目录/乙.bin", 'c', 3),
+            ("目录/丙.bin", 'd', 4),
+        ] {
+            commit_artifact(&pool, &制品输入(repo_id, path, marker, false, size), false)
+                .await
+                .unwrap();
+        }
+
+        let (root, root_total) = list_artifact_directory(&pool, repo_id, "", 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(root_total, 2);
+        assert!(root[0].is_directory);
+        assert_eq!(root[0].path, "目录");
+        assert_eq!(root[1].path, "根.bin");
+
+        let (page, total) = list_artifact_directory(&pool, repo_id, "目录", 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "目录/甲.bin");
+    }
+
+    #[tokio::test]
+    async fn 制品路径搜索分页且通配符按字面匹配() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "artifact-search").await;
+        for (path, marker) in [("a%file.bin", 'a'), ("a-file.bin", 'b'), ("other.bin", 'c')] {
+            commit_artifact(&pool, &制品输入(repo_id, path, marker, false, 1), false)
+                .await
+                .unwrap();
+        }
+
+        let (items, total) = search_artifacts(&pool, repo_id, "%", 1, 1).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].path, "a%file.bin");
+    }
+
+    #[tokio::test]
+    async fn proxy仅在上游地址真实变化时事务失效正缓存() {
+        let pool = test_pool().await;
+        let repo_id: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('proxy-invalidate', 'raw', 'proxy', 'private', 'https://old.example/base') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        commit_artifact(
+            &pool,
+            &制品输入(repo_id.0, "cached.bin", 'a', true, 3),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let credential_only = RepositoryRowPatch {
+            upstream_credential_ref: Some(Some("UPSTREAM_AUTH".to_string())),
+            ..RepositoryRowPatch::default()
+        };
+        assert!(
+            update_repository_record(&pool, repo_id.0, &credential_only, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let changed_url = RepositoryRowPatch {
+            upstream_url: Some("https://new.example/base".to_string()),
+            ..RepositoryRowPatch::default()
+        };
+        let reclamations = update_repository_record(&pool, repo_id.0, &changed_url, None)
+            .await
+            .unwrap();
+        assert_eq!(reclamations.len(), 1);
+        assert_eq!(reclamations[0].sha256, "a".repeat(64));
+        assert!(
+            find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn 删除仓库事务返回级联前去重blob候选() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "delete-with-artifacts").await;
+        for path in ["a.bin", "a-copy.bin"] {
+            commit_artifact(&pool, &制品输入(repo_id, path, 'a', false, 1), false)
+                .await
+                .unwrap();
+        }
+
+        let deleted = delete_repository_record(&pool, repo_id, true)
+            .await
+            .unwrap();
+        let (hashes, reclamations) = match deleted {
+            RepositoryDeleteOutcome::Deleted {
+                hashes,
+                reclamations,
+            } => Some((hashes, reclamations)),
+            RepositoryDeleteOutcome::InUse => None,
+        }
+        .unwrap();
+        assert_eq!(hashes, vec!["a".repeat(64)]);
+        assert_eq!(reclamations.len(), 1);
+        assert_eq!(reclamations[0].sha256, "a".repeat(64));
+        assert_eq!(
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM artifacts WHERE repo_id = ?")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .0,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn blob回收迁移约束与generation条件完成() {
+        let pool = test_pool().await;
+        let table: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'blob_reclamations'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(table.0, 1);
+        for (sha256, generation) in [("z".repeat(64), 1_i64), ("a".repeat(64), 0_i64)] {
+            assert!(
+                sqlx::query("INSERT INTO blob_reclamations (sha256, generation) VALUES (?, ?)")
+                    .bind(sha256)
+                    .bind(generation)
+                    .execute(&pool)
+                    .await
+                    .is_err()
+            );
+        }
+
+        let repo_id = 创建制品测试仓库(&pool, "reclamation-generation").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+        let first = delete_artifact_by_path(&pool, repo_id, "a.bin")
+            .await
+            .unwrap()
+            .unwrap()
+            .reclamation;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+        let second = delete_artifact_by_path(&pool, repo_id, "a.bin")
+            .await
+            .unwrap()
+            .unwrap()
+            .reclamation;
+
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(
+            complete_blob_reclamations(&pool, &[first]).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            pending_blob_reclamations(&pool).await.unwrap(),
+            vec![second.clone()]
+        );
+        assert_eq!(
+            complete_blob_reclamations(&pool, &[second]).await.unwrap(),
+            1
+        );
+        assert!(pending_blob_reclamations(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blob回收批量操作不受sqlite变量上限限制() {
+        let pool = test_pool().await;
+        let reclamations: Vec<_> = (0..16_385)
+            .map(|index| BlobReclamation {
+                sha256: format!("{index:064x}"),
+                generation: 1,
+            })
+            .collect();
+
+        assert!(
+            inspect_blob_reclamations(&pool, &reclamations)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            complete_blob_reclamations(&pool, &reclamations)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn 候选blob引用统计支持大批量并保持去重() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "candidate-references").await;
+        commit_artifact(&pool, &制品输入(repo_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+        let referenced = "a".repeat(64);
+        let mut candidates: Vec<_> = (0..16_385).map(|index| format!("{index:064x}")).collect();
+        candidates.push(referenced.clone());
+        candidates.push(referenced.clone());
+
+        assert_eq!(
+            referenced_candidate_hashes(&pool, &candidates)
+                .await
+                .unwrap(),
+            HashSet::from([referenced])
+        );
+    }
+
+    #[tokio::test]
+    async fn 仓库data登记且config取消同摘要回收意图() {
+        let pool = test_pool().await;
+        let source_id = 创建制品测试仓库(&pool, "reclamation-source").await;
+        commit_artifact(&pool, &制品输入(source_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+        delete_artifact_by_path(&pool, source_id, "a.bin")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let config_id = 创建制品测试仓库(&pool, "reclamation-config").await;
+        commit_artifact(&pool, &制品输入(config_id, "a.bin", 'a', false, 1), false)
+            .await
+            .unwrap();
+        let config = delete_repository_record(&pool, config_id, false)
+            .await
+            .unwrap();
+        let (hashes, reclamations) = match config {
+            RepositoryDeleteOutcome::Deleted {
+                hashes,
+                reclamations,
+            } => Some((hashes, reclamations)),
+            RepositoryDeleteOutcome::InUse => None,
+        }
+        .unwrap();
+        assert_eq!(hashes, vec!["a".repeat(64)]);
+        assert!(reclamations.is_empty());
+        assert!(pending_blob_reclamations(&pool).await.unwrap().is_empty());
+
+        let data_id = 创建制品测试仓库(&pool, "reclamation-data").await;
+        commit_artifact(&pool, &制品输入(data_id, "b.bin", 'b', false, 1), false)
+            .await
+            .unwrap();
+        let data = delete_repository_record(&pool, data_id, true)
+            .await
+            .unwrap();
+        let reclamations = match data {
+            RepositoryDeleteOutcome::Deleted { reclamations, .. } => Some(reclamations),
+            RepositoryDeleteOutcome::InUse => None,
+        }
+        .unwrap();
+        assert_eq!(reclamations.len(), 1);
+        assert_eq!(reclamations[0].sha256, "b".repeat(64));
+        assert_eq!(
+            pending_blob_reclamations(&pool).await.unwrap(),
+            reclamations
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy缓存提交在事务内拒绝旧上游快照() {
+        let pool = test_pool().await;
+        let repo_id: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('proxy-commit-snapshot', 'raw', 'proxy', 'private', 'https://old.example/base') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = 'https://new.example/base' WHERE id = ?",
+        )
+        .bind(repo_id.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = commit_proxy_artifact(
+            &pool,
+            &制品输入(repo_id.0, "cached.bin", 'a', true, 1),
+            "https://old.example/base",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactCommitError::StaleProxyConfiguration
+        ));
+        assert!(
+            find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

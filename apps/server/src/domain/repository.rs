@@ -183,7 +183,7 @@ pub enum AuthorizationDecision {
     Forbidden,
 }
 
-/// 仓库元数据领域实体。本批次尚无制品索引，统计值恒为零。
+/// 仓库元数据领域实体，统计值由制品索引聚合查询提供。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     /// 仓库标识。

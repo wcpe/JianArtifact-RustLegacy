@@ -23,6 +23,12 @@ pub struct Config {
     pub jwt_secret: String,
     /// 会话令牌有效期（小时），默认 8。
     pub session_ttl_hours: u64,
+    /// 单个制品允许写入的最大实际字节数，默认 5 GiB。
+    pub max_artifact_bytes: u64,
+    /// blob 写入前要求的最小可用空间字节数，默认 5 GiB。
+    pub min_free_bytes: u64,
+    /// blob 写入前要求的最小可用空间百分比，默认 5。
+    pub min_free_percent: u8,
 }
 
 impl Default for Config {
@@ -35,6 +41,9 @@ impl Default for Config {
             // 密钥无内置默认值，须经环境变量注入；空值在 build_app 处被拒绝启动
             jwt_secret: String::new(),
             session_ttl_hours: 8,
+            max_artifact_bytes: 5 * 1024 * 1024 * 1024,
+            min_free_bytes: 5 * 1024 * 1024 * 1024,
+            min_free_percent: 5,
         }
     }
 }
@@ -54,5 +63,23 @@ impl Config {
     /// 组装 sqlx 使用的 SQLite 连接串（缺库文件时自动创建）。
     pub fn database_url(&self) -> String {
         format!("sqlite://{}?mode=rwc", self.database_path.display())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 制品与磁盘阈值默认值符合nfr() -> Result<(), serde_json::Error> {
+        let config = Config::default();
+        assert_eq!(config.max_artifact_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(config.min_free_bytes, 5 * 1024 * 1024 * 1024);
+        assert_eq!(config.min_free_percent, 5);
+        let value = serde_json::to_value(config)?;
+        assert!(value.get("max-artifact-bytes").is_some());
+        assert!(value.get("min-free-bytes").is_some());
+        assert!(value.get("min-free-percent").is_some());
+        Ok(())
     }
 }

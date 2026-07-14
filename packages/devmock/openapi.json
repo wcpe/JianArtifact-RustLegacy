@@ -870,8 +870,8 @@
               }
             }
           },
-          "501": {
-            "description": "数据物理删除尚未实现",
+          "500": {
+            "description": "索引删除或 blob 回收失败",
             "content": {
               "application/json": {
                 "schema": {
@@ -1136,7 +1136,7 @@
         "tags": [
           "repos"
         ],
-        "summary": "仓库内目录浏览（本批次不实现）。",
+        "summary": "仓库内目录浏览。",
         "operationId": "files",
         "parameters": [
           {
@@ -1191,8 +1191,8 @@
               }
             }
           },
-          "404": {
-            "description": "仓库或路径不存在",
+          "400": {
+            "description": "路径或分页参数无效",
             "content": {
               "application/json": {
                 "schema": {
@@ -1201,8 +1201,8 @@
               }
             }
           },
-          "501": {
-            "description": "仓库浏览尚未实现",
+          "404": {
+            "description": "仓库、目录不存在或无权读取",
             "content": {
               "application/json": {
                 "schema": {
@@ -1219,7 +1219,7 @@
         "tags": [
           "repos"
         ],
-        "summary": "仓库内路径搜索（本批次不实现）。",
+        "summary": "仓库内路径搜索。",
         "operationId": "search",
         "parameters": [
           {
@@ -1274,8 +1274,8 @@
               }
             }
           },
-          "404": {
-            "description": "仓库不存在",
+          "400": {
+            "description": "搜索或分页参数无效",
             "content": {
               "application/json": {
                 "schema": {
@@ -1284,8 +1284,8 @@
               }
             }
           },
-          "501": {
-            "description": "仓库搜索尚未实现",
+          "404": {
+            "description": "仓库不存在或无权读取",
             "content": {
               "application/json": {
                 "schema": {
@@ -1708,6 +1708,240 @@
         }
       }
     },
+    "/repository/{name}/": {
+      "get": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "读取仓库根目录。",
+        "operationId": "repository_root_get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "目录页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "目录每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "根目录分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "仓库根目录不支持写入。",
+        "operationId": "repository_root_put",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "根目录不可写入",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无写入权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "仓库根目录不支持删除。",
+        "operationId": "repository_root_delete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "根目录不可删除",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "无写入权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "仓库根目录不支持 HEAD。",
+        "operationId": "repository_root_head",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "根目录不可探测",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/repository/{name}/{path}": {
       "get": {
         "tags": [
@@ -1733,11 +1967,83 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "目录页码，从 1 起",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "目录每页条数，最大 200",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
-          "501": {
-            "description": "格式协议读取待对应域实现",
+          "200": {
+            "description": "文件流或目录分页",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "路径或查询参数无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库、制品不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "代理上游失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "代理上游超时",
             "content": {
               "application/json": {
                 "schema": {
@@ -1774,9 +2080,90 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
-          "501": {
-            "description": "格式协议写入待对应域实现",
+          "200": {
+            "description": "覆盖成功"
+          },
+          "201": {
+            "description": "新建成功"
+          },
+          "400": {
+            "description": "路径或请求头无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "已有读取权限但无写入权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "仓库类型只读",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "覆盖策略拒绝",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "制品超过大小上限",
             "content": {
               "application/json": {
                 "schema": {
@@ -1814,8 +2201,51 @@
           }
         ],
         "responses": {
-          "501": {
-            "description": "格式协议删除待对应域实现",
+          "204": {
+            "description": "删除成功"
+          },
+          "400": {
+            "description": "路径无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "已有读取权限但无写入权限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库、制品不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "仓库类型只读",
             "content": {
               "application/json": {
                 "schema": {
@@ -1853,8 +2283,51 @@
           }
         ],
         "responses": {
-          "501": {
-            "description": "格式协议探测待对应域实现",
+          "200": {
+            "description": "文件元数据，响应体为空"
+          },
+          "400": {
+            "description": "路径无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭据无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "仓库、制品不存在或无权读取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "代理上游失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "代理上游超时",
             "content": {
               "application/json": {
                 "schema": {
@@ -2049,12 +2522,76 @@
           "orphaned_blobs": {
             "type": "integer",
             "format": "int64",
-            "description": "因删除失去引用的 blob 数；本批次恒为零。"
+            "description": "config 模式删除后失去全部引用、保留待 GC 的 blob 数。"
           },
           "reclaimed_blobs": {
             "type": "integer",
             "format": "int64",
-            "description": "被物理回收的 blob 数；本批次恒为零。"
+            "description": "data 模式已物理回收的 blob 数。"
+          }
+        }
+      },
+      "DirectoryItem": {
+        "type": "object",
+        "description": "Raw 目录条目。",
+        "required": [
+          "name",
+          "path",
+          "is_directory",
+          "updated_at"
+        ],
+        "properties": {
+          "is_directory": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "DirectoryResponse": {
+        "type": "object",
+        "description": "Raw 目录分页响应。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DirectoryItem"
+            }
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "page_size": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -2612,7 +3149,7 @@
           "object_count": {
             "type": "integer",
             "format": "int64",
-            "description": "制品数；本批次尚无制品索引，恒为零。"
+            "description": "当前制品索引数。"
           },
           "overwrite_policy": {
             "oneOf": [
@@ -2632,7 +3169,7 @@
           "total_bytes": {
             "type": "integer",
             "format": "int64",
-            "description": "总大小；本批次尚无制品索引，恒为零。"
+            "description": "当前制品总字节数。"
           },
           "upstream_credential_ref": {
             "type": [

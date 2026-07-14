@@ -13,6 +13,7 @@ use jianartifact_server::config::Config;
 use jianartifact_server::domain::{Role, create_user};
 use jianartifact_server::persistence;
 use jianartifact_server::state::AppState;
+use jianartifact_server::storage::BlobStore;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -53,7 +54,20 @@ async fn setup() -> TestContext {
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: 8,
+        max_artifact_bytes: 5 * 1024 * 1024 * 1024,
+        min_free_bytes: 5 * 1024 * 1024 * 1024,
+        min_free_percent: 5,
     };
+    let blob_store = Arc::new(BlobStore::new(
+        config.data_dir.clone(),
+        config.max_artifact_bytes,
+        config.min_free_bytes,
+        config.min_free_percent,
+    ));
+    let artifacts = Arc::new(jianartifact_server::artifact::ArtifactService::new(
+        pool.clone(),
+        blob_store.as_ref().clone(),
+    ));
     let state = AppState {
         pool: pool.clone(),
         auth: Arc::new(AuthRuntime::new(
@@ -61,6 +75,8 @@ async fn setup() -> TestContext {
             config.session_ttl_hours,
         )),
         config: Arc::new(config),
+        blob_store,
+        artifacts,
     };
     TestContext {
         app: router(state),
@@ -1074,7 +1090,16 @@ async fn 停用状态管理面仍可见_删除引用保护与双模式边界() {
         .body(Body::empty())
         .unwrap();
     let data_response = context.app.clone().oneshot(data_request).await.unwrap();
-    assert_eq!(data_response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(data_response.status(), StatusCode::OK);
+    let bytes = data_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["orphaned_blobs"], 0);
+    assert_eq!(result["reclaimed_blobs"], 0);
     let remains = send(
         &context.app,
         "GET",
@@ -1084,22 +1109,5 @@ async fn 停用状态管理面仍可见_删除引用保护与双模式边界() {
         None,
     )
     .await;
-    assert_eq!(remains.status, StatusCode::OK);
-
-    let config_request = Request::delete("/api/v1/repos/delete-standalone?mode=config")
-        .header(header::AUTHORIZATION, &admin)
-        .header("x-confirm-repository", "delete-standalone")
-        .body(Body::empty())
-        .unwrap();
-    let config_response = context.app.clone().oneshot(config_request).await.unwrap();
-    assert_eq!(config_response.status(), StatusCode::OK);
-    let bytes = config_response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
-    let result: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result["orphaned_blobs"], 0);
-    assert_eq!(result["reclaimed_blobs"], 0);
+    assert_eq!(remains.status, StatusCode::NOT_FOUND);
 }

@@ -322,7 +322,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 仓库内目录浏览（本批次不实现）。 */
+        /** 仓库内目录浏览。 */
         get: operations["files"];
         put?: never;
         post?: never;
@@ -339,7 +339,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 仓库内路径搜索（本批次不实现）。 */
+        /** 仓库内路径搜索。 */
         get: operations["search"];
         put?: never;
         post?: never;
@@ -470,6 +470,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/repository/{name}/": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取仓库根目录。 */
+        get: operations["repository_root_get"];
+        /** 仓库根目录不支持写入。 */
+        put: operations["repository_root_put"];
+        post?: never;
+        /** 仓库根目录不支持删除。 */
+        delete: operations["repository_root_delete"];
+        options?: never;
+        /** 仓库根目录不支持 HEAD。 */
+        head: operations["repository_root_head"];
+        patch?: never;
+        trace?: never;
+    };
     "/repository/{name}/{path}": {
         parameters: {
             query?: never;
@@ -571,14 +591,33 @@ export interface components {
         DeleteRepoResponse: {
             /**
              * Format: int64
-             * @description 因删除失去引用的 blob 数；本批次恒为零。
+             * @description config 模式删除后失去全部引用、保留待 GC 的 blob 数。
              */
             orphaned_blobs: number;
             /**
              * Format: int64
-             * @description 被物理回收的 blob 数；本批次恒为零。
+             * @description data 模式已物理回收的 blob 数。
              */
             reclaimed_blobs: number;
+        };
+        /** @description Raw 目录条目。 */
+        DirectoryItem: {
+            is_directory: boolean;
+            name: string;
+            path: string;
+            /** Format: int64 */
+            size?: number | null;
+            updated_at: string;
+        };
+        /** @description Raw 目录分页响应。 */
+        DirectoryResponse: {
+            items: components["schemas"]["DirectoryItem"][];
+            /** Format: int32 */
+            page: number;
+            /** Format: int32 */
+            page_size: number;
+            /** Format: int64 */
+            total: number;
         };
         /** @description 发现到的源仓库。 */
         DiscoveredRepo: {
@@ -804,7 +843,7 @@ export interface components {
             name: string;
             /**
              * Format: int64
-             * @description 制品数；本批次尚无制品索引，恒为零。
+             * @description 当前制品索引数。
              */
             object_count: number;
             overwrite_policy?: null | components["schemas"]["OverwritePolicy"];
@@ -812,7 +851,7 @@ export interface components {
             repo_type: components["schemas"]["RepoType"];
             /**
              * Format: int64
-             * @description 总大小；本批次尚无制品索引，恒为零。
+             * @description 当前制品总字节数。
              */
             total_bytes: number;
             /** @description proxy 上游凭据引用名。 */
@@ -1796,8 +1835,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 数据物理删除尚未实现 */
-            501: {
+            /** @description 索引删除或 blob 回收失败 */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2018,8 +2057,8 @@ export interface operations {
                     "application/json": components["schemas"]["FileListResponse"];
                 };
             };
-            /** @description 仓库或路径不存在 */
-            404: {
+            /** @description 路径或分页参数无效 */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2027,8 +2066,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 仓库浏览尚未实现 */
-            501: {
+            /** @description 仓库、目录不存在或无权读取 */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2066,8 +2105,8 @@ export interface operations {
                     "application/json": components["schemas"]["FileListResponse"];
                 };
             };
-            /** @description 仓库不存在 */
-            404: {
+            /** @description 搜索或分页参数无效 */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2075,8 +2114,8 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 仓库搜索尚未实现 */
-            501: {
+            /** @description 仓库不存在或无权读取 */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2401,9 +2440,192 @@ export interface operations {
             };
         };
     };
-    repository_get: {
+    repository_root_get: {
+        parameters: {
+            query?: {
+                /** @description 目录页码，从 1 起 */
+                page?: number;
+                /** @description 目录每页条数，最大 200 */
+                page_size?: number;
+            };
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 根目录分页 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryResponse"];
+                };
+            };
+            /** @description 仓库不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_root_put: {
         parameters: {
             query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 根目录不可写入 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 无写入权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_root_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 根目录不可删除 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 无写入权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_root_head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 根目录不可探测 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_get: {
+        parameters: {
+            query?: {
+                /** @description 目录页码，从 1 起 */
+                page?: number;
+                /** @description 目录每页条数，最大 200 */
+                page_size?: number;
+            };
             header?: never;
             path: {
                 /** @description 仓库名 */
@@ -2415,8 +2637,53 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 格式协议读取待对应域实现 */
-            501: {
+            /** @description 文件流或目录分页 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryResponse"];
+                };
+            };
+            /** @description 路径或查询参数无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库、制品不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 代理上游失败 */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 代理上游超时 */
+            504: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2438,10 +2705,82 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/octet-stream": number[];
+            };
+        };
         responses: {
-            /** @description 格式协议写入待对应域实现 */
-            501: {
+            /** @description 覆盖成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 新建成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 路径或请求头无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 已有读取权限但无写入权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库类型只读 */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 覆盖策略拒绝 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 制品超过大小上限 */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2465,8 +2804,51 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 格式协议删除待对应域实现 */
-            501: {
+            /** @description 删除成功 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 路径无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 已有读取权限但无写入权限 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库、制品不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库类型只读 */
+            405: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2490,8 +2872,51 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 格式协议探测待对应域实现 */
-            501: {
+            /** @description 文件元数据，响应体为空 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 路径无效 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 凭据无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 仓库、制品不存在或无权读取 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 代理上游失败 */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 代理上游超时 */
+            504: {
                 headers: {
                     [name: string]: unknown;
                 };

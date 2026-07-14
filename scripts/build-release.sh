@@ -38,16 +38,17 @@ if ! readelf -h "$bin_path" | grep -q "X86-64"; then
     exit 1
 fi
 
-echo "==> [5/5] 打包"
+echo "==> [5/5] 打包二进制、systemd unit、VERSION 与第三方许可证 notice"
 pkg_name="jianartifact-${version_file}-${TARGET_TRIPLE}"
 stage_dir="$(mktemp -d)"
 mkdir -p "${stage_dir}/${pkg_name}/bin" "${stage_dir}/${pkg_name}/systemd"
 cp "$bin_path" "${stage_dir}/${pkg_name}/bin/jianartifact"
 cp scripts/deploy/jianartifact.service "${stage_dir}/${pkg_name}/systemd/jianartifact.service"
 cp VERSION "${stage_dir}/${pkg_name}/VERSION"
+cp THIRD_PARTY_NOTICES "${stage_dir}/${pkg_name}/THIRD_PARTY_NOTICES"
 mkdir -p dist
 tar -czf "dist/${pkg_name}.tar.gz" -C "$stage_dir" "$pkg_name"
 (cd dist && sha256sum "${pkg_name}.tar.gz" > "${pkg_name}.tar.gz.sha256")
 rm -rf "$stage_dir"
 
-echo "发布构建完成：dist/${pkg_name}.tar.gz（含 sha256 伴随文件）"
+echo "发布构建完成：dist/${pkg_name}.tar.gz（含 THIRD_PARTY_NOTICES 与 sha256 伴随文件）"

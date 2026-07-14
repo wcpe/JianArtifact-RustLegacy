@@ -2,7 +2,7 @@
 
 > 系统当前真貌（HOW）。始终原地更新到现状；结构 / 机制变了就改它。
 >
-> 当前状态：阶段 3 已完成认证与用户域真连、仓库可见性/ACL/配置生命周期真实后端与就绪探针硬化；格式协议、制品索引/blob 存储、浏览与迁移仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
+> 当前状态：阶段 3 已完成认证与用户、仓库权限/配置生命周期、BlobStore 与制品索引、Raw hosted/proxy、仓库浏览搜索及就绪探针真实后端；Maven、npm、group、使用片段与迁移仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
 
 ## 1. 定位与边界
 
@@ -10,9 +10,9 @@ JianArtifact 是一个以低运维成本为目标的自托管制品仓库，统�
 
 第一期目标运行形态（阶段 3 当前已落地 Rust 管理 API、SQLite 认证与仓库配置元数据、就绪探针及独立前端构建）：
 
-- **一个 Rust 服务进程**：当前承载认证、用户、仓库配置/ACL 管理 API 与健康探针；格式协议、blob 存储与迁移随对应业务域接入同一进程。
-- **一个 SQLite 元数据库**：当前已作为认证、用户、仓库配置、ACL 与 group 成员关系的唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
-- **一个本地文件系统 blob 数据目录**：当前由 `/readyz` 验证挂载可写，制品内容本体与内容寻址布局随存储域落地。
+- **一个 Rust 服务进程**：当前承载认证、用户、仓库配置/ACL、制品索引与浏览管理 API、Raw hosted/proxy 协议及健康探针；其他格式与迁移随对应业务域接入同一进程。
+- **一个 SQLite 元数据库**：当前已作为认证、用户、仓库配置、ACL、group 成员关系与制品索引的唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
+- **一个本地文件系统 blob 数据目录**：当前按 SHA-256 内容寻址落盘，并由 `/readyz` 验证挂载可写；SQLite 索引是引用关系唯一真源。
 - **前端最终内嵌交付**：当前 React 管理端独立构建，尚未接入 Rust 静态资源路由；后续以编译期内嵌方式收敛为单二进制交付。
 - **TLS 在反向代理终止**：服务本身只监听明文 HTTP，可置于任意反向代理之后。
 
@@ -36,7 +36,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ### 2.2 `apps/server` 内部分层
 
-当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`repository`、`state`；认证与仓库域均遵循 `api → domain/repository → persistence` 单向依赖。`api::formats` 目前只承载 `/repository/{name}/{path}` 的 OpenAPI 与 501 路由占位，真实协议逻辑仍须落入独立 `protocol` 模块。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
+当前 Rust crate 已落地 `api`、`protocol`、`auth`、`artifact`、`repository`、`domain`、`persistence`、`storage` 等模块。`api::formats` 只承担 axum 提取与 utoipa 契约，Raw 行为位于 `protocol::raw`，并经 `artifact` / `repository` 服务访问基础设施；协议层不直连数据库。以下分层继续供 Maven、npm 与 group 复用，不因格式扩展拆成微型 crate：
 
 ```text
         ┌───────────────┐      ┌───────────────┐
@@ -47,7 +47,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
                 │                      │
                 ▼                      ▼
    ┌─────────────────────────────────────────────┐
-   │   auth  │  repository  │  domain  │migration│   领域服务层
+   │ auth │ artifact │ repository │ domain │migration│ 领域服务层
    └───────────────────┬─────────────────────────┘
                        │
             ┌──────────┴──────────┐
@@ -65,14 +65,15 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | `api` | 管理 API 路由与 handler（axum），鉴权提取、请求校验、统一错误映射；utoipa 注解在此生成 OpenAPI |
 | `protocol` | Raw、Maven、npm 格式协议适配：路径解析、协议元数据生成、checksum sidecar、packument 合并等；**严禁直接读写数据库，必须经领域服务与仓储接口** |
 | `auth` | 认证与授权：Argon2 口令校验、JWT 会话签发与撤销校验、API Token、授权判定 |
-| `repository` | 仓库领域服务：仓库 CRUD、hosted/proxy/group 行为、group 成员聚合、ACL 应用 |
+| `artifact` | 共享制品服务：索引原子提交、带租约读取、引用安全回收、proxy 单飞与长生命周期上游客户端 |
+| `repository` | 仓库领域服务：仓库 CRUD、配置失效、浏览搜索、group 成员关系与 ACL 应用 |
 | `domain` | 核心领域类型与纯逻辑：仓库/制品/用户模型、路径规范化、覆盖策略、状态机 |
 | `migration` | Nexus 迁移：在线/离线发现、计划、执行、断点续传、报告 |
 | `persistence` | SQLite 访问层：仓储接口实现、事务、迁移脚本 |
-| `storage` | blob 存储：内容寻址落盘、临时文件、提交守卫 |
+| `storage` | blob 存储：内容寻址落盘、临时文件、提交守卫、读写租约、删除许可与启动恢复 |
 | `config` | 启动配置装载与校验，只读提供给各层 |
 
-入口层（`api`、`protocol`）只调用领域服务层（`auth`、`repository`、`domain`、`migration`）；领域服务层通过仓储接口使用 `persistence` 与 `storage`；禁止任何反向依赖与循环依赖。
+入口层（`api`、`protocol`）只调用领域服务层（`auth`、`artifact`、`repository`、`domain`、`migration`）；领域服务层使用 `persistence` 与 `storage`，协议层不得直接访问 SQL；禁止任何反向依赖与循环依赖。
 
 ## 3. 数据模型
 
@@ -86,7 +87,8 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | 仓库 | 格式（raw/maven2/npm）、类型（hosted/proxy/group）、可见性（public/private）、状态、proxy 上游配置与凭据引用状态 |
 | group 成员 | group 仓库到成员仓库的有序关系 |
 | 仓库 ACL | 用户 × 仓库 × 动作（read/write/admin） |
-| 制品索引 | 仓库内路径/坐标到 blob sha256 的索引、大小、校验和、时间戳 |
+| 制品索引 | `repo_id + path` 唯一映射到 SHA-256 内容，记录 SHA-1/MD5/SHA-512、大小、正缓存标记与创建/更新时间；blob 引用数按 SHA-256 聚合，不另设计数表 |
+| blob 回收意图 | 以 SHA-256 为主键持久化待回收内容及正整数 `generation`；代次隔离同摘要的新旧任务，陈旧任务不得误删文件或清除新意图 |
 | 迁移任务 | 任务标识、不可变参数快照、状态机状态、节流进度、幂等信息 |
 | 迁移分仓明细 | 每仓库的对象/字节计数、校验结果、凭据引用状态、有界失败样本 |
 
@@ -94,22 +96,24 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 沿用已验证的设计：
 
-- **内容寻址**：blob 按 sha256 内容寻址，取哈希前两位分桶存储（如 `ab/cdef...`）；数据库只存索引与校验和，不存内容本体。相同内容天然去重。
-- **写入提交顺序不变量**（所有写入路径一律遵守，禁止跳过或调换）：
-  1. 流式写入临时文件，边写边计算摘要（全链路流式，缓冲上限固定）；
-  2. 校验摘要与预期（如客户端声明的 checksum）；
-  3. 将临时文件落定到内容寻址正式路径（原子重命名）；
-  4. 写入元数据索引；
-  5. 索引提交失败时回滚无引用 blob。
-- **提交守卫**：写入流程由提交守卫对象包裹，含 Drop 兜底与取消安全语义——请求中断、任务取消或进程异常终止都不得留下可见的孤儿索引或孤儿 blob；临时文件可识别、可回收且不会被正常读取路径命中。
-- **所有权明确**：同一 blob 的写入、索引提交与清理有明确所有权，禁止竞争删除仍被其他制品引用的内容。
+- **内容寻址**：blob 按 SHA-256 内容寻址，取哈希前两位分桶存储（如 `ab/cdef...`）；数据库只存索引与校验和，不存内容本体。相同内容天然去重。
+- **写入提交顺序不变量**（hosted 上传与 proxy 回源共用）：
+  1. 随机排他创建 `.part`，流式写入并同步计算 SHA-256/SHA-1/SHA-512/MD5 与实际大小；
+  2. 执行大小、磁盘阈值与路径校验；
+  3. 先持久化提交守卫，再以同文件系统硬链接原子发布内容寻址正式路径；已存在同摘要时复用正式 blob；
+  4. 在 SQLite 短事务内提交或覆盖制品索引；
+  5. 索引成功后移除守卫；索引失败时取得删除许可、重新核对全局引用并立即清理，无引用清理失败则由启动恢复兜底。
+- **提交守卫与启动恢复**：请求中断时 `.part` 由 Drop 清理；正式 blob 已发布但索引尚未提交时保留守卫。启动会删除残留 `.part`，并只删除“有守卫且无数据库引用”的正式 blob，保证 SQLite 始终是引用真源。
+- **租约与删除许可**：读取、落定与回收按 SHA-256 协调。活跃租约阻止物理删除；删除请求建立后阻止新租约并等待旧租约释放，取得许可后再次批量核对引用。多摘要回收按稳定顺序获取许可，避免交叉回收死锁；空闲协调状态即时释放，避免按对象数增长。
+- **持久化回收意图**：索引覆盖、单文件删除、proxy URL 缓存失效与仓库 `mode=data` 删除都在删除/替换索引的同一 SQLite 事务内登记回收意图；`mode=config` 在删除配置与索引前同事务取消相关意图，明确保留 orphan blob。每次重复登记递增 `generation`，回收器只按匹配代次核对引用和完成意图，陈旧任务不得误删或误清新任务。
+- **取消安全与恢复顺序**：事务提交后即使请求在等待租约、删除文件或清理意图时被取消，意图仍保留在数据库。启动先收口 `.part` 与提交守卫，再在开放路由前处理全部持久化回收意图；文件已删除但意图未清时按不存在幂等完成，普通无守卫且无回收意图的 orphan blob 保持不动。
 
 ## 5. 接口
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期与 ACL 已真实现，仓库内浏览/搜索/使用片段及迁移目前仍为契约骨架。仓库列表在 SQL 中按 read 权限过滤，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
-- **格式协议端点**：通用 GET/HEAD/PUT/DELETE 路径已进入同一 utoipa OpenAPI 并挂载 501 占位；后续按域实现 Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，并接入已具备 Basic 与 Bearer/API Token 能力的统一鉴权提取器。真实协议实现必须从 `api::formats` 占位迁移到 `protocol` 层，不得在 API handler 内堆业务逻辑。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期、ACL、制品统计、目录浏览与路径搜索已真实现，使用片段及迁移仍为契约骨架。仓库列表在 SQL 中按 read 权限过滤并聚合制品数/总大小，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
+- **格式协议端点**：Raw hosted/proxy 已由 `protocol::raw` 实现 GET/HEAD/PUT/DELETE 与 JSON 目录索引，`api::formats` 只负责提取请求和 OpenAPI。Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）与 group 后续按域接入同一 `ArtifactService`，协议层始终不得直连数据库。
 - **健康检查**：`/healthz` 只报告进程存活；`/readyz` 以临时事务写入并回滚探测 SQLite，以随机且排他创建的临时文件探测 blob 目录，运行期挂载丢失时不自愈重建，响应不泄露路径、凭据或内部拓扑。
 
 ## 6. 关键机制
@@ -125,7 +129,11 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ### 6.2 proxy 缓存与单飞
 
-同一 proxy 仓库、同一路径的并发缓存未命中必须**单飞合并**：只发起一次有效上游拉取，其余请求等待并共享结果；回源内容流式落盘并走第 4 节提交流程。上游错误分类（不存在、超时、4xx/5xx、断流）与负缓存策略由 `repository` 层统一处理。
+同一 proxy 仓库、同一路径、同一规范化 `upstream_url` 配置快照的并发缓存未命中由 `ArtifactService` 进程内注册表**单飞合并**：URL 更新前后的请求进入独立 flight，不互相等待；锁内只登记任务，网络、磁盘和数据库 IO 全在锁外。领导任务脱离首个客户端生命周期执行，等待者共享同一成功或错误结果；领导者取得资格后再次检查本地索引，消除“先 miss、后登记”的竞态。
+
+正缓存提交携带预期 `upstream_url`，并在同一 SQLite 事务内通过条件写入核对仓库仍存在、类型仍为 proxy 且 URL 与快照一致。若配置更新先提交，旧回源的缓存提交被拒绝且不会生成索引；协议层随后重新读取仓库与授权状态，按新配置最多透明重试一次，重试前仍先查本地缓存。若第二次提交期间配置再次变化，则返回稳定 503，避免无限循环。
+
+Raw proxy 使用进程内长生命周期 reqwest/rustls 客户端，连接超时 10 秒、首响应 30 秒、分块空闲 60 秒，禁止重定向与客户端自动重试；上述一次重试只针对本地仓库配置竞态，不重试上游传输。上游凭据只持久化环境变量引用，运行时仅接受完整 Basic/Bearer Authorization 并只注入该头。2xx 内容完整流式落盘并提交正缓存后才从本地 blob 响应；不实现负缓存。404、连接/超时、3xx、其他 4xx、5xx 与断流映射为稳定类别，失败不产生索引。`upstream_url` 变化、正缓存索引删除与回收意图登记在同一 SQLite 事务内完成；只改凭据引用不失效缓存。
 
 ### 6.3 迁移状态机与持久化
 

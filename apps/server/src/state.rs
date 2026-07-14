@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
+use crate::artifact::ArtifactService;
 use crate::config::Config;
+use crate::storage::BlobStore;
 
 /// axum 各 handler 共享的应用状态（克隆为廉价的引用计数）。
 #[derive(Clone)]
@@ -15,4 +17,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// 认证运行时（JWT 密钥、会话时长、Basic 口令缓存）。
     pub auth: Arc<crate::auth::AuthRuntime>,
+    /// 内容寻址 blob 存储。
+    pub blob_store: Arc<BlobStore>,
+    /// 共享制品索引与回收服务。
+    pub artifacts: Arc<ArtifactService>,
 }

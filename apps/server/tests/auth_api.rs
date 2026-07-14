@@ -18,6 +18,7 @@ use jianartifact_server::config::Config;
 use jianartifact_server::domain::{Role, create_user};
 use jianartifact_server::persistence;
 use jianartifact_server::state::AppState;
+use jianartifact_server::storage::BlobStore;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -49,15 +50,30 @@ async fn setup_details() -> (Router, TempDir, SqlitePool, Arc<AuthRuntime>, i64,
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: SESSION_TTL_HOURS,
+        max_artifact_bytes: 5 * 1024 * 1024 * 1024,
+        min_free_bytes: 5 * 1024 * 1024 * 1024,
+        min_free_percent: 5,
     };
     let auth = Arc::new(AuthRuntime::new(
         &config.jwt_secret,
         config.session_ttl_hours,
     ));
+    let blob_store = Arc::new(BlobStore::new(
+        config.data_dir.clone(),
+        config.max_artifact_bytes,
+        config.min_free_bytes,
+        config.min_free_percent,
+    ));
+    let artifacts = Arc::new(jianartifact_server::artifact::ArtifactService::new(
+        pool.clone(),
+        blob_store.as_ref().clone(),
+    ));
     let state = AppState {
         pool: pool.clone(),
         config: Arc::new(config),
         auth: auth.clone(),
+        blob_store,
+        artifacts,
     };
     (router(state), dir, pool, auth, admin.id, alice.id)
 }

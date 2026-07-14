@@ -21,7 +21,7 @@ workspace = true
 [dependencies]
 # Web 框架与异步运行时
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "sync", "time"] }
 tower-http = { version = "0.6", features = ["trace", "request-id"] }
 # 序列化与请求/响应模型
 serde = { version = "1", features = ["derive"] }
@@ -43,11 +43,20 @@ argon2 = "0.5"
 jsonwebtoken = "9"
 # 安全随机数：API Token 明文与 Argon2 盐
 rand = "0.8"
-# SHA-256：会话撤销与 API Token 的域分隔哈希
+# SHA-256：会话撤销、API Token 与 blob 摘要
 sha2 = "0.10"
+# 制品摘要与内容类型识别
+sha1 = "0.10"
+md-5 = "0.10"
+mime_guess = "2"
+# blob 增量 IO、磁盘阈值与生产响应体工具
+tokio-util = { version = "0.7", features = ["io"] }
+fs4 = "1.1"
+http-body-util = "0.1"
+# proxy 上游客户端：rustls、响应流与禁重定向策略
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 [dev-dependencies]
 # 集成测试：驱动 Router 处理请求、读取响应体、临时数据目录
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 tempfile = "3"

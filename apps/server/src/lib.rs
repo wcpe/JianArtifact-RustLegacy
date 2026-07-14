@@ -2,6 +2,7 @@
 //! 分层依赖单向：api（入口层）→ 领域服务层 → persistence/storage（基础设施层），config 只读引用。
 
 pub mod api;
+pub mod artifact;
 pub mod auth;
 pub mod config;
 pub mod domain;
@@ -9,8 +10,10 @@ pub mod error;
 pub mod health;
 pub mod logging;
 pub mod persistence;
+pub mod protocol;
 pub mod repository;
 pub mod state;
+pub mod storage;
 
 use axum::Router;
 
@@ -43,8 +46,27 @@ pub(crate) async fn build_app_with_bootstrap(
             "缺少 JWT 会话密钥，请经 JIANARTIFACT_JWT_SECRET 环境变量提供".to_string(),
         ));
     }
-    tokio::fs::create_dir_all(&config.data_dir).await?;
+    let blob_store = std::sync::Arc::new(storage::BlobStore::new(
+        config.data_dir.clone(),
+        config.max_artifact_bytes,
+        config.min_free_bytes,
+        config.min_free_percent,
+    ));
+    blob_store.initialize().await?;
     let pool = persistence::init(&config.database_url(), &config.database_path).await?;
+    let referenced = persistence::referenced_blob_hashes(&pool).await?;
+    let recovered = blob_store.recover(&referenced).await?;
+    tracing::info!(
+        removed_parts = recovered.removed_parts,
+        removed_guards = recovered.removed_guards,
+        removed_blobs = recovered.removed_blobs,
+        "已完成 blob 启动恢复"
+    );
+    let artifacts = std::sync::Arc::new(artifact::ArtifactService::new(
+        pool.clone(),
+        blob_store.as_ref().clone(),
+    ));
+    recover_blob_reclamations(&artifacts).await?;
     // 元数据库就绪后执行管理员自举（空库且提供自举变量时创建首个 admin）
     domain::bootstrap_admin_with(&pool, username, password).await?;
     let auth = std::sync::Arc::new(crate::auth::AuthRuntime::new(
@@ -55,8 +77,25 @@ pub(crate) async fn build_app_with_bootstrap(
         pool,
         config: std::sync::Arc::new(config),
         auth,
+        blob_store,
+        artifacts,
     };
     Ok(api::router(state))
+}
+
+async fn recover_blob_reclamations(
+    artifacts: &artifact::ArtifactService,
+) -> Result<(), StartupError> {
+    match artifacts.recover_reclamations().await {
+        Ok(reclaimed) => {
+            tracing::info!(reclaimed_blobs = reclaimed, "已完成持久化 blob 回收恢复");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(code = error.code(), "启动恢复持久化 blob 回收意图失败");
+            Err(StartupError::BlobReclamationRecovery)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +121,9 @@ mod tests {
             log_level: "warn".to_string(),
             jwt_secret: JWT_SECRET.to_string(),
             session_ttl_hours: 8,
+            max_artifact_bytes: 5 * 1024 * 1024 * 1024,
+            min_free_bytes: 5 * 1024 * 1024 * 1024,
+            min_free_percent: 5,
         }
     }
 
@@ -177,5 +219,64 @@ mod tests {
 
         let (status, _) = 发送请求(&app, request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn 启动编排依据数据库引用执行守卫恢复() {
+        let 目录 = tempfile::tempdir().unwrap();
+        let config = 测试配置(&目录);
+        let pool = persistence::init(&config.database_url(), &config.database_path)
+            .await
+            .unwrap();
+        let repo: (i64,) = sqlx::query_as("INSERT INTO repositories (name, format, repo_type, visibility, overwrite_policy) VALUES ('recover', 'raw', 'hosted', 'private', 'allow') RETURNING id").fetch_one(&pool).await.unwrap();
+        let referenced = "a".repeat(64);
+        sqlx::query("INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size) VALUES (?, 'a', ?, ?, ?, ?, 1)").bind(repo.0).bind(&referenced).bind("b".repeat(40)).bind("c".repeat(32)).bind("d".repeat(128)).execute(&pool).await.unwrap();
+        let reclaimable = "f".repeat(64);
+        sqlx::query("INSERT INTO blob_reclamations (sha256, generation) VALUES (?, 1)")
+            .bind(&reclaimable)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let store = storage::BlobStore::new(config.data_dir.clone(), 1024, 0, 0);
+        store.initialize().await.unwrap();
+        let abandoned = "e".repeat(64);
+        let unguarded = "1".repeat(64);
+        for hash in [&referenced, &abandoned, &reclaimable, &unguarded] {
+            let path = store.blob_path(hash).unwrap();
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, b"x").await.unwrap();
+        }
+        let part_path = config.data_dir.join(".tmp/left.part");
+        tokio::fs::write(&part_path, b"x").await.unwrap();
+        tokio::fs::write(config.data_dir.join(".tmp/guards/ref.guard"), &referenced)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            config.data_dir.join(".tmp/guards/abandoned.guard"),
+            &abandoned,
+        )
+        .await
+        .unwrap();
+
+        let _app = build_app_with_bootstrap(config.clone(), None, None)
+            .await
+            .unwrap();
+        assert!(store.blob_path(&referenced).unwrap().exists());
+        assert!(!store.blob_path(&abandoned).unwrap().exists());
+        assert!(!store.blob_path(&reclaimable).unwrap().exists());
+        assert!(store.blob_path(&unguarded).unwrap().exists());
+        assert!(!part_path.exists());
+        let pool = persistence::init(&config.database_url(), &config.database_path)
+            .await
+            .unwrap();
+        let pending: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM blob_reclamations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending.0, 0);
     }
 }

@@ -1,5 +1,5 @@
-//! 仓库核心管理 API：元数据生命周期、可见性、ACL 与 group 成员关系。
-//! 文件浏览、搜索、使用片段与格式协议仍保持 501，占位能力不在本批次实现。
+//! 仓库核心管理 API：元数据生命周期、可见性、ACL、制品浏览与路径搜索。
+//! 使用片段仍保持契约占位，格式协议由 protocol 分域实现。
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -9,11 +9,13 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::PageQuery;
-use crate::api::extractor::{OptionalAuth, RequireAdmin};
-use crate::auth::AuthIdentity;
-use crate::domain::repository::{AclRecord, Repository, Subject};
+use crate::api::extractor::{
+    OptionalAuth, RequireAdmin, subject_from_identity, subject_from_optional,
+};
+use crate::api::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageQuery};
+use crate::domain::repository::{AclRecord, Repository};
 use crate::error::ApiError;
+use crate::persistence::{ArtifactDirectoryEntry, ArtifactRecord};
 use crate::repository::{self, CreateRepository, DeleteMode as ServiceDeleteMode, RepositoryPatch};
 use crate::state::AppState;
 
@@ -63,9 +65,9 @@ pub struct RepoInfo {
     pub upstream_credential_ref: Option<String>,
     /// group 有序成员。
     pub members: Option<Vec<String>>,
-    /// 制品数；本批次尚无制品索引，恒为零。
+    /// 当前制品索引数。
     pub object_count: i64,
-    /// 总大小；本批次尚无制品索引，恒为零。
+    /// 当前制品总字节数。
     pub total_bytes: i64,
     /// 创建时间。
     pub created_at: String,
@@ -203,9 +205,9 @@ pub struct RepoListResponse {
 #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum DeleteMode {
-    /// 仅删除配置；本批次计数固定为零。
+    /// 删除配置与制品索引，保留无引用 blob。
     Config,
-    /// 数据物理删除尚未实现，稳定返回 501。
+    /// 删除配置与制品索引，并回收无其他引用的 blob。
     Data,
 }
 
@@ -217,9 +219,9 @@ pub struct DeleteQuery {
 /// 删除结果。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteRepoResponse {
-    /// 因删除失去引用的 blob 数；本批次恒为零。
+    /// config 模式删除后失去全部引用、保留待 GC 的 blob 数。
     pub orphaned_blobs: i64,
-    /// 被物理回收的 blob 数；本批次恒为零。
+    /// data 模式已物理回收的 blob 数。
     pub reclaimed_blobs: i64,
 }
 
@@ -289,6 +291,29 @@ pub struct FileListResponse {
     pub total: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FilesQuery {
+    path: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchQuery {
+    q: String,
+    page: Option<u32>,
+    page_size: Option<u32>,
+}
+
+fn resolve_artifact_page(page: Option<u32>, page_size: Option<u32>) -> (u32, u32) {
+    (
+        page.unwrap_or(1).max(1),
+        page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE),
+    )
+}
+
 /// 使用方式片段。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UsageSnippet {
@@ -298,27 +323,59 @@ pub struct UsageSnippet {
     pub content: String,
 }
 
-fn subject_from_optional(auth: OptionalAuth) -> Subject {
-    match auth.0 {
-        Some(identity) => subject_from_identity(identity),
-        None => Subject::Anonymous,
-    }
-}
-
-fn subject_from_identity(identity: AuthIdentity) -> Subject {
-    Subject::Authenticated {
-        user_id: identity.user_id,
-        role: identity.role,
-        enabled: true,
-    }
-}
-
 fn invalid_json(_: JsonRejection) -> ApiError {
     ApiError::bad_request("REPO_INVALID_CONFIG", "仓库请求字段或 JSON 格式无效")
 }
 
 fn invalid_query(_: QueryRejection) -> ApiError {
     ApiError::bad_request("REPO_INVALID_QUERY", "仓库查询参数无效")
+}
+
+fn directory_file_entry(entry: ArtifactDirectoryEntry) -> Result<FileEntry, ApiError> {
+    let content_type = (!entry.is_directory).then(|| artifact_content_type(&entry.path));
+    Ok(FileEntry {
+        name: entry.name,
+        path: entry.path,
+        is_dir: entry.is_directory,
+        size: entry.size.map(artifact_size).transpose()?,
+        sha256: entry.sha256,
+        sha1: entry.sha1,
+        md5: entry.md5,
+        sha512: entry.sha512,
+        content_type,
+        updated_at: Some(entry.updated_at),
+    })
+}
+
+fn search_file_entry(record: ArtifactRecord) -> Result<FileEntry, ApiError> {
+    let name = record
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(record.path.as_str())
+        .to_string();
+    Ok(FileEntry {
+        name,
+        content_type: Some(artifact_content_type(&record.path)),
+        path: record.path,
+        is_dir: false,
+        size: Some(artifact_size(record.size)?),
+        sha256: Some(record.sha256),
+        sha1: Some(record.sha1),
+        md5: Some(record.md5),
+        sha512: Some(record.sha512),
+        updated_at: Some(record.updated_at),
+    })
+}
+
+fn artifact_size(size: u64) -> Result<i64, ApiError> {
+    i64::try_from(size).map_err(|_| ApiError::internal("制品大小超出接口范围"))
+}
+
+fn artifact_content_type(path: &str) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
 }
 
 /// 仓库列表（按权限过滤，分页）。
@@ -428,6 +485,7 @@ pub async fn update(
     let Json(request) = body.map_err(invalid_json)?;
     let repository = repository::update_repository(
         &state.pool,
+        &state.artifacts,
         subject_from_optional(auth),
         &name,
         request.into(),
@@ -452,7 +510,7 @@ pub async fn update(
         (status = 403, description = "已有读取权限但无仓库管理权限", body = crate::error::ErrorBody),
         (status = 404, description = "仓库不存在或无权访问", body = crate::error::ErrorBody),
         (status = 409, description = "仓库仍被 group 引用", body = crate::error::ErrorBody),
-        (status = 501, description = "数据物理删除尚未实现", body = crate::error::ErrorBody),
+        (status = 500, description = "索引删除或 blob 回收失败", body = crate::error::ErrorBody),
     ),
 )]
 pub async fn delete(
@@ -472,6 +530,7 @@ pub async fn delete(
         .and_then(|value| value.to_str().ok());
     let result = repository::delete_repository(
         &state.pool,
+        &state.artifacts,
         subject_from_optional(auth),
         &name,
         mode,
@@ -563,7 +622,7 @@ pub async fn acl_remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 仓库内目录浏览（本批次不实现）。
+/// 仓库内目录浏览。
 #[utoipa::path(
     get,
     path = "/api/v1/repos/{name}/files",
@@ -576,15 +635,41 @@ pub async fn acl_remove(
     ),
     responses(
         (status = 200, description = "目录条目分页", body = FileListResponse),
-        (status = 404, description = "仓库或路径不存在", body = crate::error::ErrorBody),
-        (status = 501, description = "仓库浏览尚未实现", body = crate::error::ErrorBody),
+        (status = 400, description = "路径或分页参数无效", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库、目录不存在或无权读取", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn files() -> ApiError {
-    ApiError::not_implemented("仓库浏览接口不在本批次范围")
+pub async fn files(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    query: Result<Query<FilesQuery>, QueryRejection>,
+) -> Result<Json<FileListResponse>, ApiError> {
+    let Query(query) = query.map_err(invalid_query)?;
+    let (page, page_size) = resolve_artifact_page(query.page, query.page_size);
+    let (entries, total) = repository::browse_artifacts(
+        &state.pool,
+        &state.artifacts,
+        subject_from_optional(auth),
+        &name,
+        query.path.as_deref().unwrap_or_default(),
+        page,
+        page_size,
+    )
+    .await?;
+    let items = entries
+        .into_iter()
+        .map(directory_file_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(FileListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
-/// 仓库内路径搜索（本批次不实现）。
+/// 仓库内路径搜索。
 #[utoipa::path(
     get,
     path = "/api/v1/repos/{name}/search",
@@ -597,12 +682,38 @@ pub async fn files() -> ApiError {
     ),
     responses(
         (status = 200, description = "匹配条目分页", body = FileListResponse),
-        (status = 404, description = "仓库不存在", body = crate::error::ErrorBody),
-        (status = 501, description = "仓库搜索尚未实现", body = crate::error::ErrorBody),
+        (status = 400, description = "搜索或分页参数无效", body = crate::error::ErrorBody),
+        (status = 404, description = "仓库不存在或无权读取", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn search() -> ApiError {
-    ApiError::not_implemented("仓库搜索接口不在本批次范围")
+pub async fn search(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    query: Result<Query<SearchQuery>, QueryRejection>,
+) -> Result<Json<FileListResponse>, ApiError> {
+    let Query(query) = query.map_err(invalid_query)?;
+    let (page, page_size) = resolve_artifact_page(query.page, query.page_size);
+    let (records, total) = repository::search_artifacts(
+        &state.pool,
+        &state.artifacts,
+        subject_from_optional(auth),
+        &name,
+        &query.q,
+        page,
+        page_size,
+    )
+    .await?;
+    let items = records
+        .into_iter()
+        .map(search_file_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(FileListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
 /// 使用方式片段（本批次不实现）。

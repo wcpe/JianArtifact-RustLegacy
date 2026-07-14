@@ -15,7 +15,9 @@
 
 全部构建在 Docker 容器内执行，宿主机禁止直接运行 cargo / pnpm。
 
-发布构建入口：`make release`（执行 `scripts/build-release.sh` 于容器内）。流程：VERSION 与 Cargo workspace 版本一致性校验 → 前端构建（子工程未落地时跳过）→ `cargo build --release` → ELF x86_64 产物校验 → 打包 `dist/jianartifact-<版本>-x86_64-unknown-linux-gnu.tar.gz`（内含二进制、用户级 systemd unit 模板与 VERSION）及 `.sha256` 伴随文件。`make clean` 清空 `dist/`。
+发布构建入口：`make release`（执行 `scripts/build-release.sh` 于容器内）。流程：VERSION 与 Cargo workspace 版本一致性校验 → 前端构建（子工程未落地时跳过）→ `cargo build --release` → ELF x86_64 产物校验 → 打包 `dist/jianartifact-<版本>-x86_64-unknown-linux-gnu.tar.gz`（内含二进制、用户级 systemd unit 模板、VERSION 与根级 `THIRD_PARTY_NOTICES`）及 `.sha256` 伴随文件。`make clean` 清空 `dist/`。
+
+`THIRD_PARTY_NOTICES` 是发布包的许可证 notice 清单。新增、升级或移除需要 notice 的依赖，或调整 `deny.toml` 的包级许可证例外时，发布维护者必须同步核对并更新该文件；不得只放宽许可证门禁而遗漏随包分发的 notice。
 
 构建顺序硬约束：必须先产出前端 dist，再构建后端二进制（rust-embed 在编译期打包前端静态产物，顺序颠倒会得到缺失前端的二进制或构建失败）；该顺序已由 `scripts/build-release.sh` 固化。
 

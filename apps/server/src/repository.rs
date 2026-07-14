@@ -4,12 +4,17 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::SqlitePool;
 
+use crate::artifact::ArtifactService;
+use crate::domain::artifact::ArtifactDirectory;
 use crate::domain::repository::{
     AccessSurface, AclRecord, AuthorizationDecision, Format, OverwritePolicy, Permission, RepoType,
     Repository, Subject, VersionPolicy, Visibility, authorize,
 };
 use crate::error::ApiError;
-use crate::persistence::{self, NewRepositoryRow, RepositoryDeleteOutcome, RepositoryRowPatch};
+use crate::persistence::{
+    self, ArtifactDirectoryEntry, ArtifactRecord, NewRepositoryRow, RepositoryDeleteOutcome,
+    RepositoryRowPatch,
+};
 
 /// 创建仓库输入。
 #[derive(Debug)]
@@ -40,9 +45,9 @@ pub struct RepositoryPatch {
 /// 仓库删除模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteMode {
-    /// 仅删除仓库配置。本批次无制品索引，因此计数为零。
+    /// 删除仓库配置与制品索引，保留无引用 blob 等待后续 GC。
     Config,
-    /// 物理删除数据尚未实现，必须稳定返回 501。
+    /// 删除仓库配置与制品索引，并回收无其他引用的 blob。
     Data,
 }
 
@@ -102,9 +107,54 @@ pub async fn get_repository(
     authorized_repository(pool, subject, name, Permission::Read).await
 }
 
+/// 分页浏览仓库目录，仅返回直接子项。
+pub async fn browse_artifacts(
+    pool: &SqlitePool,
+    artifacts: &ArtifactService,
+    subject: Subject,
+    name: &str,
+    path: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<(Vec<ArtifactDirectoryEntry>, i64), ApiError> {
+    let repository = authorized_repository(pool, subject, name, Permission::Read).await?;
+    let directory = ArtifactDirectory::parse(path)
+        .map_err(|_| ApiError::bad_request("ARTIFACT_INVALID_PATH", "制品目录路径无效"))?;
+    let result = artifacts
+        .list_directory(repository.id, directory.as_str(), page, page_size)
+        .await?;
+    if !directory.as_str().is_empty() && result.1 == 0 {
+        return Err(ApiError::not_found("ARTIFACT_NOT_FOUND", "制品目录不存在"));
+    }
+    Ok(result)
+}
+
+/// 分页搜索仓库内制品路径。
+pub async fn search_artifacts(
+    pool: &SqlitePool,
+    artifacts: &ArtifactService,
+    subject: Subject,
+    name: &str,
+    query: &str,
+    page: u32,
+    page_size: u32,
+) -> Result<(Vec<ArtifactRecord>, i64), ApiError> {
+    let repository = authorized_repository(pool, subject, name, Permission::Read).await?;
+    if query.is_empty() {
+        return Err(ApiError::bad_request(
+            "ARTIFACT_INVALID_QUERY",
+            "制品搜索关键字不能为空",
+        ));
+    }
+    artifacts
+        .search(repository.id, query, page, page_size)
+        .await
+}
+
 /// 部分更新仓库字段，并原子替换 group 成员关系。
 pub async fn update_repository(
     pool: &SqlitePool,
+    artifacts: &ArtifactService,
     subject: Subject,
     name: &str,
     patch: RepositoryPatch,
@@ -132,14 +182,21 @@ pub async fn update_repository(
         upstream_url: patch.upstream_url,
         upstream_credential_ref: patch.upstream_credential_ref,
     };
-    persistence::update_repository_record(pool, repository.id, &row_patch, member_ids.as_deref())
-        .await?;
+    let reclamations = persistence::update_repository_record(
+        pool,
+        repository.id,
+        &row_patch,
+        member_ids.as_deref(),
+    )
+    .await?;
+    artifacts.reclaim_reclamations(&reclamations).await?;
     get_repository(pool, subject, name).await
 }
 
-/// 删除仓库配置；mode=data 在任何删除发生前稳定返回 501。
+/// 删除仓库配置与索引；data 模式同时回收无其他引用的 blob。
 pub async fn delete_repository(
     pool: &SqlitePool,
+    artifacts: &ArtifactService,
     subject: Subject,
     name: &str,
     mode: DeleteMode,
@@ -147,18 +204,38 @@ pub async fn delete_repository(
 ) -> Result<DeleteRepositoryResult, ApiError> {
     let repository = authorized_repository(pool, subject, name, Permission::Admin).await?;
     ensure_delete_confirmation(confirmation, name)?;
-    if mode == DeleteMode::Data {
-        return Err(ApiError::not_implemented("仓库数据删除模式尚未实现"));
-    }
-    match persistence::delete_repository_record(pool, repository.id).await? {
-        RepositoryDeleteOutcome::Deleted => Ok(DeleteRepositoryResult {
-            orphaned_blobs: 0,
+    let reclaim = mode == DeleteMode::Data;
+    let deleted = persistence::delete_repository_record(pool, repository.id, reclaim).await?;
+    let RepositoryDeleteOutcome::Deleted {
+        hashes,
+        reclamations,
+    } = deleted
+    else {
+        return Err(ApiError::conflict("REPO_IN_USE", "仓库仍被 group 引用"));
+    };
+    delete_repository_blobs(artifacts, mode, &hashes, &reclamations).await
+}
+
+async fn delete_repository_blobs(
+    artifacts: &ArtifactService,
+    mode: DeleteMode,
+    hashes: &[String],
+    reclamations: &[persistence::BlobReclamation],
+) -> Result<DeleteRepositoryResult, ApiError> {
+    match mode {
+        DeleteMode::Config => Ok(DeleteRepositoryResult {
+            orphaned_blobs: blob_count(artifacts.count_unreferenced_candidates(hashes).await?)?,
             reclaimed_blobs: 0,
         }),
-        RepositoryDeleteOutcome::InUse => {
-            Err(ApiError::conflict("REPO_IN_USE", "仓库仍被 group 引用"))
-        }
+        DeleteMode::Data => Ok(DeleteRepositoryResult {
+            orphaned_blobs: 0,
+            reclaimed_blobs: blob_count(artifacts.reclaim_reclamations(reclamations).await?)?,
+        }),
     }
+}
+
+fn blob_count(value: u64) -> Result<i64, ApiError> {
+    i64::try_from(value).map_err(|_| ApiError::internal("blob 统计超出支持范围"))
 }
 
 /// 列出仓库 ACL。
@@ -217,6 +294,26 @@ async fn authorized_repository(
     name: &str,
     action: Permission,
 ) -> Result<Repository, ApiError> {
+    authorized_repository_for(pool, subject, name, action, AccessSurface::Management).await
+}
+
+/// 在格式协议入口校验仓库权限；停用仓库与私有无权仓库统一隐藏。
+pub async fn protocol_repository(
+    pool: &SqlitePool,
+    subject: Subject,
+    name: &str,
+    action: Permission,
+) -> Result<Repository, ApiError> {
+    authorized_repository_for(pool, subject, name, action, AccessSurface::Protocol).await
+}
+
+async fn authorized_repository_for(
+    pool: &SqlitePool,
+    subject: Subject,
+    name: &str,
+    action: Permission,
+    surface: AccessSurface,
+) -> Result<Repository, ApiError> {
     ensure_subject_valid(subject)?;
     let (repository, granted) = persistence::find_repository_access(
         pool,
@@ -232,7 +329,7 @@ async fn authorized_repository(
         granted,
         action,
         repository.disabled,
-        AccessSurface::Management,
+        surface,
     );
     map_authorization(decision)?;
     Ok(repository)
@@ -449,16 +546,17 @@ fn validate_name(name: &str) -> Result<(), ApiError> {
 }
 
 fn validate_upstream_url(value: &str) -> Result<(), ApiError> {
-    if value.trim() != value || value.chars().any(char::is_control) {
+    if value.trim() != value || value.chars().any(char::is_control) || value.contains('#') {
         return Err(invalid_config("proxy 上游地址格式无效"));
     }
     let remainder = value
         .strip_prefix("http://")
         .or_else(|| value.strip_prefix("https://"))
         .ok_or_else(|| invalid_config("proxy 上游地址格式无效"))?;
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority_end = remainder.find(['/', '?']).unwrap_or(remainder.len());
     let authority = &remainder[..authority_end];
-    if authority.is_empty() || authority.chars().any(char::is_whitespace) {
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
         return Err(invalid_config("proxy 上游地址格式无效"));
     }
     Ok(())
@@ -530,15 +628,19 @@ fn validate_member(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use sqlx::SqlitePool;
+
     use super::{
         CreateRepository, DeleteMode, RepositoryPatch, create_repository, delete_repository,
-        get_repository, set_acl, update_repository,
+        get_repository, set_acl, update_repository, validate_upstream_url,
     };
+    use crate::artifact::ArtifactService;
     use crate::domain::repository::{
         Format, OverwritePolicy, Permission, RepoType, Subject, VersionPolicy, Visibility,
     };
     use crate::domain::{Role, create_user};
     use crate::persistence::test_pool;
+    use crate::storage::BlobStore;
 
     fn admin() -> Subject {
         Subject::Authenticated {
@@ -559,6 +661,29 @@ mod tests {
             upstream_url: None,
             upstream_credential_ref: None,
             members: None,
+        }
+    }
+
+    async fn artifact_service(pool: &SqlitePool, dir: &tempfile::TempDir) -> ArtifactService {
+        let blobs = BlobStore::new(dir.path().join("blobs"), 1024, 0, 0);
+        blobs.initialize().await.unwrap();
+        ArtifactService::new(pool.clone(), blobs)
+    }
+
+    #[test]
+    fn 上游地址允许内网但拒绝userinfo与fragment() {
+        for value in [
+            "http://127.0.0.1:8080/raw",
+            "http://[::1]/raw",
+            "https://intranet.example/raw",
+        ] {
+            assert!(validate_upstream_url(value).is_ok(), "应接受 {value}");
+        }
+        for value in [
+            "https://user:password@example.invalid/raw",
+            "https://example.invalid/raw#fragment",
+        ] {
+            assert!(validate_upstream_url(value).is_err(), "应拒绝 {value}");
         }
     }
 
@@ -607,6 +732,8 @@ mod tests {
     #[tokio::test]
     async fn group成员校验且失败替换保持原顺序() {
         let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = artifact_service(&pool, &dir).await;
         create_repository(&pool, admin(), hosted("first", Format::Raw))
             .await
             .unwrap();
@@ -635,6 +762,7 @@ mod tests {
 
         let error = update_repository(
             &pool,
+            &artifacts,
             admin(),
             "raw-group",
             RepositoryPatch {
@@ -652,6 +780,8 @@ mod tests {
     #[tokio::test]
     async fn patch显式清空凭据引用_acl向下包含与删除引用保护() {
         let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = artifact_service(&pool, &dir).await;
         let user = create_user(&pool, "alice", "pw", Role::User).await.unwrap();
         let mut proxy = hosted("proxy", Format::Raw);
         proxy.repo_type = RepoType::Proxy;
@@ -671,6 +801,7 @@ mod tests {
         assert_eq!(readable.name, "proxy");
         let updated = update_repository(
             &pool,
+            &artifacts,
             admin(),
             "proxy",
             RepositoryPatch {
@@ -694,28 +825,39 @@ mod tests {
             members: Some(vec!["proxy".to_string()]),
         };
         create_repository(&pool, admin(), group).await.unwrap();
-        let in_use = delete_repository(&pool, admin(), "proxy", DeleteMode::Config, Some("proxy"))
-            .await
-            .unwrap_err();
+        let in_use = delete_repository(
+            &pool,
+            &artifacts,
+            admin(),
+            "proxy",
+            DeleteMode::Config,
+            Some("proxy"),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(in_use.code(), "REPO_IN_USE");
 
-        let unsupported =
-            delete_repository(&pool, admin(), "group", DeleteMode::Data, Some("group"))
-                .await
-                .unwrap_err();
-        assert_eq!(
-            unsupported.status(),
-            axum::http::StatusCode::NOT_IMPLEMENTED
-        );
-        assert!(get_repository(&pool, admin(), "group").await.is_ok());
-
-        let removed = delete_repository(&pool, admin(), "group", DeleteMode::Config, Some("group"))
-            .await
-            .unwrap();
+        let removed = delete_repository(
+            &pool,
+            &artifacts,
+            admin(),
+            "group",
+            DeleteMode::Data,
+            Some("group"),
+        )
+        .await
+        .unwrap();
         assert_eq!(removed.orphaned_blobs, 0);
         assert_eq!(removed.reclaimed_blobs, 0);
-        delete_repository(&pool, admin(), "proxy", DeleteMode::Config, Some("proxy"))
-            .await
-            .unwrap();
+        delete_repository(
+            &pool,
+            &artifacts,
+            admin(),
+            "proxy",
+            DeleteMode::Config,
+            Some("proxy"),
+        )
+        .await
+        .unwrap();
     }
 }

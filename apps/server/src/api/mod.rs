@@ -81,6 +81,10 @@ impl PageQuery {
         formats::head,
         formats::put,
         formats::delete,
+        formats::root_get,
+        formats::root_head,
+        formats::root_put,
+        formats::root_delete,
         migration::discover,
         migration::plan,
         migration::create_task,
@@ -141,6 +145,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/repos/{name}/files", get(repos::files))
         .route("/api/v1/repos/{name}/search", get(repos::search))
         .route("/api/v1/repos/{name}/usage", get(repos::usage))
+        .route(
+            "/repository/{name}/",
+            get(formats::root_get)
+                .head(formats::root_head)
+                .put(formats::root_put)
+                .delete(formats::root_delete),
+        )
         .route(
             "/repository/{name}/{*path}",
             get(formats::get)

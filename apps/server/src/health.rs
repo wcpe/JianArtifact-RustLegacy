@@ -97,6 +97,16 @@ mod tests {
         let data_dir = dir.path().join("blobs");
         std::fs::create_dir(&data_dir).unwrap();
         let pool = persistence::test_pool().await;
+        let blob_store = Arc::new(crate::storage::BlobStore::new(
+            dir.path().join("blobs"),
+            5 * 1024 * 1024 * 1024,
+            5 * 1024 * 1024 * 1024,
+            5,
+        ));
+        let artifacts = Arc::new(crate::artifact::ArtifactService::new(
+            pool.clone(),
+            blob_store.as_ref().clone(),
+        ));
         let state = AppState {
             pool: pool.clone(),
             config: Arc::new(Config {
@@ -106,8 +116,13 @@ mod tests {
                 log_level: "warn".to_string(),
                 jwt_secret: "health-test-secret".to_string(),
                 session_ttl_hours: 8,
+                max_artifact_bytes: 5 * 1024 * 1024 * 1024,
+                min_free_bytes: 5 * 1024 * 1024 * 1024,
+                min_free_percent: 5,
             }),
             auth: Arc::new(AuthRuntime::new("health-test-secret", 8)),
+            blob_store,
+            artifacts,
         };
 
         sqlx::query("PRAGMA query_only = ON")

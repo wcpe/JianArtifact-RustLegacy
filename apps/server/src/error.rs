@@ -20,8 +20,21 @@ pub enum StartupError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
+    #[error("blob 存储初始化失败：{0}")]
+    Storage(crate::storage::StorageError),
+    #[error("启动恢复 blob 回收意图失败")]
+    BlobReclamationRecovery,
     #[error("认证配置无效：{0}")]
     AuthConfig(String),
+}
+
+impl From<crate::storage::StorageError> for StartupError {
+    fn from(error: crate::storage::StorageError) -> Self {
+        match error {
+            crate::storage::StorageError::Io(error) => Self::Io(error),
+            other => Self::Storage(other),
+        }
+    }
 }
 
 /// 对外统一错误响应体。
@@ -34,7 +47,7 @@ pub struct ErrorBody {
 }
 
 /// 可转换为 HTTP 响应的 API 错误。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,

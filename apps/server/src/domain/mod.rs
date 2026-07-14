@@ -1,6 +1,7 @@
 //! 领域服务层：角色类型与用户服务（自举、增改查、口令修改与最后 Admin 保护）。
 //! 依赖方向：domain（领域）→ auth（认证原语）/ persistence（基础设施），不反向依赖 api 入口层。
 
+pub mod artifact;
 pub mod repository;
 
 use serde::{Deserialize, Serialize};

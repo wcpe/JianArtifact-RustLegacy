@@ -18,14 +18,14 @@
   - Raw：按任意规范化路径直接读写，路径必须经过规范化与越界防护。
   - Maven：Maven2 标准仓库布局（POM、构件、metadata、checksum sidecar）。
   - npm：npm registry 协议布局（packument、tarball、dist-tag、scoped package）。
-- 格式协议通用路径的 GET/HEAD/PUT/DELETE 已纳入同一 OpenAPI 并真实挂载；当前为 501 契约占位，Raw、Maven、npm 与 group 将按阶段 3 批次逐域替换为真实协议语义。包管理器与自动化客户端只依赖该路径空间，无需理解管理 API。
+- 格式协议通用路径的 GET/HEAD/PUT/DELETE 与仓库根目录 GET 已纳入同一 OpenAPI 并真实挂载；Raw hosted/proxy 已落地真实 HTTP 语义，Maven、npm 与 group 仍按路线图逐域替换占位。包管理器与自动化客户端只依赖该路径空间，无需理解管理 API。
 - 健康检查端点独立于上述两个路径空间（见 §5）。
 
 ### 2.2 鉴权
 
 - 管理 API：`Authorization: Bearer` 携带 JWT 会话令牌或 API Token（见 ADR-0003）；`GET /api/v1/auth/me` 返回当前权威用户身份与角色，前端不得按用户名推断角色。
-- 认证提取器已具备格式协议所需能力：`Authorization: Basic`（用户名 + 密码，或用户名 + API Token）与 Bearer；格式路由落地后接入并补齐协议矩阵验收。
-- 格式路由落地后，匿名请求仅允许读取 public 仓库；其余请求一律拒绝（见 ADR-0004）。
+- 格式协议支持 `Authorization: Basic`（用户名 + 密码，或用户名 + API Token）与 Bearer；每次请求都复核用户启用状态与凭据有效性。
+- 匿名请求仅允许读取 public 仓库；private 无 read、仓库不存在与停用仓库在协议面统一返回 404，已有 read 但无 write 返回 403（见 ADR-0004）。
 - 携带凭据但校验失败的请求必须以 401 拒绝，**不得**降级为匿名身份或任何其他已认证身份继续处理。
 - JWT 会话同时校验签名、到期时间、会话撤销哈希、用户启用状态与用户会话版本；同一旧会话并发刷新仅允许一个请求换发成功。
 - 会话退出、Token 吊销、用户禁用或口令修改提交成功后，下一次使用对应既有凭据的请求必定失败。
@@ -39,13 +39,22 @@
 
 ### 2.4 仓库管理契约
 
-- 仓库列表、详情、创建、PATCH、删除与 ACL 端点已由真实 Rust 领域服务和 SQLite 持久化承载；浏览、搜索与使用片段仍随制品索引域后续落地。
+- 仓库列表、详情、创建、PATCH、删除、ACL、目录浏览与路径搜索端点已由真实 Rust 领域服务和 SQLite 持久化承载；使用片段仍按路线图后续落地。
 - ACL 设置与移除以精确用户名作为路径键：`/api/v1/repos/{name}/acl/{username}`；客户端必须对用户名做路径编码，不得依赖数据库用户 ID。仓库 admin 可直接按用户名授权，不依赖全局用户列表权限。
 - 仓库 PATCH 中字段缺失表示不更新；`upstream_credential_ref: null` 表示清空上游凭据引用，其他类型专属必填字段不接受 null 清空。
 - 浏览与搜索响应的 `FileEntry.path` 是仓库根相对完整路径，客户端以该字段为准，不自行拼接父目录与条目名。
 - 类型专属配置：hosted 使用覆盖策略，Maven hosted 另有版本策略，proxy 使用上游 URL 与可选凭据引用，group 使用有序成员列表；group 响应只返回调用方可读成员，未提交 `members` 的普通 PATCH 不得据此覆盖完整成员关系。
 - 私有仓库无 read 权与仓库不存在统一返回 `REPO_NOT_FOUND` / `仓库不存在或无权访问`，列表与详情均不得泄露名称或数量；已有 read 但动作权限不足时返回 403。group 成员配置中，不存在与调用方不可读的候选统一返回 `REPO_INVALID_CONFIG` / `group 成员不存在或无权访问`。
-- 删除先校验仓库 admin 权限，再校验确认头与删除模式，避免无权调用方利用确认参数探测仓库存在性；当前仓库核心批次尚无制品索引，删除统计为零，blob 回收语义随存储域落地。
+- 删除先校验仓库 admin 权限，再校验确认头与删除模式，避免无权调用方利用确认参数探测仓库存在性；`mode=config` 删除配置与索引、保留无引用 blob 并报告 `orphaned_blobs`，`mode=data` 仅物理回收无其他仓库引用的 blob 并报告 `reclaimed_blobs`。
+
+### 2.5 Raw hosted/proxy 协议
+
+- hosted `PUT` 流式写入并按覆盖策略返回 201/200/409；`GET` 流式下载，`HEAD` 返回同组元数据头且无响应体，`DELETE` 返回 204/404。对象响应固定携带 `Content-Length`、按扩展名推断的 `Content-Type`、强 `ETag`，以及 `X-Checksum-Sha256`、`X-Checksum-Sha1`、`X-Checksum-Sha512`、`X-Checksum-Md5`。
+- hosted 目录以尾随 `/` 表示，仓库根 `/repository/{name}/` 返回 JSON 分页索引；对象路径不得为空或尾随 `/`，规范化后 UTF-8 长度上限为 4096 字节。hosted query 不参与路径键。
+- proxy 仅允许 GET/HEAD；缓存未命中按仓库、路径与 `upstream_url` 配置快照单飞回源，完整流式落盘并提交正缓存后才从本地 blob 响应，首次 HEAD 同样完整缓存。任意 query 返回 400，写操作返回 405。
+- proxy 缓存事务仅在仓库仍为 proxy 且当前 `upstream_url` 等于回源预期快照时提交索引；旧配置提交被拒后，请求重新读取仓库与授权状态，并按新配置最多透明重试一次。若重试期间配置再次变化，则返回稳定 503，表示代理配置连续变化且本次请求未写入旧缓存。
+- proxy 禁止自动重定向，3xx/其他 4xx/5xx/断流分别以稳定 `PROXY_UPSTREAM_*` 类别返回 502；上游 404 返回 404，连接或响应超时返回 504。失败不写入缓存索引。
+- proxy 凭据引用只存环境变量名；运行时变量值必须是完整的 `Basic …` 或 `Bearer …`，只注入 `Authorization` 头，明文不得进入数据库、响应或日志。修改 `upstream_url` 会在同一数据库事务内失效该仓库全部正缓存索引并登记 blob 回收意图，单独修改凭据引用保留缓存。
 
 ## 3. 错误约定
 
@@ -95,4 +104,4 @@
 
 ## 6. 端点 / 方法
 
-具体业务端点与方法由 utoipa 生成的 OpenAPI 呈现明细（§1），本文不手抄完整清单；本节仅在形成新的跨端点稳定契约时补充说明。当前 `/repository/{name}/{path}` 已登记 GET/HEAD/PUT/DELETE 契约占位。
+具体业务端点与方法由 utoipa 生成的 OpenAPI 呈现明细（§1），本文不手抄完整清单；本节仅在形成新的跨端点稳定契约时补充说明。当前 `/repository/{name}/` 与 `/repository/{name}/{path}` 已登记并实现 Raw 所需方法，其他格式按对应规格继续落地。
