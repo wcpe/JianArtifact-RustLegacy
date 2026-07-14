@@ -128,6 +128,7 @@ describe('迁移向导', () => {
   it('在途任务标识恢复到进度页并展示迁移中阶段', async () => {
     // migration-running 场景种子含运行中任务 task_run_1；写入在途任务标识模拟刷新恢复
     await resetScenario('migration-running');
+    await loginAs('admin', 'admin123');
     localStorage.setItem(MIGRATION_TASK_KEY, 'task_run_1');
     renderWithProviders(<MigrationPage />);
     // 恢复优先级：有在途任务 → 进度页（不回源配置）
@@ -140,6 +141,7 @@ describe('迁移向导', () => {
   it('终态在途任务恢复到进度页并放开查看报告', async () => {
     // migration-partial 场景种子含部分完成终态任务 task_part_1
     await resetScenario('migration-partial');
+    await loginAs('admin', 'admin123');
     localStorage.setItem(MIGRATION_TASK_KEY, 'task_part_1');
     renderWithProviders(<MigrationPage />);
     // 终态：查看报告放开、阶段说明为部分完成

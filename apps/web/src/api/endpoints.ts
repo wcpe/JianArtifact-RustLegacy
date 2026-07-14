@@ -17,6 +17,7 @@ export type PageQuery = {
 export const authApi = {
   login: (body: Schemas['LoginRequest']) =>
     apiRequest<Schemas['SessionToken']>('/api/v1/auth/login', { method: 'POST', body }),
+  me: () => apiRequest<Schemas['UserInfo']>('/api/v1/auth/me'),
   refresh: () => apiRequest<Schemas['SessionToken']>('/api/v1/auth/refresh', { method: 'POST' }),
   // 204 无内容响应：返回值实际为 undefined
   logout: () => apiRequest<undefined>('/api/v1/auth/logout', { method: 'POST' }),

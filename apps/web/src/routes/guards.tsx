@@ -6,8 +6,9 @@ import { useAuth } from '../auth/AuthContext';
 
 // 需登录：未登录跳登录页并记录来源
 export function RequireAuth({ children }: { children: ReactNode }) {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, isRestoring } = useAuth();
   const location = useLocation();
+  if (isRestoring) return null;
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
@@ -16,8 +17,9 @@ export function RequireAuth({ children }: { children: ReactNode }) {
 
 // 需管理员：未登录跳登录，已登录非管理员跳无权限提示
 export function RequireAdmin({ children }: { children: ReactNode }) {
-  const { isAuthenticated, isAdmin } = useAuth();
+  const { isAuthenticated, isAdmin, isRestoring } = useAuth();
   const location = useLocation();
+  if (isRestoring) return null;
   if (!isAuthenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }

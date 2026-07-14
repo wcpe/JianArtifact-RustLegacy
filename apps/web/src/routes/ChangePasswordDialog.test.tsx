@@ -1,12 +1,14 @@
 // 修改口令模态框测试（受控）：成功路径、旧口令错误路径与两次输入不一致拦截（M1-FR-045）。
-import { fireEvent, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { loginAs, renderWithProviders, resetScenario } from '../test/utils';
 import { ChangePasswordDialog } from './ChangePasswordDialog';
 
 // 直接以打开态渲染受控模态框
-function renderDialog() {
-  renderWithProviders(<ChangePasswordDialog open onOpenChange={() => undefined} />);
+function renderDialog(onSuccess?: () => void) {
+  renderWithProviders(
+    <ChangePasswordDialog open onOpenChange={() => undefined} onSuccess={onSuccess} />,
+  );
 }
 
 // 填写三项口令输入并提交
@@ -28,6 +30,13 @@ describe('修改口令模态框', () => {
     renderDialog();
     await submit('admin123', 'new-pass-1', 'new-pass-1');
     expect(await screen.findByText('修改成功', { exact: true })).toBeInTheDocument();
+  });
+
+  it('成功后调用会话清理回调', async () => {
+    const onSuccess = vi.fn();
+    renderDialog(onSuccess);
+    await submit('admin123', 'new-pass-1', 'new-pass-1');
+    await waitFor(() => expect(onSuccess).toHaveBeenCalledOnce());
   });
 
   it('旧口令错误时展示后端消息', async () => {

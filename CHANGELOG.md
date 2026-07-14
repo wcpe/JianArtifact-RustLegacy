@@ -13,12 +13,13 @@
 - 前端工程基座（React 19 + Tailwind 4 + Vite 7）：web / ui / wiki / devmock 四工程脚手架与共享严格配置（TS strict + noUncheckedIndexedAccess、ESLint 9 严格集 --max-warnings 0、Prettier 只检不改）接入 Docker 质量门；ui 经 shadcn CLI 收录 Button 组件源码，wiki 提供组件预览矩阵，devmock 建立 MSW 双端骨架。
 - 工作区结构调整为 apps/（可运行入口）+ packages/（共享库）双根（ADR-0016）。
 - 后端服务基座与认证域契约骨架：axum 服务（配置加载/中文日志/SQLite 迁移框架/统一错误结构/请求标识）、健康检查与就绪自检（/healthz、/readyz 真实现）、登录/刷新/退出/API Token/用户管理契约端点（utoipa OpenAPI 唯一真源，GET /api/v1/openapi.json 与 `jianartifact openapi` 导出）；cargo-audit 与 cargo-deny 许可证检查接入质量门。
-- 仓库域与迁移域契约骨架：仓库 CRUD（删除双模式 + 确认头）、ACL、浏览/搜索/使用片段；迁移三类来源、发现、计划与冲突、十态任务生命周期、分仓报告——管理 API 六域契约面齐备（32 个 operation）；契约快照 `packages/devmock/openapi.json` 新鲜度校验与 devmock 无幻影端点比对测试纳入质量门（make openapi 重新生成）。
+- 仓库域与迁移域契约骨架：仓库 CRUD（删除双模式 + 确认头）、ACL、浏览/搜索/使用片段；迁移三类来源、发现、计划与冲突、十态任务生命周期、分仓报告——当前管理 API 契约共 34 个 operation；契约快照 `packages/devmock/openapi.json` 新鲜度校验与 devmock 无幻影端点比对测试纳入质量门（make openapi 重新生成）。
 - devmock 七类场景包与有状态内存模型（M1-FR-035）：认证/Token/用户/仓库/浏览/迁移全语义、契约双向硬断言（无幻影 + 全量覆盖）；openapi-typescript 契约类型生成接线。
 - 共享组件库四层（M1-FR-036）：基础（shadcn 源码 12 组件）、复合（StatusBadge/Pagination/DataTable 基于 TanStack Table）、状态（Empty/Error/Loading/Forbidden）、布局（AppShell/PageHeader）；wiki 重写为组件 × 状态矩阵验收站。
 - 管理端六组页面对 devmock 开发：登录/仪表盘/仓库列表与详情（文件下钻、使用片段）/API Token（一次性明文）/用户管理/迁移向导（源配置→发现→计划→执行→轮询进度→报告，task_id 持久化刷新可找回，M1-FR-034 向导 UI）；三层守卫路由 + 统一 API client；VITE_MOCK 构建期常量守卫保证生产产物零 mock 与测试凭据。
-- Playwright 真实浏览器 E2E（9 用例，容器内 chromium）：登录鉴权、建仓、Token 一次性明文、用户管理、迁移向导五步与刷新找回，跑在 devmock 模式下并纳入质量门第 9 步（ROADMAP 阶段 2 收口）。
-- 口令修改与重置（M1-FR-045）：`POST /api/v1/auth/password` 修改本人口令（旧口令验证、旧口令立即失效）与用户管理重置口令（`PATCH /api/v1/users/{id}` 扩 password 字段）；顶栏修改口令模态框、用户管理行内重置模态框；契约 33 个 operation，devmock 同步行为与测试。
+- 认证与用户域后端真连（M1-FR-001~006、045）：管理员原子自举、Argon2id 登录、JWT HS256 会话刷新/退出、API Token、Basic/Bearer 提取器、用户管理与最后 Admin 原子保护全部落地；新增 `GET /api/v1/auth/me` 作为前端权威角色来源，改密/重置通过 `token_version` 撤销全部既有会话，自改口令用哈希与版本 CAS 防止并发管理员重置被旧快照覆盖；JWT 引入 sid 会话家族，刷新沿用、退出整族撤销，同一旧 JWT 并发刷新仅一个成功且刷新/退出竞态不遗留有效令牌；Argon2 哈希/校验移交阻塞线程池，不存在用户仍执行同参数固定哈希校验；devmock 绑定请求 Bearer 会话并统一 `AUTH_` 错误码，管理端每次恢复都经 `/auth/me` 复核身份。
+- Playwright 真实浏览器 E2E（14 用例，容器内 chromium）：登录鉴权、建仓与删除、仓库详情、Token 一次性明文、用户管理、迁移向导流程与刷新找回、改密重登，跑在 devmock 模式下并纳入质量门第 9 步。
+- 口令修改与重置（M1-FR-045）：`POST /api/v1/auth/password` 修改本人口令（旧口令验证、旧口令立即失效）与用户管理重置口令（`PATCH /api/v1/users/{id}` 扩 password 字段）；顶栏修改口令模态框、用户管理行内重置模态框；devmock 同步行为与测试。
 - 仓库详情升级为左侧文件树 + 右侧详情面板（M1-FR-019 验收细化）：目录懒加载展开、文件元数据卡（大小/sha256 可复制/更新时间）、目录内容表与树联动选中。
 - 仓库管理页面按参考布局改造（M1-FR-008/009/019）：列表页扩制品数/总大小/状态/上游/操作列（设置直达配置页签、删除经模式选择 + 输名确认的高危对话框）；详情页重组为浏览/配置/权限三页签（页签映射 URL 锚点）——浏览页签文件详情补内容类型、四算法校验和卡（SHA-256/SHA-1/MD5/SHA-512 可复制）与下载按钮，配置页签提供仓库编辑（可见性/覆盖策略/上游/成员/停用）与危险区删除，权限页签提供 ACL 增删管理（403 显示无权状态）；契约 RepoInfo 扩制品数与总大小、FileEntry 扩多校验和与内容类型，devmock 增格式端点下载 mock。
 - 制品详情格式感知与主题统一（M1-FR-019/020）：浏览页签改为面板化左树右详情（目录展开箭头、蓝色文件夹图标、选中高亮）；Maven 详情按 GAV 推导坐标卡并给出 Maven/Gradle/Gradle KTS 依赖片段，npm 详情按包名版本推导并给出 npm/yarn/pnpm 安装命令，校验和按格式惯例排序；仓库接入片段扩展 Maven 的 build.gradle/build.gradle.kts 与 npm 的 .yarnrc.yml；配置页签表单改双列网格、危险区收窄为单行；管理端主色统一为蓝色系。

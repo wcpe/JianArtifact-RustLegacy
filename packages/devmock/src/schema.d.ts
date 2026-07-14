@@ -30,8 +30,25 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 退出：吊销当前会话。 */
+        /** 退出：吊销当前 sid 会话家族。 */
         post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 当前认证用户信息。 */
+        get: operations["me"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -47,7 +64,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 修改本人口令：旧口令验证通过后生效，旧口令立即失效。 */
+        /** 修改本人口令：旧口令验证通过后生效，旧口令与既有会话立即失效。 */
         post: operations["change_password"];
         delete?: never;
         options?: never;
@@ -64,7 +81,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 刷新：换发新会话令牌，旧令牌立即失效。 */
+        /** 刷新：原子撤销仍有效的当前会话，并沿用声明版本换发新令牌。 */
         post: operations["refresh"];
         delete?: never;
         options?: never;
@@ -234,10 +251,10 @@ export interface paths {
             cookie?: never;
         };
         /** 仓库列表（按权限过滤，分页）。 */
-        get: operations["list"];
+        get: operations["repos_list"];
         put?: never;
         /** 创建仓库（Admin）。 */
-        post: operations["create"];
+        post: operations["repos_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -260,7 +277,7 @@ export interface paths {
         options?: never;
         head?: never;
         /** 编辑仓库（仓库 admin）。 */
-        patch: operations["update"];
+        patch: operations["repos_update"];
         trace?: never;
     };
     "/api/v1/repos/{name}/acl": {
@@ -357,10 +374,10 @@ export interface paths {
             cookie?: never;
         };
         /** 列出本人 Token 元数据（分页）。 */
-        get: operations["list"];
+        get: operations["tokens_list"];
         put?: never;
         /** 签发 Token。 */
-        post: operations["create"];
+        post: operations["tokens_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -377,7 +394,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** 吊销 Token。 */
+        /** 吊销 Token（仅限本人）。 */
         delete: operations["revoke"];
         options?: never;
         head?: never;
@@ -392,10 +409,10 @@ export interface paths {
             cookie?: never;
         };
         /** 列出用户（分页，Admin）。 */
-        get: operations["list"];
+        get: operations["users_list"];
         put?: never;
         /** 新增用户（Admin）。 */
-        post: operations["create"];
+        post: operations["users_create"];
         delete?: never;
         options?: never;
         head?: never;
@@ -416,7 +433,7 @@ export interface paths {
         options?: never;
         head?: never;
         /** 更新用户启停与角色（Admin）。 */
-        patch: operations["update"];
+        patch: operations["users_update"];
         trace?: never;
     };
     "/healthz": {
@@ -872,7 +889,7 @@ export interface components {
          */
         RepoType: "hosted" | "proxy" | "group";
         /**
-         * @description 全局角色。
+         * @description 全局角色。落库为 users.role（CHECK 约束取值 'admin'/'user'），序列化为小写。
          * @enum {string}
          */
         Role: "admin" | "user";
@@ -1128,6 +1145,35 @@ export interface operations {
                 content?: never;
             };
             /** @description 会话无效 */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 当前认证用户信息 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserInfo"];
+                };
+            };
+            /** @description 未认证或会话无效 */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -1549,7 +1595,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    repos_list: {
         parameters: {
             query?: {
                 /** @description 页码，从 1 起 */
@@ -1576,7 +1622,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    repos_create: {
         parameters: {
             query?: never;
             header?: never;
@@ -1697,7 +1743,7 @@ export interface operations {
             };
         };
     };
-    update: {
+    repos_update: {
         parameters: {
             query?: never;
             header?: never;
@@ -1945,7 +1991,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    tokens_list: {
         parameters: {
             query?: {
                 /** @description 页码，从 1 起 */
@@ -1981,7 +2027,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    tokens_create: {
         parameters: {
             query?: never;
             header?: never;
@@ -2053,7 +2099,7 @@ export interface operations {
             };
         };
     };
-    list: {
+    users_list: {
         parameters: {
             query?: {
                 /** @description 页码，从 1 起 */
@@ -2089,7 +2135,7 @@ export interface operations {
             };
         };
     };
-    create: {
+    users_create: {
         parameters: {
             query?: never;
             header?: never;
@@ -2131,7 +2177,7 @@ export interface operations {
             };
         };
     };
-    update: {
+    users_update: {
         parameters: {
             query?: never;
             header?: never;

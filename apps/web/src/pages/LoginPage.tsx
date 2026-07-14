@@ -17,13 +17,16 @@ import { ApiClientError } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 
 export function LoginPage() {
-  const { isAuthenticated, login } = useAuth();
+  const { isAuthenticated, isRestoring, login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  // 恢复已有令牌期间等待 auth/me 确认身份，避免先跳登录页
+  if (isRestoring) return null;
 
   // 已登录用户不应停留在登录页，直接送往仪表盘
   if (isAuthenticated) {

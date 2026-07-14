@@ -2,18 +2,18 @@
 
 > 系统当前真貌（HOW）。始终原地更新到现状；结构 / 机制变了就改它。
 >
-> 当前状态：业务实现尚未开始，本文描述的是已裁决的目标架构；实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
+> 当前状态：阶段 3 已完成认证与用户域真连，其余业务域仍按路线图逐域实现；实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
 
 ## 1. 定位与边界
 
 JianArtifact 是一个以低运维成本为目标的自托管制品仓库，统一管理 Raw、Maven、npm 三种格式的 hosted、proxy 与只读 group 仓库，并承接存量 Nexus Repository OSS 3.70.x 中上述仓库的全量迁移与切换。
 
-第一期运行形态：
+第一期目标运行形态（阶段 3 当前仅 Rust 管理 API、SQLite 认证元数据与独立前端构建已落地）：
 
-- **一个 Rust 服务进程**：管理 API、格式协议端点、存储与迁移全部在同一进程内。
-- **一个 SQLite 元数据库**：元数据唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
-- **一个本地文件系统 blob 数据目录**：制品内容本体按内容寻址存放。
-- **rust-embed 编译期内嵌前端产物**：React 管理端静态资源在构建时嵌入二进制，单二进制交付，部署不需要独立 Node 运行时或前端服务。
+- **一个 Rust 服务进程**：当前承载管理 API；格式协议、blob 存储与迁移随对应业务域接入同一进程。
+- **一个 SQLite 元数据库**：当前已作为认证与用户元数据唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
+- **一个本地文件系统 blob 数据目录**：制品内容本体按内容寻址存放，随存储域落地。
+- **前端最终内嵌交付**：当前 React 管理端独立构建，尚未接入 Rust 静态资源路由；后续以编译期内嵌方式收敛为单二进制交付。
 - **TLS 在反向代理终止**：服务本身只监听明文 HTTP，可置于任意反向代理之后。
 
 边界之外（详见第 8.2 节非目标）：不做多节点集群、对象存储后端、LDAP/OIDC，Raw/Maven/npm 之外的格式进入后续分期。
@@ -36,7 +36,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ### 2.2 `apps/server` 内部分层
 
-第一期保持单服务、清晰模块分层，不因未来格式扩展提前拆成微型 crate。至少划分以下模块，依赖严格单向：
+当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`state`；其中认证域遵循 `api → domain → persistence` 单向依赖。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
 
 ```text
         ┌───────────────┐      ┌───────────────┐
@@ -80,9 +80,9 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 | 表族 | 内容 |
 |---|---|
-| 用户 | 账号、Argon2 密码哈希、启用状态、全局角色（Admin/User） |
-| API Token | Token 哈希（明文只在签发时显示一次）、名称、创建/吊销元数据 |
-| 会话撤销 | 已撤销会话的**域分隔哈希**与撤销时间，支撑退出/禁用后下一次请求必定失败 |
+| 用户 | 账号、Argon2id 密码哈希、启用状态、全局角色（Admin/User）、会话版本 `token_version`；改密或重置时原子递增版本，使全部既有 JWT 失效 |
+| API Token | Token 域分隔哈希（明文只在签发时显示一次）、名称、创建元数据；吊销即删除记录 |
+| 会话撤销 | 已撤销会话标识的**域分隔哈希**与过期时间，支撑退出与刷新旧会话的即时失效 |
 | 仓库 | 格式（raw/maven2/npm）、类型（hosted/proxy/group）、可见性（public/private）、状态、proxy 上游配置与凭据引用状态 |
 | group 成员 | group 仓库到成员仓库的有序关系 |
 | 仓库 ACL | 用户 × 仓库 × 动作（read/write/admin） |
@@ -108,16 +108,19 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API，覆盖认证、用户、Token、仓库、ACL、浏览与迁移。**utoipa 生成的 OpenAPI 是管理 API 契约唯一真源**，`devmock` 契约测试自动与其比对。
-- **格式协议端点**：Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，官方客户端（curl、Maven、npm）无需理解内部管理 API。支持 Basic Auth 与 Bearer/API Token。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户与 Token 已真实现，仓库、ACL、浏览与迁移目前为契约骨架。**utoipa 生成的 OpenAPI 是管理 API 契约唯一真源**，`devmock` 契约测试自动与其比对。
+- **格式协议端点**：尚未落地；后续按域实现 Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，并接入已具备 Basic 与 Bearer/API Token 能力的统一鉴权提取器。
 - **健康检查**：进程健康与基本就绪状态，响应不泄露路径、凭据或内部拓扑。
 
 ## 6. 关键机制
 
 ### 6.1 认证、会话与授权
 
-- 密码使用内存安全参数的 Argon2 哈希。
-- Web 会话采用 JWT（HS256）+ **服务端撤销状态**：沿用已验证的设计，撤销表只存域分隔哈希；退出、吊销或禁用用户提交成功后，下一次请求必定失败（会话即时撤销），不影响其他会话或 API Token。
+- 密码使用 Argon2id，参数固定为 memory 19456 KiB、iterations 2、parallelism 1。
+- Web 会话采用 JWT（HS256）+ **服务端撤销状态 + 用户会话版本**：每次请求同时校验签名、到期时间、jti/sid 撤销哈希、`token_version` 与用户启用状态；刷新原子消费当前 jti 并沿用 sid，退出撤销整个 sid 会话家族，改密/重置口令原子递增版本并撤销该用户全部既有会话。同一旧令牌并发刷新仅一个请求成功，刷新与退出竞态不得遗留有效新令牌。
+- API Token 仅持久化 `sha256("api-token:" + 明文)`；Bearer `jat_` 与 Basic 口令位均可使用，吊销或用户禁用后下一次请求立即失败。
+- Basic 口令校验仅缓存 Argon2 正向结果 60 秒，缓存键绑定口令、当前 PHC 与 `token_version`；身份、角色和启用状态仍逐请求查库。
+- 管理端通过 `GET /api/v1/auth/me` 获取权威用户角色，不按用户名猜测；前端隐藏入口仅为体验优化。
 - **授权判定为无 IO 纯函数**：输入主体（匿名/用户/Admin）、仓库可见性与 ACL、动作，输出允许/拒绝，便于穷举测试整张权限矩阵。前端不复制授权规则，权限拒绝一律以后端结果为准。
 
 ### 6.2 proxy 缓存与单飞
@@ -150,8 +153,8 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ## 7. 部署
 
-- 交付物为**单个 Rust 二进制**（前端产物经 rust-embed 编译期内嵌），零系统级 C 库依赖（sqlx SQLite bundled 编译期内嵌、reqwest rustls，不依赖系统 OpenSSL / sqlite3），Rust 生产代码 `forbid(unsafe)`。
-- 运行时依赖仅：一个可写数据目录（SQLite 文件 + blob 目录）与启动配置。
+- 目标交付物为**单个 Rust 二进制**（前端产物编译期内嵌）；当前阶段 Rust 服务与前端仍分别构建，静态资源内嵌待后续部署域落地。后端保持零系统级 C 库依赖（sqlx SQLite bundled，不依赖系统 sqlite3），Rust 生产代码 `forbid(unsafe)`。
+- 当前运行时依赖为 SQLite 文件、就绪探针使用的可写数据目录与启动配置；blob 目录语义随存储域落地。
 - TLS 由反向代理终止；服务自身不管理证书。
 - 首次启动通过管理员自举流程创建首个管理员，成功后入口永久关闭。
 - 构建、测试、lint、typecheck 与协议验收统一在 Docker 中执行，宿主项目目录不产生 `target`、`node_modules` 或大型测试产物。

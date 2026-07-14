@@ -19,6 +19,9 @@ async fn test_app() -> Result<(Router, tempfile::TempDir), Box<dyn std::error::E
         database_path: dir.path().join("test.db"),
         data_dir: dir.path().join("blobs"),
         log_level: "warn".to_string(),
+        // 测试用固定 JWT 密钥（非生产凭据），满足 build_app 的密钥非空校验
+        jwt_secret: "test-jwt-secret-please-change".to_string(),
+        session_ttl_hours: 8,
     };
     let app = jianartifact_server::build_app(config).await?;
     Ok((app, dir))
@@ -64,6 +67,9 @@ async fn 就绪自检数据目录不可写时五百零三() -> TestResult {
         database_path: dir.path().join("test.db"),
         data_dir: blocker.join("blobs"),
         log_level: "warn".to_string(),
+        // 测试用固定 JWT 密钥（非生产凭据），满足 build_app 的密钥非空校验
+        jwt_secret: "test-jwt-secret-please-change".to_string(),
+        session_ttl_hours: 8,
     };
     let app = jianartifact_server::build_app(config).await?;
     let resp = send(&app, "GET", "/readyz").await?;

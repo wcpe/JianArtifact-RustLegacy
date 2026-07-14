@@ -62,6 +62,7 @@ describe('进度步', () => {
   it('终态任务恢复：展示部分完成阶段、放开查看报告并提供重试', async () => {
     // 直接以终态任务标识挂载即刷新恢复场景：轮询取回终态并停止
     await resetScenario('migration-partial');
+    await loginAs('admin', 'admin123');
     renderWithProviders(
       <ProgressStep
         taskId="task_part_1"

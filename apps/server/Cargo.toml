@@ -37,6 +37,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 # 统一错误类型
 thiserror = "2"
+# 口令哈希（Argon2id，RustCrypto 纯 Rust，无系统级 C 库）
+argon2 = "0.5"
+# JWT HS256 会话令牌签发与验签
+jsonwebtoken = "9"
+# 安全随机数：API Token 明文与 Argon2 盐
+rand = "0.8"
+# SHA-256：会话撤销与 API Token 的域分隔哈希
+sha2 = "0.10"
 
 [dev-dependencies]
 # 集成测试：驱动 Router 处理请求、读取响应体、临时数据目录

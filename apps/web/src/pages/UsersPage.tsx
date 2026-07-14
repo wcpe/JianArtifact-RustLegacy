@@ -28,8 +28,10 @@ import {
   SelectValue,
   type ColumnDef,
 } from '@jianartifact/ui';
+import { useNavigate } from 'react-router-dom';
 import { ApiClientError } from '../api/client';
 import { userApi } from '../api/endpoints';
+import { useAuth } from '../auth/AuthContext';
 import { useAsync } from '../lib/useAsync';
 import { useRegisterRefresh } from '../routes/RefreshContext';
 import { formatDateTime } from '../lib/format';
@@ -113,12 +115,12 @@ function ResetPasswordDialog({
 function UserActions({
   user,
   onChanged,
-  onNotice,
+  onPasswordReset,
   onError,
 }: {
   user: UserInfo;
   onChanged: () => void;
-  onNotice: (message: string) => void;
+  onPasswordReset: (user: UserInfo) => void;
   onError: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -153,11 +155,7 @@ function UserActions({
       >
         {user.role === 'admin' ? '降为普通' : '升为管理员'}
       </Button>
-      <ResetPasswordDialog
-        user={user}
-        onDone={() => onNotice(`已重置 ${user.username} 的口令`)}
-        onError={onError}
-      />
+      <ResetPasswordDialog user={user} onDone={() => onPasswordReset(user)} onError={onError} />
     </div>
   );
 }
@@ -262,6 +260,8 @@ function CreateUserDialog({ onCreated }: { onCreated: () => void }) {
 }
 
 export function UsersPage() {
+  const { user: currentUser, clearLocalSession } = useAuth();
+  const navigate = useNavigate();
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [q, setQ] = useState('');
@@ -280,6 +280,19 @@ export function UsersPage() {
     setQ(value.trim());
     setPage(1);
   }, []);
+
+  const handlePasswordReset = useCallback(
+    (target: UserInfo) => {
+      if (target.id === currentUser?.id) {
+        clearLocalSession();
+        navigate('/login', { replace: true });
+        return;
+      }
+      setActionError(null);
+      setActionNotice(`已重置 ${target.username} 的口令`);
+    },
+    [currentUser?.id, clearLocalSession, navigate],
+  );
 
   const columns: ColumnDef<UserInfo>[] = [
     { accessorKey: 'username', header: '用户名' },
@@ -319,10 +332,7 @@ export function UsersPage() {
             setActionNotice(null);
             reload();
           }}
-          onNotice={(message) => {
-            setActionError(null);
-            setActionNotice(message);
-          }}
+          onPasswordReset={handlePasswordReset}
           onError={(message) => {
             setActionNotice(null);
             setActionError(message);

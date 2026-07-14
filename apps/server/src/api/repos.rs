@@ -243,6 +243,7 @@ pub struct UsageSnippet {
 /// 仓库列表（按权限过滤，分页）。
 #[utoipa::path(
     get,
+    operation_id = "repos_list",
     path = "/api/v1/repos",
     tag = "repos",
     params(
@@ -261,6 +262,7 @@ pub async fn list() -> ApiError {
 /// 创建仓库（Admin）。
 #[utoipa::path(
     post,
+    operation_id = "repos_create",
     path = "/api/v1/repos",
     tag = "repos",
     request_body = CreateRepoRequest,
@@ -292,6 +294,7 @@ pub async fn detail() -> ApiError {
 /// 编辑仓库（仓库 admin）。
 #[utoipa::path(
     patch,
+    operation_id = "repos_update",
     path = "/api/v1/repos/{name}",
     tag = "repos",
     params(("name" = String, Path, description = "仓库名")),

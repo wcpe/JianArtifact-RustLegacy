@@ -1,10 +1,18 @@
-//! API Token 契约骨架（M1-FR-004）：签发、列表、吊销。
-//! 明文只在签发响应出现一次，持久化只存哈希；阶段 1 handler 返回未实现。
+//! API Token 接口（M1-FR-004）：签发、列表、吊销。
+//! 明文只在签发响应出现一次，持久化只存哈希；入口层只做 HTTP 适配，调仓储与认证原语。
 
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::PageQuery;
+use crate::api::extractor::RequireAuth;
+use crate::auth::token::generate_token;
 use crate::error::ApiError;
+use crate::persistence::{self, TokenRow};
+use crate::state::AppState;
 
 /// 创建 Token 请求体。
 #[derive(Debug, Deserialize, ToSchema)]
@@ -22,6 +30,17 @@ pub struct TokenInfo {
     pub name: String,
     /// 创建时间。
     pub created_at: String,
+}
+
+impl From<TokenRow> for TokenInfo {
+    /// 由仓储 Token 行映射为对外元数据（永不含明文或哈希）。
+    fn from(row: TokenRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            created_at: row.created_at,
+        }
+    }
 }
 
 /// 签发成功返回：明文仅此一次出现。
@@ -53,6 +72,7 @@ pub struct TokenListResponse {
 /// 签发 Token。
 #[utoipa::path(
     post,
+    operation_id = "tokens_create",
     path = "/api/v1/tokens",
     tag = "tokens",
     request_body = CreateTokenRequest,
@@ -61,13 +81,30 @@ pub struct TokenListResponse {
         (status = 401, description = "未认证", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn create() -> ApiError {
-    ApiError::not_implemented("Token 签发接口待阶段 3 实现")
+pub async fn create(
+    RequireAuth(identity): RequireAuth,
+    State(state): State<AppState>,
+    Json(req): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<CreatedToken>), ApiError> {
+    // 明文只此一次返回；持久化只存域分隔哈希
+    let (plain, hash) = generate_token();
+    let (id, created_at) =
+        persistence::insert_token(&state.pool, identity.user_id, &req.name, &hash).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedToken {
+            id,
+            name: req.name,
+            token: plain,
+            created_at,
+        }),
+    ))
 }
 
 /// 列出本人 Token 元数据（分页）。
 #[utoipa::path(
     get,
+    operation_id = "tokens_list",
     path = "/api/v1/tokens",
     tag = "tokens",
     params(
@@ -80,11 +117,30 @@ pub async fn create() -> ApiError {
         (status = 401, description = "未认证", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn list() -> ApiError {
-    ApiError::not_implemented("Token 列表接口待阶段 3 实现")
+pub async fn list(
+    RequireAuth(identity): RequireAuth,
+    State(state): State<AppState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<TokenListResponse>, ApiError> {
+    let (page, page_size) = query.resolve();
+    let (rows, total) = persistence::list_tokens_by_user(
+        &state.pool,
+        identity.user_id,
+        page,
+        page_size,
+        query.q.as_deref(),
+    )
+    .await?;
+    let items = rows.into_iter().map(TokenInfo::from).collect();
+    Ok(Json(TokenListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
-/// 吊销 Token。
+/// 吊销 Token（仅限本人）。
 #[utoipa::path(
     delete,
     path = "/api/v1/tokens/{id}",
@@ -96,6 +152,15 @@ pub async fn list() -> ApiError {
         (status = 404, description = "Token 不存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn revoke() -> ApiError {
-    ApiError::not_implemented("Token 吊销接口待阶段 3 实现")
+pub async fn revoke(
+    RequireAuth(identity): RequireAuth,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    // id 与 user_id 双重限定：未命中即视为不存在，不泄露他人 Token 的存在性
+    let deleted = persistence::delete_token(&state.pool, id, identity.user_id).await?;
+    if !deleted {
+        return Err(ApiError::not_found("AUTH_TOKEN_NOT_FOUND", "Token 不存在"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

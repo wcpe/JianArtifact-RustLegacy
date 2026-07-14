@@ -26,11 +26,12 @@ describe('会话流转', () => {
     expect(store.refresh().ok).toBe(true);
   });
 
-  it('错误凭据与未知用户登录均返回 401', () => {
+  it('错误凭据与未知用户登录均返回统一认证错误', () => {
     const store = createStore('default');
     store.logout();
-    expect(unwrapError(store.login('admin', '错误口令')).status).toBe(401);
-    expect(unwrapError(store.login('ghost', 'x')).status).toBe(401);
+    expect(unwrapError(store.me()).code).toBe('AUTH_UNAUTHENTICATED');
+    expect(unwrapError(store.login('admin', '错误口令')).code).toBe('AUTH_INVALID_CREDENTIALS');
+    expect(unwrapError(store.login('ghost', 'x')).code).toBe('AUTH_INVALID_CREDENTIALS');
   });
 });
 
@@ -45,42 +46,54 @@ describe('Token 管理', () => {
     expect(found !== undefined && 'token' in found).toBe(false);
     expect(store.revokeToken(created.id).ok).toBe(true);
     expect(unwrap(store.listTokens()).items.some((t) => t.id === created.id)).toBe(false);
-    expect(unwrapError(store.revokeToken(created.id)).status).toBe(404);
+    expect(unwrapError(store.revokeToken(created.id)).code).toBe('AUTH_TOKEN_NOT_FOUND');
   });
 });
 
 describe('用户管理', () => {
   it('最后一名启用管理员不可禁用或降级；补充管理员后可禁用', () => {
     const store = createStore('default');
-    expect(unwrapError(store.updateUser(1, { enabled: false })).status).toBe(403);
-    expect(unwrapError(store.updateUser(1, { role: 'user' })).status).toBe(403);
+    expect(unwrapError(store.updateUser(1, { enabled: false })).code).toBe('AUTH_LAST_ADMIN');
+    expect(unwrapError(store.updateUser(1, { role: 'user' })).code).toBe('AUTH_LAST_ADMIN');
     unwrap(store.createUser({ username: 'admin2', password: 'admin2pass', role: 'admin' }));
     expect(store.updateUser(1, { enabled: false }).ok).toBe(true);
   });
 
   it('restricted 场景下普通用户访问用户管理被拒（403）', () => {
     const store = createStore('restricted');
-    expect(unwrapError(store.listUsers()).status).toBe(403);
+    expect(unwrapError(store.listUsers()).code).toBe('AUTH_FORBIDDEN');
     const created = store.createUser({ username: 'x', password: 'p', role: 'user' });
-    expect(unwrapError(created).status).toBe(403);
+    expect(unwrapError(created).code).toBe('AUTH_FORBIDDEN');
   });
 
-  it('修改本人口令：旧口令错误 401，成功后旧口令立即失效（M1-FR-045）', () => {
+  it('用户域错误码与后端 AUTH_ 前缀一致', () => {
     const store = createStore('default');
-    expect(unwrapError(store.changePassword('错误口令', 'new-pass')).status).toBe(401);
+    const duplicate = store.createUser({ username: 'admin', password: 'p', role: 'user' });
+    expect(unwrapError(duplicate).code).toBe('AUTH_USERNAME_TAKEN');
+    expect(unwrapError(store.updateUser(999, { enabled: false })).code).toBe('AUTH_USER_NOT_FOUND');
+  });
+
+  it('修改本人口令：旧口令错误，成功后旧口令与当前会话立即失效（M1-FR-045）', () => {
+    const store = createStore('default');
+    expect(unwrapError(store.changePassword('错误口令', 'new-pass')).code).toBe(
+      'AUTH_INVALID_CREDENTIALS',
+    );
     expect(store.changePassword('admin123', 'new-pass').ok).toBe(true);
-    // 旧口令立即失效，新口令可登录
-    store.logout();
-    expect(unwrapError(store.login('admin', 'admin123')).status).toBe(401);
+    expect(unwrapError(store.me()).code).toBe('AUTH_UNAUTHENTICATED');
+    expect(unwrapError(store.login('admin', 'admin123')).code).toBe('AUTH_INVALID_CREDENTIALS');
     expect(store.login('admin', 'new-pass').ok).toBe(true);
   });
 
-  it('Admin 重置用户口令后立即生效（M1-FR-045）', () => {
+  it('Admin 重置用户口令后立即生效，重置当前用户时撤销会话（M1-FR-045）', () => {
     const store = createStore('default');
     expect(store.updateUser(2, { password: 'reset-pass' }).ok).toBe(true);
-    store.logout();
-    expect(unwrapError(store.login('dev', 'dev123')).status).toBe(401);
+    expect(store.me().ok).toBe(true);
+    expect(unwrapError(store.login('dev', 'dev123')).code).toBe('AUTH_INVALID_CREDENTIALS');
     expect(store.login('dev', 'reset-pass').ok).toBe(true);
+
+    const adminStore = createStore('default');
+    expect(adminStore.updateUser(1, { password: 'admin-new' }).ok).toBe(true);
+    expect(unwrapError(adminStore.me()).code).toBe('AUTH_UNAUTHENTICATED');
   });
 });
 

@@ -48,9 +48,11 @@ function PasswordField({
 export function ChangePasswordDialog({
   open,
   onOpenChange,
+  onSuccess,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onSuccess?: () => void;
 }) {
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -82,11 +84,14 @@ export function ChangePasswordDialog({
     setSubmitting(true);
     try {
       await authApi.changePassword({ old_password: oldPassword, new_password: newPassword });
-      // 成功后清空表单并在框内提示，旧口令已失效
-      setOldPassword('');
-      setNewPassword('');
-      setConfirmPassword('');
-      setNotice('修改成功，旧口令已失效，请使用新口令登录。');
+      if (onSuccess) {
+        onSuccess();
+      } else {
+        setOldPassword('');
+        setNewPassword('');
+        setConfirmPassword('');
+        setNotice('修改成功，旧口令已失效，请使用新口令登录。');
+      }
     } catch (err) {
       setError(err instanceof ApiClientError ? err.message : '修改口令失败');
     } finally {

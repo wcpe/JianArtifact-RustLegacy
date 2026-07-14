@@ -107,7 +107,15 @@ function fail(status: number, code: string, message: string): StoreFailure {
 }
 
 function unauthorized(): StoreFailure {
-  return fail(401, 'UNAUTHORIZED', '未登录或会话已失效');
+  return fail(401, 'AUTH_UNAUTHENTICATED', '未提供有效的认证凭据');
+}
+
+function invalidSession(): StoreFailure {
+  return fail(401, 'AUTH_INVALID_SESSION', '会话令牌无效或已失效');
+}
+
+function authForbidden(message: string): StoreFailure {
+  return fail(403, 'AUTH_FORBIDDEN', message);
 }
 
 function forbidden(message: string): StoreFailure {
@@ -372,19 +380,24 @@ export class DevmockStore {
   private tokens: SeedToken[] = [];
   private repos: SeedRepo[] = [];
   private tasks: SeedTask[] = [];
-  private session: { userId: number } | null = null;
+  private readonly sessions = new Map<string, number>();
+  private activeToken: string | null = null;
+  private requestContext = false;
+  private directUserId: number | null = null;
   private upstreamDown = false;
   private readonly discoveries = new Map<string, DiscoveryResult>();
   private readonly plans = new Map<string, MigrationPlan>();
   private seq = 0;
 
-  // 迁移任务持久化键：模拟后端对任务的持久化（FR-029），使「刷新找回」跨页面重载成立。
+  // 迁移任务与会话持久化键：模拟后端跨页面重载仍保有服务端状态。
   private static readonly TASKS_KEY = 'jianartifact.devmock.tasks';
+  private static readonly SESSIONS_KEY = 'jianartifact.devmock.sessions';
 
   constructor(scenario: ScenarioId) {
     this.resetTo(scenario);
-    // 页面重载后 rehydrate 已持久化的运行时任务（scenario 种子任务不受影响，按 id 去重）
+    // 页面重载后恢复模拟后端持久状态；显式切换场景会先清空这些运行时数据
     this.rehydrateTasks();
+    this.rehydrateSessions();
   }
 
   /** 浏览器环境才有 localStorage；node 测试环境跳过持久化（用例不涉及重载）。 */
@@ -418,11 +431,38 @@ export class DevmockStore {
     }
   }
 
-  /** 清除持久化任务：显式切换场景视为全新后端。 */
+  /** 持久化 mock 会话表，使页面导航与刷新不等价于服务端重启。 */
+  private persistSessions(): void {
+    if (!DevmockStore.hasStorage()) return;
+    try {
+      localStorage.setItem(DevmockStore.SESSIONS_KEY, JSON.stringify([...this.sessions]));
+    } catch {
+      // 存储不可用时仅影响开发态跨重载保持登录
+    }
+  }
+
+  /** 从 localStorage 恢复仍属于当前场景用户的 mock 会话。 */
+  private rehydrateSessions(): void {
+    if (!DevmockStore.hasStorage()) return;
+    try {
+      const raw = localStorage.getItem(DevmockStore.SESSIONS_KEY);
+      if (!raw) return;
+      const persisted = JSON.parse(raw) as Array<[string, number]>;
+      const userIds = new Set(this.users.map((user) => user.info.id));
+      for (const [token, userId] of persisted) {
+        if (typeof token === 'string' && userIds.has(userId)) this.sessions.set(token, userId);
+      }
+    } catch {
+      // 会话数据损坏时忽略，前端会经 auth/me 清理失效登录态
+    }
+  }
+
+  /** 清除持久化运行时状态：显式切换场景视为全新后端。 */
   clearPersistedTasks(): void {
     if (!DevmockStore.hasStorage()) return;
     try {
       localStorage.removeItem(DevmockStore.TASKS_KEY);
+      localStorage.removeItem(DevmockStore.SESSIONS_KEY);
     } catch {
       // 忽略清除失败
     }
@@ -441,7 +481,10 @@ export class DevmockStore {
     this.tokens = seed.tokens;
     this.repos = seed.repos;
     this.tasks = seed.tasks;
-    this.session = seed.session;
+    this.sessions.clear();
+    this.activeToken = null;
+    this.requestContext = false;
+    this.directUserId = seed.session?.userId ?? null;
     this.upstreamDown = seed.upstreamDown;
     this.discoveries.clear();
     this.plans.clear();
@@ -455,27 +498,77 @@ export class DevmockStore {
 
   // —— 会话 ——
 
-  /** 登录：校验测试凭据并建立会话（default 场景凭据 admin/admin123、dev/dev123）。 */
+  /** 登录：校验测试凭据并建立与返回令牌精确绑定的会话。 */
   login(username: string, password: string): StoreResult<SessionToken> {
     const user = this.users.find((u) => u.info.username === username);
     if (!user || !user.info.enabled || user.password !== password) {
-      return fail(401, 'INVALID_CREDENTIALS', '用户名或口令无效');
+      return fail(401, 'AUTH_INVALID_CREDENTIALS', '用户名或口令无效');
     }
-    this.session = { userId: user.info.id };
-    return ok(this.issueSessionToken());
+    const sessionToken = this.issueSessionToken();
+    this.sessions.set(sessionToken.token, user.info.id);
+    this.persistSessions();
+    this.activeToken = sessionToken.token;
+    this.directUserId = user.info.id;
+    return ok(sessionToken);
   }
 
-  /** 退出：吊销当前会话。 */
-  logout(): StoreResult<null> {
-    if (!this.session) return unauthorized();
-    this.session = null;
+  /** 校验请求 Bearer 令牌；成功后在当前同步请求上下文中选择对应身份。 */
+  authenticate(token: string | null): StoreResult<null> {
+    this.requestContext = true;
+    this.activeToken = null;
+    if (token === null) return unauthorized();
+    const userId = this.sessions.get(token);
+    if (userId === undefined) return invalidSession();
+    const user = this.users.find((item) => item.info.id === userId);
+    if (!user?.info.enabled) return invalidSession();
+    this.activeToken = token;
     return ok(null);
   }
 
-  /** 刷新：换发新会话令牌。 */
+  /** 建立匿名请求上下文；仅用于允许匿名读取 public 的格式协议端点。 */
+  beginAnonymousRequest(): void {
+    this.requestContext = true;
+    this.activeToken = null;
+  }
+
+  /** 清理请求身份，避免影响后续直接 store 调用或其他请求。 */
+  clearRequestContext(): void {
+    this.requestContext = false;
+    this.activeToken = null;
+  }
+
+  /** 退出：只吊销本次请求所携带的会话。 */
+  logout(): StoreResult<null> {
+    if (this.activeToken !== null) {
+      this.sessions.delete(this.activeToken);
+      this.persistSessions();
+      this.activeToken = null;
+      this.directUserId = null;
+      return ok(null);
+    }
+    if (this.directUserId === null) return unauthorized();
+    this.revokeUserSessions(this.directUserId);
+    this.directUserId = null;
+    return ok(null);
+  }
+
+  /** 刷新：只换发本次请求所携带的会话，旧令牌立即失效。 */
   refresh(): StoreResult<SessionToken> {
-    if (!this.session) return unauthorized();
-    return ok(this.issueSessionToken());
+    const userId = this.currentUserId();
+    if (userId === null) return unauthorized();
+    if (this.activeToken !== null) this.sessions.delete(this.activeToken);
+    const sessionToken = this.issueSessionToken();
+    this.sessions.set(sessionToken.token, userId);
+    this.persistSessions();
+    this.activeToken = sessionToken.token;
+    this.directUserId = userId;
+    return ok(sessionToken);
+  }
+
+  /** 返回当前权威用户信息。 */
+  me(): StoreResult<UserInfo> {
+    const user = this.requireUser();
+    return user.ok ? ok(user.value.info) : user;
   }
 
   /** 生成伪会话令牌（纯 mock 值，无任何真实密钥参与）。 */
@@ -487,11 +580,30 @@ export class DevmockStore {
     };
   }
 
+  /** 当前请求或直接调用上下文中的用户标识。 */
+  private currentUserId(): number | null {
+    if (this.requestContext) {
+      return this.activeToken === null ? null : (this.sessions.get(this.activeToken) ?? null);
+    }
+    return this.directUserId;
+  }
+
   /** 当前会话用户（null = 未登录）。 */
   private currentUser(): SeedUser | null {
-    const session = this.session;
-    if (!session) return null;
-    return this.users.find((u) => u.info.id === session.userId) ?? null;
+    const userId = this.currentUserId();
+    if (userId === null) return null;
+    return this.users.find((u) => u.info.id === userId) ?? null;
+  }
+
+  /** 吊销指定用户的全部会话令牌。 */
+  private revokeUserSessions(userId: number): void {
+    for (const [token, ownerId] of this.sessions) {
+      if (ownerId === userId) this.sessions.delete(token);
+    }
+    if (this.activeToken !== null && !this.sessions.has(this.activeToken)) {
+      this.activeToken = null;
+    }
+    this.persistSessions();
   }
 
   /** 会话守卫：未登录返回 401。 */
@@ -504,7 +616,7 @@ export class DevmockStore {
   private requireAdmin(): StoreResult<SeedUser> {
     const user = this.requireUser();
     if (!user.ok) return user;
-    return user.value.info.role === 'admin' ? user : forbidden('需要管理员权限');
+    return user.value.info.role === 'admin' ? user : authForbidden('需要管理员权限');
   }
 
   // —— Token ——
@@ -537,7 +649,7 @@ export class DevmockStore {
     if (!user.ok) return user;
     const uid = user.value.info.id;
     const index = this.tokens.findIndex((t) => t.info.id === id && t.userId === uid);
-    if (index < 0) return notFound('Token 不存在');
+    if (index < 0) return fail(404, 'AUTH_TOKEN_NOT_FOUND', 'Token 不存在');
     this.tokens.splice(index, 1);
     return ok(null);
   }
@@ -558,7 +670,7 @@ export class DevmockStore {
     const admin = this.requireAdmin();
     if (!admin.ok) return admin;
     if (this.users.some((u) => u.info.username === req.username)) {
-      return fail(409, 'USERNAME_TAKEN', '用户名已存在');
+      return fail(409, 'AUTH_USERNAME_TAKEN', '用户名已存在');
     }
     const id = this.users.reduce((max, u) => Math.max(max, u.info.id), 0) + 1;
     const info: UserInfo = {
@@ -577,14 +689,18 @@ export class DevmockStore {
     const admin = this.requireAdmin();
     if (!admin.ok) return admin;
     const user = this.users.find((u) => u.info.id === id);
-    if (!user) return notFound('用户不存在');
+    if (!user) return fail(404, 'AUTH_USER_NOT_FOUND', '用户不存在');
     if (this.wouldRemoveLastAdmin(user.info, req)) {
-      return fail(403, 'LAST_ADMIN_PROTECTED', '不能禁用或降级最后一名启用的管理员');
+      return fail(403, 'AUTH_LAST_ADMIN', '不能禁用或降级最后一名启用的管理员');
     }
     if (req.enabled != null) user.info.enabled = req.enabled;
     if (req.role != null) user.info.role = req.role;
-    // Admin 重置口令（M1-FR-045）：直接生效，旧口令立即失效
-    if (req.password != null) user.password = req.password;
+    // Admin 重置口令后旧口令与该用户全部既有会话立即失效
+    if (req.password != null) {
+      user.password = req.password;
+      this.revokeUserSessions(user.info.id);
+      if (this.directUserId === user.info.id) this.directUserId = null;
+    }
     return ok(user.info);
   }
 
@@ -593,9 +709,11 @@ export class DevmockStore {
     const current = this.requireUser();
     if (!current.ok) return current;
     if (current.value.password !== oldPassword) {
-      return fail(401, 'INVALID_CREDENTIALS', '旧口令错误');
+      return fail(401, 'AUTH_INVALID_CREDENTIALS', '旧口令错误');
     }
     current.value.password = newPassword;
+    this.revokeUserSessions(current.value.info.id);
+    if (this.directUserId === current.value.info.id) this.directUserId = null;
     return ok(null);
   }
 
@@ -952,7 +1070,7 @@ export function createStore(id: ScenarioId): DevmockStore {
   return new DevmockStore(id);
 }
 
-/** 切换场景：清除持久化任务（视为全新后端）并原地重建为目标场景种子（模块级引用保持不变）。 */
+/** 切换场景：清除持久化运行时状态并原地重建为目标场景种子（模块级引用保持不变）。 */
 export function switchScenario(store: DevmockStore, id: ScenarioId): void {
   store.clearPersistedTasks();
   store.resetTo(id);

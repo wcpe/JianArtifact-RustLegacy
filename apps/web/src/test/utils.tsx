@@ -34,10 +34,14 @@ export function renderWithProviders(ui: ReactElement, options: RenderOptions = {
 export async function loginAs(username: string, password: string): Promise<void> {
   const session = await authApi.login({ username, password });
   setSessionToken(session.token);
-  const role: 'admin' | 'user' = username === 'admin' ? 'admin' : 'user';
+  const info = await authApi.me();
   localStorage.setItem(
     AUTH_STORAGE_KEY,
-    JSON.stringify({ token: session.token, user: { username, role } }),
+    JSON.stringify({
+      token: session.token,
+      user: { username: info.username, role: info.role },
+      identity_source: 'me',
+    }),
   );
 }
 

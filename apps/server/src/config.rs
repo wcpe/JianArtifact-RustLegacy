@@ -19,6 +19,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// 日志级别过滤（tracing EnvFilter 语法，如 `info`）。
     pub log_level: String,
+    /// JWT HS256 会话令牌签名密钥（机密，仅经环境变量注入，缺失即拒绝启动，不落库不进日志）。
+    pub jwt_secret: String,
+    /// 会话令牌有效期（小时），默认 8。
+    pub session_ttl_hours: u64,
 }
 
 impl Default for Config {
@@ -28,6 +32,9 @@ impl Default for Config {
             database_path: PathBuf::from("data/jianartifact.db"),
             data_dir: PathBuf::from("data/blobs"),
             log_level: "info".to_string(),
+            // 密钥无内置默认值，须经环境变量注入；空值在 build_app 处被拒绝启动
+            jwt_secret: String::new(),
+            session_ttl_hours: 8,
         }
     }
 }

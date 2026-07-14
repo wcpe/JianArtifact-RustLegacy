@@ -13,4 +13,6 @@ pub struct AppState {
     pub pool: SqlitePool,
     /// 运行配置（只读共享）。
     pub config: Arc<Config>,
+    /// 认证运行时（JWT 密钥、会话时长、Basic 口令缓存）。
+    pub auth: Arc<crate::auth::AuthRuntime>,
 }

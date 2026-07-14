@@ -21,7 +21,7 @@ if (typeof Element.prototype.releasePointerCapture !== 'function') {
   Element.prototype.releasePointerCapture = () => {};
 }
 
-const server = createDevmockServer();
+export const server = createDevmockServer();
 
 beforeAll(() => {
   server.listen({ onUnhandledRequest: 'error' });

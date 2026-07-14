@@ -54,11 +54,7 @@ test('修改口令后同一页面会话内用新口令重新登录', async ({ pa
   await page.fill('#password-new', 'e2e-new-pass');
   await page.fill('#password-confirm', 'e2e-new-pass');
   await page.getByRole('button', { name: '确认修改' }).click();
-  await expect(page.getByText('修改成功', { exact: true })).toBeVisible();
-  // 关闭模态框（成功后不自动关闭），再经用户菜单退出登录（SPA 导航、devmock 内存新口令仍存活）
-  await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: /admin/ }).click();
-  await page.getByRole('menuitem', { name: '退出登录' }).click();
+  // 改密会撤销全部既有会话，前端应立即清理本地身份并返回登录页
   await expect(page.getByRole('heading', { name: '登录 JianArtifact' })).toBeVisible();
   // 同一页面会话内用新口令登录成功
   await page.fill('#login-username', 'admin');

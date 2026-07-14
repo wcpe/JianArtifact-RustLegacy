@@ -16,6 +16,6 @@ describe('仪表盘', () => {
     expect(await screen.findByText('仓库总数')).toBeInTheDocument();
     // 默认场景有六个仓库，数值唯一可断言
     expect(screen.getByText('6')).toBeInTheDocument();
-    expect(screen.getByText('迁移任务数')).toBeInTheDocument();
+    expect(await screen.findByText('迁移任务数')).toBeInTheDocument();
   });
 });

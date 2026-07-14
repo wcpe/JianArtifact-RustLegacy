@@ -1,6 +1,7 @@
 //! 管理 API 路由装配与 OpenAPI 文档（ADR-0012：utoipa 生成的 OpenAPI 是契约唯一真源）。
 
 pub mod auth;
+pub mod extractor;
 pub mod migration;
 pub mod repos;
 pub mod tokens;
@@ -8,11 +9,40 @@ pub mod users;
 
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use utoipa::OpenApi;
 
 use crate::health;
 use crate::state::AppState;
+
+/// 列表接口每页默认条数（未显式指定 page_size 时采用）。
+pub(crate) const DEFAULT_PAGE_SIZE: u32 = 50;
+/// 列表接口每页条数上限（NFR-16，超出按上限执行）。
+pub(crate) const MAX_PAGE_SIZE: u32 = 200;
+
+/// 列表分页查询参数（用户 / Token 列表共用）：page 默认 1、page_size 默认 50 上限 200。
+#[derive(Debug, Deserialize)]
+pub struct PageQuery {
+    /// 页码，从 1 起。
+    pub page: Option<u32>,
+    /// 每页条数。
+    pub page_size: Option<u32>,
+    /// 名称子串筛选（可选）。
+    pub q: Option<String>,
+}
+
+impl PageQuery {
+    /// 应用默认值与上限，返回生效的 (page, page_size)。
+    pub(crate) fn resolve(&self) -> (u32, u32) {
+        let page = self.page.unwrap_or(1).max(1);
+        let page_size = self
+            .page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        (page, page_size)
+    }
+}
 
 /// 管理 API 的 OpenAPI 文档定义：新增端点必须同步登记到此处。
 #[derive(OpenApi)]
@@ -28,6 +58,7 @@ use crate::state::AppState;
         auth::refresh,
         auth::logout,
         auth::change_password,
+        auth::me,
         tokens::create,
         tokens::list,
         tokens::revoke,
@@ -84,6 +115,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/refresh", post(auth::refresh))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/password", post(auth::change_password))
+        .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/tokens", post(tokens::create).get(tokens::list))
         .route("/api/v1/tokens/{id}", delete(tokens::revoke))
         .route("/api/v1/users", get(users::list).post(users::create))

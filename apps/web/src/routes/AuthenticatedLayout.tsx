@@ -101,7 +101,7 @@ function collapsibleText(collapsed: boolean): string {
 }
 
 export function AuthenticatedLayout() {
-  const { user, isAdmin, logout } = useAuth();
+  const { user, isAdmin, logout, clearLocalSession } = useAuth();
   const { refresh, refreshing, hasRefresh } = useRefresh();
   const navigate = useNavigate();
   // 侧栏折叠态：折叠后仅图标 rail（宽 64px），展开为完整宽（256px）
@@ -126,6 +126,11 @@ export function AuthenticatedLayout() {
 
   const handleLogout = async () => {
     await logout();
+    navigate('/login', { replace: true });
+  };
+
+  const handlePasswordChanged = () => {
+    clearLocalSession();
     navigate('/login', { replace: true });
   };
 
@@ -318,7 +323,11 @@ export function AuthenticatedLayout() {
       </div>
 
       {/* 修改口令模态框（受控，由用户菜单触发） */}
-      <ChangePasswordDialog open={pwdOpen} onOpenChange={setPwdOpen} />
+      <ChangePasswordDialog
+        open={pwdOpen}
+        onOpenChange={setPwdOpen}
+        onSuccess={handlePasswordChanged}
+      />
     </div>
   );
 }

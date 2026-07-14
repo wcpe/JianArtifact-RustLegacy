@@ -49,7 +49,7 @@
 - [x] FR-044：四应用工程脚手架 + ui 首批 shadcn 组件（容器内 CLI 拉取 Button，官方源为 radix-ui 统一包、导入改相对路径供源码消费）+ wiki 预览矩阵 + devmock 双端骨架（MSW 谓词带 * 通配源站，Node 端无 baseURI 不匹配相对路径）
 - [x] FR-044：容器内生成并提交 pnpm-lock.yaml；quality-gate.sh 前端段补 prettier 检查
 - [x] FR-044 验收（2026-07-12）：16 个 turbo 任务真实执行全绿；红→绿证据三组（Prettier 拦截真实格式违规、TS 未用变量 exit 2、ESLint any exit 1）；wiki 产物含 Button 标记；devmock worker 随构建产出；宿主 target/node_modules/.pnpm-store/.turbo 全为空挂载点
-- [x] FR-035（2026-07-13）：openapi-typescript 类型生成接线、有状态数据模型、七类场景包、web 显式开关（VITE_MOCK 构建期常量守卫，生产产物零 mock 与测试凭据）、契约双向硬断言（无幻影 + 全量覆盖 32 operation）；迁移任务加 localStorage 持久化模拟 FR-029，使刷新找回对 mock 成立
+- [x] FR-035（2026-07-13）：openapi-typescript 类型生成接线、有状态数据模型、七类场景包、web 显式开关（VITE_MOCK 构建期常量守卫，生产产物零 mock 与测试凭据）、契约双向硬断言（无幻影 + 全量覆盖当前 34 operation）；迁移任务加 localStorage 持久化模拟 FR-029，使刷新找回对 mock 成立
 - [x] FR-036（2026-07-13）：ui 四层 21 组件 + wiki 组件 × 状态矩阵（正常/加载/空/错误/无权限/超长文本/大数据量）；组件先在 wiki 预览、web 页面具名消费
 - [ ] 文档同步：PRD 状态流转、ARCHITECTURE §2.1（如结构细化）、CHANGELOG 未发布段
 

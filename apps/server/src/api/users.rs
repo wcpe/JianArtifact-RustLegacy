@@ -1,20 +1,20 @@
-//! 用户管理契约骨架（M1-FR-006，Admin 专属）：列表、新增、启停与角色调整。
-//! 阶段 1 handler 返回未实现；最后一名启用 Admin 保护等规则随阶段 3 落地。
+//! 用户管理接口（M1-FR-006，Admin 专属）：列表、新增、启停与角色调整、重置口令。
+//! 入口层只做 HTTP 适配：RequireAdmin 提取器 + 请求体 / 查询 / 路径，调领域服务，不写裸 SQL。
 
+use axum::Json;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::api::PageQuery;
+use crate::api::extractor::RequireAdmin;
 use crate::error::ApiError;
+use crate::persistence::User;
+use crate::state::AppState;
 
-/// 全局角色。
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// 管理员：全局管理权限。
-    Admin,
-    /// 普通用户：按仓库 ACL 访问。
-    User,
-}
+/// 全局角色（定义下移至领域层，此处再导出保持 OpenAPI schema 名为 "Role"）。
+pub use crate::domain::Role;
 
 /// 用户信息。
 #[derive(Debug, Serialize, ToSchema)]
@@ -29,6 +29,19 @@ pub struct UserInfo {
     pub enabled: bool,
     /// 创建时间。
     pub created_at: String,
+}
+
+impl From<User> for UserInfo {
+    /// 由仓储用户实体映射为对外信息（不含口令哈希与会话版本）。
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            enabled: user.enabled,
+            created_at: user.created_at,
+        }
+    }
 }
 
 /// 创建用户请求体。
@@ -69,6 +82,7 @@ pub struct UserListResponse {
 /// 列出用户（分页，Admin）。
 #[utoipa::path(
     get,
+    operation_id = "users_list",
     path = "/api/v1/users",
     tag = "users",
     params(
@@ -81,13 +95,27 @@ pub struct UserListResponse {
         (status = 403, description = "无管理员权限", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn list() -> ApiError {
-    ApiError::not_implemented("用户列表接口待阶段 3 实现")
+pub async fn list(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<UserListResponse>, ApiError> {
+    let (page, page_size) = query.resolve();
+    let (users, total) =
+        crate::domain::list_users(&state.pool, page, page_size, query.q.as_deref()).await?;
+    let items = users.into_iter().map(UserInfo::from).collect();
+    Ok(Json(UserListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
 }
 
 /// 新增用户（Admin）。
 #[utoipa::path(
     post,
+    operation_id = "users_create",
     path = "/api/v1/users",
     tag = "users",
     request_body = CreateUserRequest,
@@ -97,13 +125,20 @@ pub async fn list() -> ApiError {
         (status = 409, description = "用户名已存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn create() -> ApiError {
-    ApiError::not_implemented("用户新增接口待阶段 3 实现")
+pub async fn create(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<UserInfo>), ApiError> {
+    let user =
+        crate::domain::create_user(&state.pool, &req.username, &req.password, req.role).await?;
+    Ok((StatusCode::CREATED, Json(UserInfo::from(user))))
 }
 
 /// 更新用户启停与角色（Admin）。
 #[utoipa::path(
     patch,
+    operation_id = "users_update",
     path = "/api/v1/users/{id}",
     tag = "users",
     params(("id" = i64, Path, description = "用户标识")),
@@ -114,6 +149,13 @@ pub async fn create() -> ApiError {
         (status = 404, description = "用户不存在", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn update() -> ApiError {
-    ApiError::not_implemented("用户更新接口待阶段 3 实现")
+pub async fn update(
+    _admin: RequireAdmin,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateUserRequest>,
+) -> Result<Json<UserInfo>, ApiError> {
+    let user =
+        crate::domain::update_user(&state.pool, id, req.enabled, req.role, req.password).await?;
+    Ok(Json(UserInfo::from(user)))
 }
