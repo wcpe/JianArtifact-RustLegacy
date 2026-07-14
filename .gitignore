@@ -35,9 +35,11 @@ Thumbs.db
 .env.*
 !.env.example
 
-# MSW 浏览器 worker（由 msw init 生成，第三方生成文件不入库）
+# MSW 浏览器 worker（由 msw init 生成，第三方生成文件不入库）；web favicon 作为产品静态资产入库
 packages/devmock/public/
-apps/web/public/
+apps/web/public/*
+!apps/web/public/favicon.svg
+!apps/web/public/favicon.ico
 
 # Playwright E2E 运行产物
 test-results/

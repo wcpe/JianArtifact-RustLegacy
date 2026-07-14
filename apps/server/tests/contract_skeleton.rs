@@ -6,6 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use jianartifact_server::api::repos::UpdateRepoRequest;
 use jianartifact_server::config::Config;
 use tower::util::ServiceExt;
 
@@ -127,7 +128,7 @@ async fn 契约文档全部端点均已挂载且方法一致() -> TestResult {
                 "{method} {path} 路由方法与契约不一致"
             );
             // 阶段 1 语义：健康端点真实现（200/503），其余为 501 占位且带稳定错误码
-            if status == StatusCode::NOT_IMPLEMENTED {
+            if status == StatusCode::NOT_IMPLEMENTED && method != "head" {
                 let body = resp.into_body().collect().await?.to_bytes();
                 let json: serde_json::Value = serde_json::from_slice(&body)?;
                 assert_eq!(
@@ -141,6 +142,55 @@ async fn 契约文档全部端点均已挂载且方法一致() -> TestResult {
     assert!(
         operations >= 30,
         "OpenAPI operation 数量异常：仅 {operations} 个"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn 仓库契约体现用户名_acl_显式清空_完整路径与格式端点() -> TestResult {
+    let (app, _dir) = test_app().await?;
+    let resp = send(&app, "GET", "/api/v1/openapi.json").await?;
+    let body = resp.into_body().collect().await?.to_bytes();
+    let doc: serde_json::Value = serde_json::from_slice(&body)?;
+
+    assert!(doc["paths"]["/api/v1/repos/{name}/acl/{username}"]["put"].is_object());
+    assert!(doc["paths"]["/api/v1/repos/{name}/acl/{username}"]["delete"].is_object());
+    assert!(doc["paths"]["/api/v1/repos/{name}/acl/{user_id}"].is_null());
+
+    let update = &doc["components"]["schemas"]["UpdateRepoRequest"]["properties"];
+    assert!(update["version_policy"].is_object());
+    let credential_type = &update["upstream_credential_ref"]["type"];
+    assert!(
+        credential_type
+            .as_array()
+            .is_some_and(|types| types.contains(&serde_json::json!("null")))
+    );
+
+    let file_required = doc["components"]["schemas"]["FileEntry"]["required"]
+        .as_array()
+        .ok_or("FileEntry.required 缺失")?;
+    assert!(file_required.contains(&serde_json::json!("path")));
+
+    for method in ["get", "head", "put", "delete"] {
+        assert!(
+            doc["paths"]["/repository/{name}/{path}"][method].is_object(),
+            "格式端点缺少 {method} 契约"
+        );
+        let response = send(&app, &method.to_uppercase(), "/repository/demo/file.bin").await?;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+    Ok(())
+}
+
+#[test]
+fn 仓库_patch_区分凭据引用缺失与显式_null() -> TestResult {
+    let missing: UpdateRepoRequest = serde_json::from_value(serde_json::json!({}))?;
+    let cleared: UpdateRepoRequest =
+        serde_json::from_value(serde_json::json!({ "upstream_credential_ref": null }))?;
+    assert_eq!(format!("{:?}", missing.upstream_credential_ref), "None");
+    assert_eq!(
+        format!("{:?}", cleared.upstream_credential_ref),
+        "Some(None)"
     );
     Ok(())
 }

@@ -297,7 +297,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/repos/{name}/acl/{user_id}": {
+    "/api/v1/repos/{name}/acl/{username}": {
         parameters: {
             query?: never;
             header?: never;
@@ -305,10 +305,10 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** 设置某用户的 ACL（仓库 admin）。 */
+        /** 按用户名设置某用户的 ACL（仓库 admin）。 */
         put: operations["acl_set"];
         post?: never;
-        /** 移除某用户的 ACL（仓库 admin）。 */
+        /** 按用户名移除某用户的 ACL（仓库 admin）。 */
         delete: operations["acl_remove"];
         options?: never;
         head?: never;
@@ -470,6 +470,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/repository/{name}/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 读取仓库路径内容。 */
+        get: operations["repository_get"];
+        /** 向仓库路径写入内容。 */
+        put: operations["repository_put"];
+        post?: never;
+        /** 删除仓库路径内容。 */
+        delete: operations["repository_delete"];
+        options?: never;
+        /** 探测仓库路径内容元数据。 */
+        head: operations["repository_head"];
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -497,18 +517,20 @@ export interface components {
         CreateRepoRequest: {
             /** @description 制品格式（创建后不可变）。 */
             format: components["schemas"]["Format"];
-            /** @description group 成员（group 必填，有序，须同格式 hosted/proxy）。 */
-            members?: string[] | null;
+            /** @description group 成员（group 必填，有序，须同格式 hosted/proxy；提供时不可为 null）。 */
+            members?: string[];
             /** @description 仓库名：小写字母/数字/连字符，1–64 字符，创建后不可改。 */
             name: string;
-            overwrite_policy?: null | components["schemas"]["OverwritePolicy"];
+            /** @description 覆盖策略（hosted，可选按格式默认；提供时不可为 null）。 */
+            overwrite_policy?: components["schemas"]["OverwritePolicy"];
             /** @description 仓库类型（创建后不可变）。 */
             repo_type: components["schemas"]["RepoType"];
             /** @description proxy 上游凭据引用名（可选）。 */
             upstream_credential_ref?: string | null;
-            /** @description proxy 上游地址（proxy 必填）。 */
-            upstream_url?: string | null;
-            version_policy?: null | components["schemas"]["VersionPolicy"];
+            /** @description proxy 上游地址（proxy 必填；提供时不可为 null）。 */
+            upstream_url?: string;
+            /** @description Maven 版本策略（Maven hosted，默认 mixed；提供时不可为 null）。 */
+            version_policy?: components["schemas"]["VersionPolicy"];
             /** @description 可见性。 */
             visibility: components["schemas"]["Visibility"];
         };
@@ -624,8 +646,10 @@ export interface components {
             is_dir: boolean;
             /** @description md5 校验和（文件，Maven 生态）。 */
             md5?: string | null;
-            /** @description 条目名。 */
+            /** @description 条目名（不含父目录）。 */
             name: string;
+            /** @description 仓库根相对完整路径；客户端不得自行拼接。 */
+            path: string;
             /** @description sha1 校验和（文件，Maven 生态）。 */
             sha1?: string | null;
             /** @description sha256 校验和（文件）。 */
@@ -1014,16 +1038,20 @@ export interface components {
         };
         /** @description 编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。 */
         UpdateRepoRequest: {
-            /** @description 停用/启用。 */
-            disabled?: boolean | null;
-            /** @description group 成员（整体替换，有序）。 */
-            members?: string[] | null;
-            overwrite_policy?: null | components["schemas"]["OverwritePolicy"];
-            /** @description proxy 上游凭据引用名。 */
+            /** @description 停用/启用；提供时不可为 null。 */
+            disabled?: boolean;
+            /** @description group 成员（整体替换且保持顺序；空数组清空，提供时不可为 null）。 */
+            members?: string[];
+            /** @description hosted 覆盖策略；提供时不可为 null。 */
+            overwrite_policy?: components["schemas"]["OverwritePolicy"];
+            /** @description proxy 上游凭据引用名：缺失不更新，字符串替换，显式 null 清空。 */
             upstream_credential_ref?: string | null;
-            /** @description proxy 上游地址。 */
-            upstream_url?: string | null;
-            visibility?: null | components["schemas"]["Visibility"];
+            /** @description proxy 上游地址；提供时不可为 null。 */
+            upstream_url?: string;
+            /** @description Maven hosted 版本策略；提供时不可为 null。 */
+            version_policy?: components["schemas"]["VersionPolicy"];
+            /** @description 可见性；提供时不可为 null。 */
+            visibility?: components["schemas"]["Visibility"];
         };
         /** @description 更新用户请求体：字段可选，只更新给出的项。 */
         UpdateUserRequest: {
@@ -1818,8 +1846,8 @@ export interface operations {
             path: {
                 /** @description 仓库名 */
                 name: string;
-                /** @description 用户标识 */
-                user_id: number;
+                /** @description 精确用户名 */
+                username: string;
             };
             cookie?: never;
         };
@@ -1856,8 +1884,8 @@ export interface operations {
             path: {
                 /** @description 仓库名 */
                 name: string;
-                /** @description 用户标识 */
-                user_id: number;
+                /** @description 精确用户名 */
+                username: string;
             };
             cookie?: never;
         };
@@ -2262,6 +2290,106 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    repository_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+                /** @description 仓库根相对完整路径 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 格式协议读取待对应域实现 */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+                /** @description 仓库根相对完整路径 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 格式协议写入待对应域实现 */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+                /** @description 仓库根相对完整路径 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 格式协议删除待对应域实现 */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    repository_head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 仓库名 */
+                name: string;
+                /** @description 仓库根相对完整路径 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 格式协议探测待对应域实现 */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
         };
     };

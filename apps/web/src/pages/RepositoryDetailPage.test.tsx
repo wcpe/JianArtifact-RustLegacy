@@ -1,7 +1,10 @@
 // 仓库详情测试：三标签页与 hash 映射、文件浏览（M1-FR-019）、校验和/下载、配置保存与 ACL 增删。
 import { fireEvent, screen, within } from '@testing-library/react';
+import { http, HttpResponse } from 'msw';
 import { Route, Routes } from 'react-router-dom';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { repoApi } from '../api/endpoints';
+import { server } from '../test/setup';
 import { loginAs, renderWithProviders, resetScenario } from '../test/utils';
 import { RepositoryDetailPage } from './RepositoryDetailPage';
 
@@ -85,6 +88,51 @@ describe('仓库详情', () => {
     expect(screen.getByText('application/pdf')).toBeInTheDocument();
   });
 
+  it('文件树直接信任接口返回的完整 path，不按父目录与名称重新拼接', async () => {
+    server.use(
+      http.get('*/api/v1/repos/raw-hosted/files', ({ request }) => {
+        const path = new URL(request.url).searchParams.get('path') ?? '';
+        if (path === '') {
+          return HttpResponse.json({
+            items: [{ name: 'docs', path: 'canonical-docs', is_dir: true }],
+            page: 1,
+            page_size: 200,
+            total: 1,
+          });
+        }
+        if (path === 'canonical-docs') {
+          return HttpResponse.json({
+            items: [
+              {
+                name: 'manual.pdf',
+                path: 'canonical-docs/manual.pdf',
+                is_dir: false,
+                size: 1024,
+                content_type: 'application/pdf',
+              },
+            ],
+            page: 1,
+            page_size: 200,
+            total: 1,
+          });
+        }
+        return HttpResponse.json({ code: 'NOT_FOUND', message: '路径不存在' }, { status: 404 });
+      }),
+    );
+
+    renderDetail();
+    const tree = await screen.findByRole('tree');
+    fireEvent.click(within(tree).getByRole('button', { name: 'docs' }));
+    fireEvent.click(await within(tree).findByRole('button', { name: 'manual.pdf' }));
+    expect(
+      await screen.findByRole('heading', { name: 'canonical-docs/manual.pdf' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '下载' })).toHaveAttribute(
+      'href',
+      '/repository/raw-hosted/canonical-docs/manual.pdf',
+    );
+  });
+
   it('选中文件后展示元数据、校验和卡与下载按钮', async () => {
     renderDetail();
     await selectManualPdf();
@@ -153,7 +201,9 @@ describe('仓库详情', () => {
     expect(await screen.findByText('仅仓库管理员可查看与管理访问授权')).toBeInTheDocument();
   });
 
-  it('权限标签页可添加并移除授权', async () => {
+  it('权限标签页按用户名添加并移除授权', async () => {
+    const setSpy = vi.spyOn(repoApi, 'aclSet');
+    const removeSpy = vi.spyOn(repoApi, 'aclRemove');
     renderDetail('/repos/raw-hosted?tab=acl');
     expect(await screen.findByText(/暂无授权/)).toBeInTheDocument();
     // 选择用户 dev（默认权限档位 read）后添加
@@ -161,9 +211,11 @@ describe('仓库详情', () => {
     fireEvent.click(screen.getByRole('button', { name: '添加' }));
     const table = screen.getByRole('table');
     expect(await within(table).findByText('dev')).toBeInTheDocument();
+    expect(setSpy).toHaveBeenCalledWith('raw-hosted', 'dev', 'read');
     expect(within(table).getByText('读')).toBeInTheDocument();
     // 移除后回到空态
     fireEvent.click(within(table).getByRole('button', { name: '移除' }));
     expect(await screen.findByText(/暂无授权/)).toBeInTheDocument();
+    expect(removeSpy).toHaveBeenCalledWith('raw-hosted', 'dev');
   });
 });

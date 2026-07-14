@@ -1,6 +1,6 @@
 # 功能规格：Maven 协议——hosted 与 proxy（M1-FR-015~016）
 
-> 状态：草拟　·　关联 PRD：M1-FR-015、M1-FR-016　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
+> 状态：已批准 / 开发中　·　关联 PRD：M1-FR-015、M1-FR-016　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
 
 ## 1. 背景与目标
 
@@ -20,7 +20,7 @@
 - **checksum sidecar 不落盘、动态生成**（沿用已验证的权威元数据设计）：
   - `GET *.sha1 / *.md5 / *.sha256`：从制品索引的校验和实时生成（写入时单遍流式已算好，见核心规格 FR-010）；
   - 客户端 `PUT *.sha1 / *.md5`：与库中值比对——一致则接受（200，不另存），不一致返回 400 拒绝（防止传输损坏落库）。
-- **两级 maven-metadata.xml 由服务端权威生成**，客户端 PUT 的 metadata 被接受但内容忽略（并发 deploy 下客户端各自生成的 metadata 互相丢失更新，服务端推导才可靠）：
+- **两级 maven-metadata.xml 由服务端权威生成**。客户端 PUT 的 metadata 以及该 metadata 的 `.sha1/.md5/.sha256` sidecar 一律接受但忽略内容（不落盘、不参与校验；并发 deploy 下客户端各自生成的 metadata 会互相丢失更新，服务端推导才可靠）：
   - artifact 级：versions 列表、latest、release（最新非 SNAPSHOT）、lastUpdated，由该坐标下已有版本实时推导；
   - snapshot 版本级：timestamp、buildNumber、snapshotVersions（按 extension/classifier），由该版本目录下 timestamped 文件实时推导；
   - 版本排序遵循 Maven ComparableVersion 规则（qualifier 语义），实现自带对照官方样例的测试集。
@@ -43,7 +43,7 @@
 
 ## 4. 任务拆分
 
-- [ ] 阶段 1：maven 路由契约骨架（构件五动词、两级 metadata、sidecar 端点族）
+- [x] 阶段 1：通用格式路径 GET/HEAD/PUT/DELETE 已纳入同一 OpenAPI 并挂载 501 占位；Maven metadata/sidecar 端点族由同一通配路径承载，具体协议语义随阶段 3 实现。
 - [ ] 阶段 3（测试先行）：布局解析与 ComparableVersion 纯函数 + 官方样例测试集
 - [ ] 阶段 3：hosted——版本策略、release 覆盖语义、sidecar 上传核验、两级 metadata 权威生成（含并发 deploy 场景）
 - [ ] 阶段 3：proxy——构件永久缓存、metadata TTL 与 stale-if-error、上游 sidecar 核验

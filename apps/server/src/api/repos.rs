@@ -1,7 +1,7 @@
 //! 仓库域契约骨架（M1-FR-007~009、019~020）：仓库生命周期、ACL、浏览、搜索与使用片段。
 //! 阶段 1 只定契约，handler 返回未实现；业务逻辑随阶段 3 落地（见 docs/specs/m1-repository-core.md）。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::error::ApiError;
@@ -74,6 +74,15 @@ pub enum Permission {
     Admin,
 }
 
+/// 反序列化 PATCH 的可空字段：缺失为 None，显式 null 为 Some(None)。
+fn deserialize_optional_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// 仓库信息。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepoInfo {
@@ -116,32 +125,46 @@ pub struct CreateRepoRequest {
     pub repo_type: RepoType,
     /// 可见性。
     pub visibility: Visibility,
-    /// 覆盖策略（hosted，可选按格式默认）。
+    /// 覆盖策略（hosted，可选按格式默认；提供时不可为 null）。
+    #[schema(nullable = false)]
     pub overwrite_policy: Option<OverwritePolicy>,
-    /// Maven 版本策略（Maven hosted，默认 mixed）。
+    /// Maven 版本策略（Maven hosted，默认 mixed；提供时不可为 null）。
+    #[schema(nullable = false)]
     pub version_policy: Option<VersionPolicy>,
-    /// proxy 上游地址（proxy 必填）。
+    /// proxy 上游地址（proxy 必填；提供时不可为 null）。
+    #[schema(nullable = false)]
     pub upstream_url: Option<String>,
     /// proxy 上游凭据引用名（可选）。
     pub upstream_credential_ref: Option<String>,
-    /// group 成员（group 必填，有序，须同格式 hosted/proxy）。
+    /// group 成员（group 必填，有序，须同格式 hosted/proxy；提供时不可为 null）。
+    #[schema(nullable = false)]
     pub members: Option<Vec<String>>,
 }
 
 /// 编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateRepoRequest {
-    /// 可见性。
+    /// 可见性；提供时不可为 null。
+    #[schema(nullable = false)]
     pub visibility: Option<Visibility>,
-    /// 停用/启用。
+    /// 停用/启用；提供时不可为 null。
+    #[schema(nullable = false)]
     pub disabled: Option<bool>,
-    /// 覆盖策略。
+    /// hosted 覆盖策略；提供时不可为 null。
+    #[schema(nullable = false)]
     pub overwrite_policy: Option<OverwritePolicy>,
-    /// proxy 上游地址。
+    /// Maven hosted 版本策略；提供时不可为 null。
+    #[schema(nullable = false)]
+    pub version_policy: Option<VersionPolicy>,
+    /// proxy 上游地址；提供时不可为 null。
+    #[schema(nullable = false)]
     pub upstream_url: Option<String>,
-    /// proxy 上游凭据引用名。
-    pub upstream_credential_ref: Option<String>,
-    /// group 成员（整体替换，有序）。
+    /// proxy 上游凭据引用名：缺失不更新，字符串替换，显式 null 清空。
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    #[schema(nullable = true)]
+    pub upstream_credential_ref: Option<Option<String>>,
+    /// group 成员（整体替换且保持顺序；空数组清空，提供时不可为 null）。
+    #[schema(nullable = false)]
     pub members: Option<Vec<String>>,
 }
 
@@ -198,8 +221,10 @@ pub struct SetAclRequest {
 /// 浏览条目（目录或文件）。
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FileEntry {
-    /// 条目名。
+    /// 条目名（不含父目录）。
     pub name: String,
+    /// 仓库根相对完整路径；客户端不得自行拼接。
+    pub path: String,
     /// 是否目录。
     pub is_dir: bool,
     /// 文件大小（字节，目录为空）。
@@ -343,14 +368,14 @@ pub async fn acl_list() -> ApiError {
     ApiError::not_implemented("ACL 列表接口待阶段 3 实现")
 }
 
-/// 设置某用户的 ACL（仓库 admin）。
+/// 按用户名设置某用户的 ACL（仓库 admin）。
 #[utoipa::path(
     put,
-    path = "/api/v1/repos/{name}/acl/{user_id}",
+    path = "/api/v1/repos/{name}/acl/{username}",
     tag = "repos",
     params(
         ("name" = String, Path, description = "仓库名"),
-        ("user_id" = i64, Path, description = "用户标识"),
+        ("username" = String, Path, description = "精确用户名"),
     ),
     request_body = SetAclRequest,
     responses(
@@ -362,14 +387,14 @@ pub async fn acl_set() -> ApiError {
     ApiError::not_implemented("ACL 设置接口待阶段 3 实现")
 }
 
-/// 移除某用户的 ACL（仓库 admin）。
+/// 按用户名移除某用户的 ACL（仓库 admin）。
 #[utoipa::path(
     delete,
-    path = "/api/v1/repos/{name}/acl/{user_id}",
+    path = "/api/v1/repos/{name}/acl/{username}",
     tag = "repos",
     params(
         ("name" = String, Path, description = "仓库名"),
-        ("user_id" = i64, Path, description = "用户标识"),
+        ("username" = String, Path, description = "精确用户名"),
     ),
     responses(
         (status = 204, description = "已移除"),

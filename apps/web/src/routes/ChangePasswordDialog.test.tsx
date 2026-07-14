@@ -26,6 +26,22 @@ describe('修改口令模态框', () => {
     await loginAs('admin', 'admin123');
   });
 
+  it('口令输入使用修改口令专用 autocomplete', async () => {
+    renderDialog();
+    expect(await screen.findByLabelText('旧口令')).toHaveAttribute(
+      'autocomplete',
+      'section-change-password current-password',
+    );
+    expect(screen.getByLabelText('新口令')).toHaveAttribute(
+      'autocomplete',
+      'section-change-password new-password',
+    );
+    expect(screen.getByLabelText('确认新口令')).toHaveAttribute(
+      'autocomplete',
+      'section-change-password new-password',
+    );
+  });
+
   it('旧口令正确时修改成功并展示成功提示', async () => {
     renderDialog();
     await submit('admin123', 'new-pass-1', 'new-pass-1');

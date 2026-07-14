@@ -26,7 +26,9 @@
 - 双端运行：浏览器 MSW worker（供 web 显式开关连接）与 Node 端（供测试与独立运行）。
 - 契约一致：请求/响应模型来自 utoipa OpenAPI 生成的 TS 类型（阶段 1 接线 openapi-typescript），契约比对测试断言 handlers 与 OpenAPI 端点集一致，防手工漂移（ADR-0012）。
 - 有状态内存数据 + 场景包，至少：默认数据、空实例、权限受限、上游失败、迁移进行中、迁移部分失败、大仓库分页（分页量按 NFR-16 覆盖 > 2 整页）。
-- web 仅在显式开发开关（构建期 `VITE_MOCK` + 运行时 URL/localStorage）下连接 devmock；生产构建默认关闭且不打包 mock worker 与任何测试凭据。
+- web 仅在 `VITE_MOCK=true` 显式开关下连接 devmock；默认开发经 Vite 代理把 `/api`、`/repository`、`/healthz`、`/readyz` 转发到本地 Rust。生产构建关闭且不打包 mock worker 与任何测试凭据。
+- `apps/web/public` 的 favicon 静态资产必须在 MSW worker 初始化后仍保留；登录、改密、创建/重置用户与迁移源凭据输入须使用符合浏览器密码管理器语义的 autocomplete。
+- Playwright 保留 devmock 通道，并提供独立真实后端通道：启动隔离 SQLite/Rust 服务，至少覆盖认证、Token、用户与改密闭环。
 
 **FR-036 wiki 验收站（壳随 044，覆盖与验收在阶段 2）**
 
@@ -49,7 +51,8 @@
 - [x] FR-044：四应用工程脚手架 + ui 首批 shadcn 组件（容器内 CLI 拉取 Button，官方源为 radix-ui 统一包、导入改相对路径供源码消费）+ wiki 预览矩阵 + devmock 双端骨架（MSW 谓词带 * 通配源站，Node 端无 baseURI 不匹配相对路径）
 - [x] FR-044：容器内生成并提交 pnpm-lock.yaml；quality-gate.sh 前端段补 prettier 检查
 - [x] FR-044 验收（2026-07-12）：16 个 turbo 任务真实执行全绿；红→绿证据三组（Prettier 拦截真实格式违规、TS 未用变量 exit 2、ESLint any exit 1）；wiki 产物含 Button 标记；devmock worker 随构建产出；宿主 target/node_modules/.pnpm-store/.turbo 全为空挂载点
-- [x] FR-035（2026-07-13）：openapi-typescript 类型生成接线、有状态数据模型、七类场景包、web 显式开关（VITE_MOCK 构建期常量守卫，生产产物零 mock 与测试凭据）、契约双向硬断言（无幻影 + 全量覆盖当前 34 operation）；迁移任务加 localStorage 持久化模拟 FR-029，使刷新找回对 mock 成立
+- [x] FR-035（2026-07-13）：openapi-typescript 类型生成接线、有状态数据模型、七类场景包、web 显式开关（VITE_MOCK 构建期常量守卫，生产产物零 mock 与测试凭据）、契约双向硬断言（无幻影 + 全量覆盖管理 API）；迁移任务加 localStorage 持久化模拟 FR-029，使刷新找回对 mock 成立
+- [x] 阶段 3 批次 0（2026-07-14）：VITE_MOCK 收紧为仅显式 true，默认 Vite 代理真连 Rust；新增隔离真实后端 Playwright 通道；favicon 静态资产与全部敏感输入 autocomplete 回归；仪表盘三卡独立 loading/error，单个 501 不遮蔽其他成功数据。
 - [x] FR-036（2026-07-13）：ui 四层 21 组件 + wiki 组件 × 状态矩阵（正常/加载/空/错误/无权限/超长文本/大数据量）；组件先在 wiki 预览、web 页面具名消费
 - [ ] 文档同步：PRD 状态流转、ARCHITECTURE §2.1（如结构细化）、CHANGELOG 未发布段
 

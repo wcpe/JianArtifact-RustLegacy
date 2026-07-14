@@ -10,6 +10,13 @@ import { MigrationPage } from './MigrationPage';
 type DiscoveryResult = components['schemas']['DiscoveryResult'];
 type MigrationPlan = components['schemas']['MigrationPlan'];
 
+// jsdom 无真实指针事件：键盘打开 Radix Select 并选择指定选项
+async function selectSourceKind(optionName: string) {
+  fireEvent.keyDown(screen.getByRole('combobox', { name: '来源类别' }), { key: 'ArrowDown' });
+  const option = await screen.findByRole('option', { name: optionName });
+  fireEvent.keyDown(option, { key: 'Enter' });
+}
+
 // 最小可用的发现结果夹具（含一个源仓库供映射明细 join）
 function discoveryFixture(): DiscoveryResult {
   return {
@@ -72,9 +79,16 @@ describe('迁移向导', () => {
     expect(screen.queryByLabelText('Nexus 口令')).not.toBeInTheDocument();
     // 填写地址后出现账号口令输入与「不保存」帮助文案
     fireEvent.change(urlInput, { target: { value: 'https://nexus.example.com' } });
-    expect(screen.getByLabelText('Nexus 用户名')).toBeInTheDocument();
-    expect(screen.getByLabelText('Nexus 口令')).toBeInTheDocument();
+    expect(screen.getByLabelText('Nexus 用户名')).toHaveAttribute('autocomplete', 'username');
+    expect(screen.getByLabelText('Nexus 口令')).toHaveAttribute('autocomplete', 'current-password');
     expect(screen.getByText(/服务端不保存、不写入日志与迁移报告/)).toBeInTheDocument();
+  });
+
+  it('online 的 Nexus 账号口令使用登录 autocomplete', async () => {
+    renderWithProviders(<MigrationPage />);
+    await selectSourceKind('在线 Nexus 实例');
+    expect(screen.getByLabelText('Nexus 用户名')).toHaveAttribute('autocomplete', 'username');
+    expect(screen.getByLabelText('Nexus 口令')).toHaveAttribute('autocomplete', 'current-password');
   });
 
   it('带 #plan 锚点且缓存齐时恢复到计划步并渲染映射明细', () => {

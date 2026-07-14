@@ -59,15 +59,17 @@ export const repoApi = {
       query: { mode },
       headers: { 'X-Confirm-Repository': confirmName },
     }),
-  // 仓库 ACL（M1-FR-008）：列出 / 设置 / 移除某用户的授权
+  // 仓库 ACL（M1-FR-008）：路径以精确用户名为授权键，响应仍保留 user_id 与 username
   aclList: (name: string) => apiRequest<Schemas['AclEntry'][]>(`/api/v1/repos/${name}/acl`),
-  aclSet: (name: string, userId: number, permission: Schemas['Permission']) =>
-    apiRequest<Schemas['AclEntry']>(`/api/v1/repos/${name}/acl/${userId}`, {
+  aclSet: (name: string, username: string, permission: Schemas['Permission']) =>
+    apiRequest<Schemas['AclEntry']>(`/api/v1/repos/${name}/acl/${encodeURIComponent(username)}`, {
       method: 'PUT',
       body: { permission },
     }),
-  aclRemove: (name: string, userId: number) =>
-    apiRequest<undefined>(`/api/v1/repos/${name}/acl/${userId}`, { method: 'DELETE' }),
+  aclRemove: (name: string, username: string) =>
+    apiRequest<undefined>(`/api/v1/repos/${name}/acl/${encodeURIComponent(username)}`, {
+      method: 'DELETE',
+    }),
   files: (name: string, query?: PageQuery & { path?: string }) =>
     apiRequest<Schemas['FileListResponse']>(`/api/v1/repos/${name}/files`, { query }),
   search: (name: string, query: PageQuery & { q: string }) =>

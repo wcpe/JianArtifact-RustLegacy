@@ -36,6 +36,31 @@ describe('用户管理', () => {
     expect(screen.getByText('dev')).toBeInTheDocument();
   });
 
+  it('创建用户输入使用独立 autocomplete 分区', async () => {
+    renderUsersPage();
+    fireEvent.click(await screen.findByRole('button', { name: '新增用户' }));
+    expect(await screen.findByLabelText('用户名')).toHaveAttribute(
+      'autocomplete',
+      'section-create-user username',
+    );
+    expect(screen.getByLabelText('初始口令')).toHaveAttribute(
+      'autocomplete',
+      'section-create-user new-password',
+    );
+  });
+
+  it('管理员重置口令使用独立 autocomplete 分区', async () => {
+    renderUsersPage();
+    const devCell = await screen.findByText('dev');
+    const row = devCell.closest('tr');
+    if (!row) throw new Error('未找到 dev 用户所在行');
+    fireEvent.click(within(row).getByRole('button', { name: '重置口令' }));
+    expect(await screen.findByLabelText('新口令')).toHaveAttribute(
+      'autocomplete',
+      'section-reset-password new-password',
+    );
+  });
+
   it('重置其他用户口令后保留当前会话并展示成功提示', async () => {
     renderUsersPage();
     // 定位 dev 行并打开其重置口令模态框

@@ -23,22 +23,18 @@ function normalizePath(path: string): string {
 // 契约中的 (method, path) 集合（归一化后）
 const contractOps = new Set<string>();
 for (const [path, methods] of Object.entries(doc.paths)) {
+  // devmock 双向覆盖只约束管理业务 API；健康探针与格式协议有独立 mock/占位实现
+  if (!path.startsWith('/api/v1')) continue;
   for (const method of Object.keys(methods)) {
     contractOps.add(`${method.toUpperCase()} ${normalizePath(path)}`);
   }
 }
 
-// devmock 业务 handler 的 (method, path) 集合；/__devmock/* 是 mock 基础设施端点，
-// /api/v1/* 通配 handler 是统一会话守卫，/repository/* 是格式协议端点；三者均不参与比对
+// devmock 管理业务 handler 的 (method, path) 集合；健康、格式协议与 mock 基础设施不参与比对
 const handlerOps = new Set(
   handlers
     .map((h) => ({ method: h.info.method.toString().toUpperCase(), path: String(h.info.path) }))
-    .filter(
-      (op) =>
-        !op.path.includes('/__devmock/') &&
-        !op.path.endsWith('/api/v1/*') &&
-        !op.path.includes('/repository/'),
-    )
+    .filter((op) => op.path.includes('/api/v1/') && !op.path.endsWith('/api/v1/*'))
     .map((op) => `${op.method} ${op.path.replace(/^\*/, '')}`),
 );
 

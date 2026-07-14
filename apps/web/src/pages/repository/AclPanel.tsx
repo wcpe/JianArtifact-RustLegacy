@@ -71,29 +71,29 @@ function AddAclForm({
 }: {
   candidates: { id: number; username: string }[];
   busy: boolean;
-  onAdd: (userId: number, permission: Permission) => Promise<void>;
+  onAdd: (username: string, permission: Permission) => Promise<void>;
 }) {
-  const [userId, setUserId] = useState('');
+  const [username, setUsername] = useState('');
   const [permission, setPermission] = useState<Permission>('read');
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (userId === '') return;
-    await onAdd(Number(userId), permission);
-    setUserId('');
+    if (username === '') return;
+    await onAdd(username, permission);
+    setUsername('');
   };
 
   return (
     <form className="flex flex-wrap items-end gap-3" onSubmit={handleSubmit}>
       <div className="flex flex-col gap-2">
         <Label htmlFor="acl-user">用户</Label>
-        <Select value={userId} onValueChange={setUserId}>
+        <Select value={username} onValueChange={setUsername}>
           <SelectTrigger id="acl-user" className="w-44">
             <SelectValue placeholder="选择用户" />
           </SelectTrigger>
           <SelectContent>
             {candidates.map((user) => (
-              <SelectItem key={user.id} value={String(user.id)}>
+              <SelectItem key={user.id} value={user.username}>
                 {user.username}
               </SelectItem>
             ))}
@@ -113,7 +113,7 @@ function AddAclForm({
           </SelectContent>
         </Select>
       </div>
-      <Button type="submit" disabled={busy || userId === ''}>
+      <Button type="submit" disabled={busy || username === ''}>
         添加
       </Button>
     </form>
@@ -223,14 +223,14 @@ export function AclPanel({ repoName }: { repoName: string }) {
         <AddAclForm
           candidates={candidates}
           busy={busy}
-          onAdd={(userId, permission) =>
-            runAction(() => repoApi.aclSet(repoName, userId, permission))
+          onAdd={(username, permission) =>
+            runAction(() => repoApi.aclSet(repoName, username, permission))
           }
         />
         <AclTable
           entries={entries}
           busy={busy}
-          onRemove={(entry) => void runAction(() => repoApi.aclRemove(repoName, entry.user_id))}
+          onRemove={(entry) => void runAction(() => repoApi.aclRemove(repoName, entry.username))}
         />
       </CardContent>
     </Card>

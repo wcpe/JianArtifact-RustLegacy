@@ -4,12 +4,12 @@
 已接受
 
 ## 背景
-管理 API 同时被 `apps/web`（真实调用）、`apps/devmock`（契约模拟）与文档消费。需求明确要求 devmock 与真实后端 API 不得漂移，且门禁必须包含 API/Mock 契约一致性检查。若契约靠手写文档维护，三处（代码、文档、mock）各说各话只是时间问题。
+服务端 HTTP 契约同时被 `apps/web`（真实调用）、`packages/devmock`（管理 API 契约模拟）、原生客户端与文档消费。需求明确要求 devmock 与真实后端管理 API 不得漂移，且格式协议同样必须有机器可读契约。若契约靠手写文档维护，代码、文档、mock 与客户端各说各话只是时间问题。
 
 ## 决策
-- 管理 API 契约以 **utoipa 从后端 Rust 代码生成的 OpenAPI 文档为唯一真源**：handler、请求/响应模型通过 utoipa 注解声明，OpenAPI 由代码构建产出。
+- 服务端对外 HTTP 契约以 **utoipa 从后端 Rust 代码生成的同一份 OpenAPI 文档为唯一真源**：管理 API、健康探针与格式协议 handler、请求/响应模型通过 utoipa 注解声明，OpenAPI 由代码构建产出。
 - 前端 TypeScript 类型由该 OpenAPI **自动生成**，`apps/web` 不手写 API 模型类型。
-- `apps/devmock` 的契约测试**自动与该 OpenAPI 比对**，请求/响应结构不一致即失败。
+- `packages/devmock` 的双向契约测试只对 `/api/v1` 管理业务路径与该 OpenAPI 比对；健康探针和 `/repository` 格式协议不要求 devmock 全量模拟，分别由健康测试与协议测试验证。
 - 上述比对纳入合并前硬门禁（ADR-0010 第 5 项）；`docs/API.md` 只记录跨端点的稳定约定，不重复端点明细。
 
 ## 理由

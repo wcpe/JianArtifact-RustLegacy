@@ -2,7 +2,7 @@
 
 > 系统当前真貌（HOW）。始终原地更新到现状；结构 / 机制变了就改它。
 >
-> 当前状态：阶段 3 已完成认证与用户域真连，其余业务域仍按路线图逐域实现；实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
+> 当前状态：阶段 3 已完成认证与用户域真连，并完成仓库/格式协议契约纠偏与真实后端浏览器测试通道；仓库核心及后续业务域仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
 
 ## 1. 定位与边界
 
@@ -27,7 +27,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | 子工程 | 职责 | 依赖方向 |
 |---|---|---|
 | `apps/server` | Rust 后端：管理 API、格式协议、存储、认证授权与迁移 | 不依赖任何前端子工程 |
-| `apps/web` | React + TypeScript 管理端产品应用，只消费管理 API | 依赖 `ui`、共享配置；开发开关下可连 `devmock` |
+| `apps/web` | React + TypeScript 管理端产品应用，只消费管理 API；默认开发经 Vite 代理直连 Rust，只有 `VITE_MOCK=true` 才启用 devmock；独立 Playwright 配置可启动隔离 SQLite/Rust 后端做真连验收 | 依赖 `ui`、共享配置；显式开发开关下可连 `devmock` |
 | `apps/wiki` | UI 组件与业务模式独立预览站，覆盖正常/加载/空/错误/无权限等状态，是视觉回归与无障碍验收入口 | 依赖 `ui`、共享配置 |
 | `packages/ui` | 共享设计系统与组件库（shadcn/ui + Tailwind，组件源码归本工程），四层：基础组件、复合组件、页面布局、业务模式 | **只允许被 `web`、`wiki` 单向依赖，禁止依赖 `apps/*`** |
 | `packages/devmock` | 浏览器与 Node 双端 Mock、场景包与契约模拟；**其契约必须与后端 OpenAPI 自动比对，防止漂移** | 依赖共享配置 |
@@ -36,7 +36,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 ### 2.2 `apps/server` 内部分层
 
-当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`state`；其中认证域遵循 `api → domain → persistence` 单向依赖。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
+当前 Rust crate 已落地 `api`、`auth`、`config`、`domain`、`error`、`health`、`logging`、`persistence`、`state`；其中认证域遵循 `api → domain → persistence` 单向依赖。`api::formats` 目前只承载 `/repository/{name}/{path}` 的 OpenAPI 与 501 路由占位，真实协议逻辑仍须落入独立 `protocol` 模块。以下是第一期随业务域逐步补齐的目标分层，不因未来格式扩展提前拆成微型 crate：
 
 ```text
         ┌───────────────┐      ┌───────────────┐
@@ -108,8 +108,8 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API；认证、用户与 Token 已真实现，仓库、ACL、浏览与迁移目前为契约骨架。**utoipa 生成的 OpenAPI 是管理 API 契约唯一真源**，`devmock` 契约测试自动与其比对。
-- **格式协议端点**：尚未落地；后续按域实现 Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，并接入已具备 Basic 与 Bearer/API Token 能力的统一鉴权提取器。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户与 Token 已真实现，仓库、ACL、浏览与迁移目前为契约骨架。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
+- **格式协议端点**：通用 GET/HEAD/PUT/DELETE 路径已进入同一 utoipa OpenAPI 并挂载 501 占位；后续按域实现 Raw（HTTP 上传/下载/浏览）、Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）原生协议，并接入已具备 Basic 与 Bearer/API Token 能力的统一鉴权提取器。真实协议实现必须从 `api::formats` 占位迁移到 `protocol` 层，不得在 API handler 内堆业务逻辑。
 - **健康检查**：进程健康与基本就绪状态，响应不泄露路径、凭据或内部拓扑。
 
 ## 6. 关键机制
@@ -176,7 +176,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | `docs/adr/0009-migration-task-persistence.md` | 任务表 + 分仓明细表持久化，重启在途任务标已中断 |
 | `docs/adr/0010-quality-gates-and-docker.md` | 质量硬门禁与 Docker 容器化验证约束 |
 | `docs/adr/0011-ui-design-system.md` | shadcn/ui + Tailwind 设计系统，组件源码归 `packages/ui`，TanStack Table |
-| `docs/adr/0012-api-contract-source.md` | utoipa 生成 OpenAPI 为管理 API 契约唯一真源 |
+| `docs/adr/0012-api-contract-source.md` | utoipa 生成同一 OpenAPI 作为服务端 HTTP 契约唯一真源；devmock 只双向比对 `/api/v1` 管理业务路径 |
 | `docs/adr/0013-single-binary-delivery.md` | rust-embed 编译期内嵌前端产物，单二进制交付 |
 | `docs/adr/0014-frontend-first-delivery.md` | M1 按域三步工序：契约骨架 → 前端 + devmock → 后端业务实现，契约真源仍为 ADR-0012 |
 | `docs/adr/0015-offline-native-datadir-primary.md` | 迁移首选离线直读 Nexus 原生数据目录（blob 磁盘直读 + 配置 REST/手动），在线 REST 降为备选 |

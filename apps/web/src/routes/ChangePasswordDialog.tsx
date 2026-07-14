@@ -23,11 +23,13 @@ function PasswordField({
   id,
   label,
   value,
+  autoComplete,
   onChange,
 }: {
   id: string;
   label: string;
   value: string;
+  autoComplete: string;
   onChange: (value: string) => void;
 }) {
   return (
@@ -37,6 +39,7 @@ function PasswordField({
         id={id}
         type="password"
         value={value}
+        autoComplete={autoComplete}
         onChange={(event) => onChange(event.target.value)}
         required
       />
@@ -123,18 +126,21 @@ export function ChangePasswordDialog({
             id="password-old"
             label="旧口令"
             value={oldPassword}
+            autoComplete="section-change-password current-password"
             onChange={setOldPassword}
           />
           <PasswordField
             id="password-new"
             label="新口令"
             value={newPassword}
+            autoComplete="section-change-password new-password"
             onChange={setNewPassword}
           />
           <PasswordField
             id="password-confirm"
             label="确认新口令"
             value={confirmPassword}
+            autoComplete="section-change-password new-password"
             onChange={setConfirmPassword}
           />
           <DialogFooter>

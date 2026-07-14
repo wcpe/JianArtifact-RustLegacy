@@ -140,6 +140,45 @@ describe('仓库管理', () => {
     }
     expect(snippets.some((s) => s.content.includes('<令牌>'))).toBe(true);
   });
+
+  it('ACL 以用户名为精确键设置与移除', () => {
+    const store = createStore('default');
+    const setByUsername = store.aclSet as unknown as (
+      name: string,
+      username: string,
+      permission: 'read' | 'write' | 'admin',
+    ) => ReturnType<typeof store.aclSet>;
+    const removeByUsername = store.aclRemove as unknown as (
+      name: string,
+      username: string,
+    ) => ReturnType<typeof store.aclRemove>;
+
+    const entry = unwrap(setByUsername.call(store, 'raw-hosted', 'dev', 'write'));
+    expect(entry).toMatchObject({ user_id: 2, username: 'dev', permission: 'write' });
+    expect(removeByUsername.call(store, 'raw-hosted', 'dev').ok).toBe(true);
+  });
+
+  it('PATCH 可显式清空上游凭据引用并更新 Maven 版本策略', () => {
+    const store = createStore('default');
+    const cleared = unwrap(store.updateRepo('npm-proxy', { upstream_credential_ref: null }));
+    expect(cleared.upstream_credential_ref).toBeNull();
+
+    const updateWithVersionPolicy = {
+      version_policy: 'snapshot',
+    } as Parameters<typeof store.updateRepo>[1];
+    const updated = unwrap(store.updateRepo('maven-releases', updateWithVersionPolicy));
+    expect(updated.version_policy).toBe('snapshot');
+  });
+
+  it('浏览与搜索条目均返回仓库根相对完整路径', () => {
+    const store = createStore('default');
+    const root = unwrap(store.listFiles('raw-hosted', ''));
+    expect(root.items.find((entry) => entry.name === 'docs')?.path).toBe('docs');
+    const docs = unwrap(store.listFiles('raw-hosted', 'docs'));
+    expect(docs.items.find((entry) => entry.name === 'manual.pdf')?.path).toBe('docs/manual.pdf');
+    const searched = unwrap(store.search('raw-hosted', 'manual.pdf'));
+    expect(searched.items[0]).toMatchObject({ name: 'manual.pdf', path: 'docs/manual.pdf' });
+  });
 });
 
 describe('大仓库分页（NFR-16）', () => {

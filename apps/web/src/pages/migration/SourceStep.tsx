@@ -54,7 +54,7 @@ function CredentialFields({
         <Input
           id={`${idPrefix}-username`}
           value={username}
-          autoComplete="off"
+          autoComplete="username"
           onChange={(event) => onUsernameChange(event.target.value)}
         />
       </div>
@@ -64,7 +64,7 @@ function CredentialFields({
           id={`${idPrefix}-password`}
           type="password"
           value={password}
-          autoComplete="new-password"
+          autoComplete="current-password"
           onChange={(event) => onPasswordChange(event.target.value)}
         />
         <p className="text-xs text-muted-foreground">{CREDENTIAL_HELP}</p>

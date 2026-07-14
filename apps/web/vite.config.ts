@@ -4,8 +4,18 @@ import { configDefaults, defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 
+const BACKEND_TARGET = 'http://127.0.0.1:18080';
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    proxy: {
+      '/api': BACKEND_TARGET,
+      '/repository': BACKEND_TARGET,
+      '/healthz': BACKEND_TARGET,
+      '/readyz': BACKEND_TARGET,
+    },
+  },
   test: {
     // 组件测试运行在 jsdom 模拟浏览器环境
     environment: 'jsdom',

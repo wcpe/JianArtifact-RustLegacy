@@ -938,12 +938,12 @@
         }
       }
     },
-    "/api/v1/repos/{name}/acl/{user_id}": {
+    "/api/v1/repos/{name}/acl/{username}": {
       "put": {
         "tags": [
           "repos"
         ],
-        "summary": "设置某用户的 ACL（仓库 admin）。",
+        "summary": "按用户名设置某用户的 ACL（仓库 admin）。",
         "operationId": "acl_set",
         "parameters": [
           {
@@ -956,13 +956,12 @@
             }
           },
           {
-            "name": "user_id",
+            "name": "username",
             "in": "path",
-            "description": "用户标识",
+            "description": "精确用户名",
             "required": true,
             "schema": {
-              "type": "integer",
-              "format": "int64"
+              "type": "string"
             }
           }
         ],
@@ -1003,7 +1002,7 @@
         "tags": [
           "repos"
         ],
-        "summary": "移除某用户的 ACL（仓库 admin）。",
+        "summary": "按用户名移除某用户的 ACL（仓库 admin）。",
         "operationId": "acl_remove",
         "parameters": [
           {
@@ -1016,13 +1015,12 @@
             }
           },
           {
-            "name": "user_id",
+            "name": "username",
             "in": "path",
-            "description": "用户标识",
+            "description": "精确用户名",
             "required": true,
             "schema": {
-              "type": "integer",
-              "format": "int64"
+              "type": "string"
             }
           }
         ],
@@ -1589,6 +1587,164 @@
           }
         }
       }
+    },
+    "/repository/{name}/{path}": {
+      "get": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "读取仓库路径内容。",
+        "operationId": "repository_get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "仓库根相对完整路径",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "501": {
+            "description": "格式协议读取待对应域实现",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "向仓库路径写入内容。",
+        "operationId": "repository_put",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "仓库根相对完整路径",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "501": {
+            "description": "格式协议写入待对应域实现",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "删除仓库路径内容。",
+        "operationId": "repository_delete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "仓库根相对完整路径",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "501": {
+            "description": "格式协议删除待对应域实现",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "formats"
+        ],
+        "summary": "探测仓库路径内容元数据。",
+        "operationId": "repository_head",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "仓库名",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "仓库根相对完整路径",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "501": {
+            "description": "格式协议探测待对应域实现",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1650,29 +1806,19 @@
             "description": "制品格式（创建后不可变）。"
           },
           "members": {
-            "type": [
-              "array",
-              "null"
-            ],
+            "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "group 成员（group 必填，有序，须同格式 hosted/proxy）。"
+            "description": "group 成员（group 必填，有序，须同格式 hosted/proxy；提供时不可为 null）。"
           },
           "name": {
             "type": "string",
             "description": "仓库名：小写字母/数字/连字符，1–64 字符，创建后不可改。"
           },
           "overwrite_policy": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OverwritePolicy",
-                "description": "覆盖策略（hosted，可选按格式默认）。"
-              }
-            ]
+            "$ref": "#/components/schemas/OverwritePolicy",
+            "description": "覆盖策略（hosted，可选按格式默认；提供时不可为 null）。"
           },
           "repo_type": {
             "$ref": "#/components/schemas/RepoType",
@@ -1686,22 +1832,12 @@
             "description": "proxy 上游凭据引用名（可选）。"
           },
           "upstream_url": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "proxy 上游地址（proxy 必填）。"
+            "type": "string",
+            "description": "proxy 上游地址（proxy 必填；提供时不可为 null）。"
           },
           "version_policy": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/VersionPolicy",
-                "description": "Maven 版本策略（Maven hosted，默认 mixed）。"
-              }
-            ]
+            "$ref": "#/components/schemas/VersionPolicy",
+            "description": "Maven 版本策略（Maven hosted，默认 mixed；提供时不可为 null）。"
           },
           "visibility": {
             "$ref": "#/components/schemas/Visibility",
@@ -1954,6 +2090,7 @@
         "description": "浏览条目（目录或文件）。",
         "required": [
           "name",
+          "path",
           "is_dir"
         ],
         "properties": {
@@ -1977,7 +2114,11 @@
           },
           "name": {
             "type": "string",
-            "description": "条目名。"
+            "description": "条目名（不含父目录）。"
+          },
+          "path": {
+            "type": "string",
+            "description": "仓库根相对完整路径；客户端不得自行拼接。"
           },
           "sha1": {
             "type": [
@@ -2815,57 +2956,38 @@
         "description": "编辑仓库请求体：字段可选，只更新给出的项；format 与 repo_type 不可变。",
         "properties": {
           "disabled": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "停用/启用。"
+            "type": "boolean",
+            "description": "停用/启用；提供时不可为 null。"
           },
           "members": {
-            "type": [
-              "array",
-              "null"
-            ],
+            "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "group 成员（整体替换，有序）。"
+            "description": "group 成员（整体替换且保持顺序；空数组清空，提供时不可为 null）。"
           },
           "overwrite_policy": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OverwritePolicy",
-                "description": "覆盖策略。"
-              }
-            ]
+            "$ref": "#/components/schemas/OverwritePolicy",
+            "description": "hosted 覆盖策略；提供时不可为 null。"
           },
           "upstream_credential_ref": {
             "type": [
               "string",
               "null"
             ],
-            "description": "proxy 上游凭据引用名。"
+            "description": "proxy 上游凭据引用名：缺失不更新，字符串替换，显式 null 清空。"
           },
           "upstream_url": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "proxy 上游地址。"
+            "type": "string",
+            "description": "proxy 上游地址；提供时不可为 null。"
+          },
+          "version_policy": {
+            "$ref": "#/components/schemas/VersionPolicy",
+            "description": "Maven hosted 版本策略；提供时不可为 null。"
           },
           "visibility": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Visibility",
-                "description": "可见性。"
-              }
-            ]
+            "$ref": "#/components/schemas/Visibility",
+            "description": "可见性；提供时不可为 null。"
           }
         }
       },
@@ -3027,6 +3149,10 @@
     {
       "name": "repos",
       "description": "仓库生命周期、ACL、浏览与使用片段"
+    },
+    {
+      "name": "formats",
+      "description": "Raw、Maven、npm 与 group 共用的格式协议路径空间"
     },
     {
       "name": "migration",

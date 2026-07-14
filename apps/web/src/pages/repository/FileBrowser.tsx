@@ -43,11 +43,11 @@ interface SelectedFile {
   updatedAt: string | null;
 }
 
-// 把接口条目转成树节点（子目录未加载态）
-function entryToNode(parentPath: string, entry: FileEntry): TreeNode {
+// 把接口条目转成树节点（完整路径以后端为准，子目录初始未加载）
+function entryToNode(entry: FileEntry): TreeNode {
   return {
     name: entry.name,
-    path: parentPath ? `${parentPath}/${entry.name}` : entry.name,
+    path: entry.path,
     isDir: entry.is_dir,
     size: entry.size ?? null,
     sha256: entry.sha256 ?? null,
@@ -319,7 +319,7 @@ export function FileBrowser({
   const loadChildren = useCallback(
     async (path: string): Promise<TreeNode[]> => {
       const result = await repoApi.files(name, { path, page_size: TREE_PAGE_SIZE });
-      return result.items.map((entry) => entryToNode(path, entry));
+      return result.items.map(entryToNode);
     },
     [name],
   );

@@ -261,15 +261,14 @@ export function createHandlers(getStore: () => DevmockStore) {
     http.get('*/api/v1/repos/:name/acl', ({ params, request }) =>
       authenticated(request, getStore, (store) => jsonOf(store.aclList(stringOf(params.name)))),
     ),
-    http.put('*/api/v1/repos/:name/acl/:user_id', ({ params, request }) =>
-      authenticatedJson<SetAclRequest>(request, getStore, (store, body) => {
-        const userId = Number(stringOf(params.user_id));
-        return jsonOf(store.aclSet(stringOf(params.name), userId, body.permission));
-      }),
+    http.put('*/api/v1/repos/:name/acl/:username', ({ params, request }) =>
+      authenticatedJson<SetAclRequest>(request, getStore, (store, body) =>
+        jsonOf(store.aclSet(stringOf(params.name), stringOf(params.username), body.permission)),
+      ),
     ),
-    http.delete('*/api/v1/repos/:name/acl/:user_id', ({ params, request }) =>
+    http.delete('*/api/v1/repos/:name/acl/:username', ({ params, request }) =>
       authenticated(request, getStore, (store) =>
-        emptyOf(store.aclRemove(stringOf(params.name), Number(stringOf(params.user_id)))),
+        emptyOf(store.aclRemove(stringOf(params.name), stringOf(params.username))),
       ),
     ),
     http.get('*/api/v1/repos/:name/files', ({ params, request }) => {

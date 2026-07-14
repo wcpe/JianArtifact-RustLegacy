@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod extractor;
+pub mod formats;
 pub mod migration;
 pub mod repos;
 pub mod tokens;
@@ -76,6 +77,10 @@ impl PageQuery {
         repos::files,
         repos::search,
         repos::usage,
+        formats::get,
+        formats::head,
+        formats::put,
+        formats::delete,
         migration::discover,
         migration::plan,
         migration::create_task,
@@ -95,6 +100,7 @@ impl PageQuery {
         (name = "tokens", description = "API Token 管理"),
         (name = "users", description = "用户管理（Admin）"),
         (name = "repos", description = "仓库生命周期、ACL、浏览与使用片段"),
+        (name = "formats", description = "Raw、Maven、npm 与 group 共用的格式协议路径空间"),
         (name = "migration", description = "Nexus 迁移：发现、计划、任务与报告（Admin）"),
     ),
 )]
@@ -129,12 +135,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/repos/{name}/acl", get(repos::acl_list))
         .route(
-            "/api/v1/repos/{name}/acl/{user_id}",
+            "/api/v1/repos/{name}/acl/{username}",
             axum::routing::put(repos::acl_set).delete(repos::acl_remove),
         )
         .route("/api/v1/repos/{name}/files", get(repos::files))
         .route("/api/v1/repos/{name}/search", get(repos::search))
         .route("/api/v1/repos/{name}/usage", get(repos::usage))
+        .route(
+            "/repository/{name}/{*path}",
+            get(formats::get)
+                .head(formats::head)
+                .put(formats::put)
+                .delete(formats::delete),
+        )
         .route("/api/v1/migration/discover", post(migration::discover))
         .route("/api/v1/migration/plan", post(migration::plan))
         .route(

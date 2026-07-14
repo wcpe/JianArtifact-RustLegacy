@@ -1,6 +1,7 @@
 // 仓库列表测试：渲染默认场景仓库行、统计/状态/上游列与操作列、删除确认流程。
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { repoApi } from '../api/endpoints';
 import { loginAs, renderWithProviders, resetScenario } from '../test/utils';
 import { RepositoriesPage } from './RepositoriesPage';
 
@@ -9,6 +10,13 @@ function repoRow(name: string): HTMLElement {
   const row = screen.getByRole('link', { name }).closest('tr');
   expect(row).not.toBeNull();
   return row as HTMLElement;
+}
+
+// jsdom 无真实指针事件：键盘打开 Radix Select 并选中指定选项
+async function selectOption(comboboxName: string, optionName: string) {
+  fireEvent.keyDown(screen.getByRole('combobox', { name: comboboxName }), { key: 'ArrowDown' });
+  const option = await screen.findByRole('option', { name: optionName });
+  fireEvent.keyDown(option, { key: 'Enter' });
 }
 
 describe('仓库列表', () => {
@@ -39,9 +47,36 @@ describe('仓库列表', () => {
     // 操作列：设置直达详情配置 tab，删除弹确认对话框
     expect(screen.getByRole('link', { name: '仓库设置 raw-hosted' })).toHaveAttribute(
       'href',
-      '/repos/raw-hosted#config',
+      '/repos/raw-hosted?tab=config',
     );
     expect(screen.getByRole('button', { name: '删除仓库 raw-hosted' })).toBeInTheDocument();
+  });
+
+  it('新建 proxy 仓库提交类型专属上游与可选凭据引用', async () => {
+    const createSpy = vi.spyOn(repoApi, 'create');
+    renderWithProviders(<RepositoriesPage />);
+    await screen.findByText('raw-hosted');
+    fireEvent.click(screen.getByRole('button', { name: '新建仓库' }));
+    fireEvent.change(screen.getByLabelText('仓库名'), { target: { value: 'proxy-demo' } });
+    await selectOption('类型', '代理');
+    fireEvent.change(screen.getByLabelText('上游地址'), {
+      target: { value: 'https://packages.example.com' },
+    });
+    fireEvent.change(screen.getByLabelText('上游凭据引用'), {
+      target: { value: 'EXAMPLE_AUTH' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '创建' }));
+
+    await waitFor(() => {
+      expect(createSpy).toHaveBeenCalledWith({
+        name: 'proxy-demo',
+        format: 'raw',
+        repo_type: 'proxy',
+        visibility: 'private',
+        upstream_url: 'https://packages.example.com',
+        upstream_credential_ref: 'EXAMPLE_AUTH',
+      });
+    });
   });
 
   it('删除对话框须原样输入仓库名才可确认，删除后行消失并提示', async () => {

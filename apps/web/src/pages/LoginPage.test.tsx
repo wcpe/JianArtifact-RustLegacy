@@ -14,6 +14,12 @@ describe('登录页', () => {
     await resetScenario('default');
   });
 
+  it('用户名和口令输入声明登录 autocomplete', () => {
+    renderWithProviders(<LoginPage />, { route: '/login' });
+    expect(screen.getByLabelText('用户名')).toHaveAttribute('autocomplete', 'username');
+    expect(screen.getByLabelText('口令')).toHaveAttribute('autocomplete', 'current-password');
+  });
+
   it('登录成功后跳转到目标页', async () => {
     renderWithProviders(
       <Routes>

@@ -14,24 +14,28 @@ const TONES = {
   teal: 'bg-teal-100 text-teal-600 dark:bg-teal-950/60 dark:text-teal-400',
 } as const;
 
-// 单张概览卡：左侧标题 + 大号数值，右侧彩色图标块
-function StatCard({
-  icon: Icon,
-  title,
-  value,
-  tone,
-}: {
+interface StatCardProps {
   icon: typeof Boxes;
   title: string;
   value: number;
   tone: keyof typeof TONES;
-}) {
+  loading: boolean;
+  error: Error | null;
+  onRetry: () => void;
+}
+
+// 单张概览卡：各自处理加载、失败与成功态，不影响相邻卡片
+function StatCard({ icon: Icon, title, value, tone, loading, error, onRetry }: StatCardProps) {
   return (
     <Card className="p-5">
       <div className="flex items-start justify-between gap-3">
-        <div className="flex flex-col gap-1">
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
           <span className="text-sm text-muted-foreground">{title}</span>
-          <span className="text-3xl font-bold tracking-tight tabular-nums">{value}</span>
+          {loading ? <Skeleton className="h-9 w-16" /> : null}
+          {!loading && error ? <ErrorState message={error.message} onRetry={onRetry} /> : null}
+          {!loading && !error ? (
+            <span className="text-3xl font-bold tracking-tight tabular-nums">{value}</span>
+          ) : null}
         </div>
         <div className={cn('flex size-10 items-center justify-center rounded-lg', TONES[tone])}>
           <Icon className="size-5" aria-hidden />
@@ -56,9 +60,6 @@ export function DashboardPage() {
   const tokens = useAsync(tokensLoader);
   const tasks = useAsync(tasksLoader);
 
-  const loading = repos.loading || tokens.loading || tasks.loading;
-  const error = repos.error ?? tokens.error ?? tasks.error;
-
   const retry = () => {
     repos.reload();
     tokens.reload();
@@ -71,28 +72,37 @@ export function DashboardPage() {
   return (
     <div className="flex h-full flex-col gap-6 overflow-y-auto">
       <PageHeader title="仪表盘" description="实例整体概览" />
-      {loading ? (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
-        </div>
-      ) : error ? (
-        <ErrorState message={error.message} onRetry={retry} />
-      ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <StatCard icon={Boxes} title="仓库总数" value={repos.data?.total ?? 0} tone="blue" />
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <StatCard
+          icon={Boxes}
+          title="仓库总数"
+          value={repos.data?.total ?? 0}
+          tone="blue"
+          loading={repos.loading}
+          error={repos.error}
+          onRetry={repos.reload}
+        />
+        <StatCard
+          icon={KeyRound}
+          title="Token 数"
+          value={tokens.data?.total ?? 0}
+          tone="violet"
+          loading={tokens.loading}
+          error={tokens.error}
+          onRetry={tokens.reload}
+        />
+        {isAdmin ? (
           <StatCard
-            icon={KeyRound}
-            title="Token 数"
-            value={tokens.data?.total ?? 0}
-            tone="violet"
+            icon={Workflow}
+            title="迁移任务数"
+            value={tasks.data?.total ?? 0}
+            tone="teal"
+            loading={tasks.loading}
+            error={tasks.error}
+            onRetry={tasks.reload}
           />
-          {isAdmin && tasks.data ? (
-            <StatCard icon={Workflow} title="迁移任务数" value={tasks.data.total} tone="teal" />
-          ) : null}
-        </div>
-      )}
+        ) : null}
+      </div>
     </div>
   );
 }

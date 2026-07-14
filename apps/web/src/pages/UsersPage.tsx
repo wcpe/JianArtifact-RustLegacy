@@ -96,6 +96,7 @@ function ResetPasswordDialog({
               id={`reset-password-${user.id}`}
               type="password"
               value={password}
+              autoComplete="section-reset-password new-password"
               onChange={(event) => setPassword(event.target.value)}
               required
             />
@@ -219,6 +220,7 @@ function CreateUserDialog({ onCreated }: { onCreated: () => void }) {
             <Input
               id="user-username"
               value={username}
+              autoComplete="section-create-user username"
               onChange={(event) => setUsername(event.target.value)}
               required
             />
@@ -229,6 +231,7 @@ function CreateUserDialog({ onCreated }: { onCreated: () => void }) {
               id="user-password"
               type="password"
               value={password}
+              autoComplete="section-create-user new-password"
               onChange={(event) => setPassword(event.target.value)}
               required
             />

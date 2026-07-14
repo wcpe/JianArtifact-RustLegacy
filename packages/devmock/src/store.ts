@@ -186,6 +186,7 @@ function listDirectory(files: SeedFile[], dir: string): FileEntry[] {
     if (slash < 0) {
       fileEntries.push({
         name: rest,
+        path: file.path,
         is_dir: false,
         size: file.size,
         sha256: file.sha256,
@@ -199,7 +200,9 @@ function listDirectory(files: SeedFile[], dir: string): FileEntry[] {
       subdirs.add(rest.slice(0, slash));
     }
   }
-  const dirEntries = [...subdirs].sort().map((name): FileEntry => ({ name, is_dir: true }));
+  const dirEntries = [...subdirs]
+    .sort()
+    .map((name): FileEntry => ({ name, path: `${prefix}${name}`, is_dir: true }));
   fileEntries.sort((a, b) => a.name.localeCompare(b.name));
   return [...dirEntries, ...fileEntries];
 }
@@ -803,14 +806,15 @@ export class DevmockStore {
     const repo = this.requireRepo(name, 'admin');
     if (!repo.ok) return repo;
     const info = repo.value.info;
-    if (req.visibility != null) info.visibility = req.visibility;
-    if (req.disabled != null) info.disabled = req.disabled;
-    if (req.members != null) info.members = req.members;
-    if (req.upstream_url != null) info.upstream_url = req.upstream_url;
-    if (req.upstream_credential_ref != null) {
+    if (req.visibility !== undefined) info.visibility = req.visibility;
+    if (req.disabled !== undefined) info.disabled = req.disabled;
+    if (req.members !== undefined) info.members = req.members;
+    if (req.upstream_url !== undefined) info.upstream_url = req.upstream_url;
+    if (req.upstream_credential_ref !== undefined) {
       info.upstream_credential_ref = req.upstream_credential_ref;
     }
-    if (req.overwrite_policy != null) info.overwrite_policy = req.overwrite_policy;
+    if (req.overwrite_policy !== undefined) info.overwrite_policy = req.overwrite_policy;
+    if (req.version_policy !== undefined) info.version_policy = req.version_policy;
     return ok(repoView(repo.value));
   }
 
@@ -828,6 +832,10 @@ export class DevmockStore {
     if (confirm !== name) {
       return fail(400, 'CONFIRM_MISMATCH', '确认头必须与仓库名一致');
     }
+    const referenced = this.repos.some(
+      (candidate) => candidate.info.repo_type === 'group' && candidate.info.members?.includes(name),
+    );
+    if (referenced) return fail(409, 'REPO_IN_USE', '仓库仍被 group 成员列表引用');
     const blobCount = repo.value.files.length;
     this.repos = this.repos.filter((r) => r.info.name !== name);
     if (mode === 'data') return ok({ reclaimed_blobs: blobCount, orphaned_blobs: 0 });
@@ -840,25 +848,25 @@ export class DevmockStore {
     return repo.ok ? ok(repo.value.acl) : repo;
   }
 
-  /** 设置某用户的 ACL（仓库 admin）。 */
-  aclSet(name: string, userId: number, permission: Permission): StoreResult<AclEntry> {
+  /** 按精确用户名设置某用户的 ACL（仓库 admin）。 */
+  aclSet(name: string, username: string, permission: Permission): StoreResult<AclEntry> {
     const repo = this.requireRepo(name, 'admin');
     if (!repo.ok) return repo;
-    const user = this.users.find((u) => u.info.id === userId);
+    const user = this.users.find((u) => u.info.username === username);
     if (!user) return notFound('用户不存在');
-    const entry: AclEntry = { user_id: userId, username: user.info.username, permission };
+    const entry: AclEntry = { user_id: user.info.id, username, permission };
     const acl = repo.value.acl;
-    const index = acl.findIndex((a) => a.user_id === userId);
+    const index = acl.findIndex((a) => a.username === username);
     if (index >= 0) acl[index] = entry;
     else acl.push(entry);
     return ok(entry);
   }
 
-  /** 移除某用户的 ACL（仓库 admin）。 */
-  aclRemove(name: string, userId: number): StoreResult<null> {
+  /** 按精确用户名移除某用户的 ACL（仓库 admin）。 */
+  aclRemove(name: string, username: string): StoreResult<null> {
     const repo = this.requireRepo(name, 'admin');
     if (!repo.ok) return repo;
-    const index = repo.value.acl.findIndex((a) => a.user_id === userId);
+    const index = repo.value.acl.findIndex((a) => a.username === username);
     if (index < 0) return notFound('ACL 条目不存在');
     repo.value.acl.splice(index, 1);
     return ok(null);
@@ -899,10 +907,15 @@ export class DevmockStore {
     for (const f of repo.value.files) {
       if (!f.path.includes(q)) continue;
       matches.push({
-        name: f.path,
+        name: f.path.split('/').at(-1) ?? f.path,
+        path: f.path,
         is_dir: false,
         size: f.size,
         sha256: f.sha256,
+        sha1: f.sha1,
+        md5: f.md5,
+        sha512: f.sha512,
+        content_type: f.content_type,
         updated_at: f.updated_at,
       });
     }

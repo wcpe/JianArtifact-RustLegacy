@@ -43,6 +43,9 @@ type RepoInfo = components['schemas']['RepoInfo'];
 type Format = components['schemas']['Format'];
 type RepoType = components['schemas']['RepoType'];
 type Visibility = components['schemas']['Visibility'];
+type OverwritePolicy = components['schemas']['OverwritePolicy'];
+type VersionPolicy = components['schemas']['VersionPolicy'];
+type CreateRepoRequest = components['schemas']['CreateRepoRequest'];
 
 // 启停状态徽标：启用为绿色软底，已停用为中性灰
 function RepoStateBadge({ disabled }: { disabled: boolean }) {
@@ -70,7 +73,7 @@ function RepoRowActions({
   return (
     <div className="flex items-center gap-1">
       <Button asChild variant="ghost" size="icon-sm" aria-label={`仓库设置 ${repo.name}`}>
-        <Link to={`/repos/${repo.name}#config`}>
+        <Link to={`/repos/${repo.name}?tab=config`}>
           <Settings className="size-4" aria-hidden />
         </Link>
       </Button>
@@ -145,6 +148,11 @@ function CreateRepoDialog({ onCreated }: { onCreated: () => void }) {
   const [format, setFormat] = useState<Format>('raw');
   const [repoType, setRepoType] = useState<RepoType>('hosted');
   const [visibility, setVisibility] = useState<Visibility>('private');
+  const [overwritePolicy, setOverwritePolicy] = useState<OverwritePolicy>('allow');
+  const [versionPolicy, setVersionPolicy] = useState<VersionPolicy>('mixed');
+  const [upstreamUrl, setUpstreamUrl] = useState('');
+  const [credentialRef, setCredentialRef] = useState('');
+  const [membersText, setMembersText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -156,6 +164,11 @@ function CreateRepoDialog({ onCreated }: { onCreated: () => void }) {
       setFormat('raw');
       setRepoType('hosted');
       setVisibility('private');
+      setOverwritePolicy('allow');
+      setVersionPolicy('mixed');
+      setUpstreamUrl('');
+      setCredentialRef('');
+      setMembersText('');
       setError(null);
     }
   };
@@ -165,7 +178,22 @@ function CreateRepoDialog({ onCreated }: { onCreated: () => void }) {
     setError(null);
     setSubmitting(true);
     try {
-      await repoApi.create({ name, format, repo_type: repoType, visibility });
+      const body: CreateRepoRequest = { name, format, repo_type: repoType, visibility };
+      if (repoType === 'hosted') {
+        body.overwrite_policy = overwritePolicy;
+        if (format === 'maven') body.version_policy = versionPolicy;
+      }
+      if (repoType === 'proxy') {
+        body.upstream_url = upstreamUrl.trim();
+        if (credentialRef.trim() !== '') body.upstream_credential_ref = credentialRef.trim();
+      }
+      if (repoType === 'group') {
+        body.members = membersText
+          .split('\n')
+          .map((member) => member.trim())
+          .filter((member) => member !== '');
+      }
+      await repoApi.create(body);
       handleOpenChange(false);
       onCreated();
     } catch (err) {
@@ -231,6 +259,79 @@ function CreateRepoDialog({ onCreated }: { onCreated: () => void }) {
               </SelectContent>
             </Select>
           </div>
+          {repoType === 'hosted' ? (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="repo-overwrite-policy">覆盖策略</Label>
+                <Select
+                  value={overwritePolicy}
+                  onValueChange={(value) => setOverwritePolicy(value as OverwritePolicy)}
+                >
+                  <SelectTrigger id="repo-overwrite-policy" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="allow">允许覆盖</SelectItem>
+                    <SelectItem value="deny">禁止覆盖</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {format === 'maven' ? (
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="repo-version-policy">Maven 版本策略</Label>
+                  <Select
+                    value={versionPolicy}
+                    onValueChange={(value) => setVersionPolicy(value as VersionPolicy)}
+                  >
+                    <SelectTrigger id="repo-version-policy" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="release">Release</SelectItem>
+                      <SelectItem value="snapshot">Snapshot</SelectItem>
+                      <SelectItem value="mixed">混合</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {repoType === 'proxy' ? (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="repo-upstream-url">上游地址</Label>
+                <Input
+                  id="repo-upstream-url"
+                  value={upstreamUrl}
+                  placeholder="https://…"
+                  onChange={(event) => setUpstreamUrl(event.target.value)}
+                  required
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="repo-credential-ref">上游凭据引用</Label>
+                <Input
+                  id="repo-credential-ref"
+                  value={credentialRef}
+                  placeholder="可选环境变量引用名"
+                  onChange={(event) => setCredentialRef(event.target.value)}
+                />
+              </div>
+            </div>
+          ) : null}
+          {repoType === 'group' ? (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="repo-members">成员（每行一个，按顺序）</Label>
+              <textarea
+                id="repo-members"
+                value={membersText}
+                onChange={(event) => setMembersText(event.target.value)}
+                rows={4}
+                required
+                className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              />
+            </div>
+          ) : null}
           <div className="flex flex-col gap-2">
             <Label htmlFor="repo-visibility">可见性</Label>
             <Select
@@ -247,7 +348,15 @@ function CreateRepoDialog({ onCreated }: { onCreated: () => void }) {
             </Select>
           </div>
           <DialogFooter>
-            <Button type="submit" disabled={submitting || name.trim() === ''}>
+            <Button
+              type="submit"
+              disabled={
+                submitting ||
+                name.trim() === '' ||
+                (repoType === 'proxy' && upstreamUrl.trim() === '') ||
+                (repoType === 'group' && membersText.trim() === '')
+              }
+            >
               {submitting ? '创建中…' : '创建'}
             </Button>
           </DialogFooter>
