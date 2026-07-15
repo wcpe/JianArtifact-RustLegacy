@@ -1,6 +1,6 @@
 # 功能规格：npm 协议——hosted 与 proxy（M1-FR-017~018）
 
-> 状态：已批准 / 开发中　·　关联 PRD：M1-FR-017、M1-FR-018　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
+> 状态：已交付@v0.2.0　·　关联 PRD：M1-FR-017、M1-FR-018　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
 
 ## 1. 背景与目标
 
@@ -43,11 +43,11 @@
 ## 4. 任务拆分
 
 - [x] 阶段 1：通用格式路径 GET/HEAD/PUT/DELETE 已纳入同一 OpenAPI 并挂载 501 占位；packument/tarball/publish/dist-tag 均由该通配路径承载，具体协议模型随阶段 3 实现补全。
-- [ ] 阶段 3（测试先行）：包名解析（scoped/unscoped）、packument 合成、tarball 地址重写纯函数
-- [ ] 阶段 3：hosted——publish 解码与 integrity/shasum 校验、不可变 403、dist-tag 端点、scoped 全链路
-- [ ] 阶段 3：proxy——packument TTL 缓存与地址重写、tarball 单飞回源与永久缓存、上游凭据零泄露断言
-- [ ] 阶段 3：官方客户端协议测试与真机验收（见 §5）
-- [ ] 文档同步：PRD 状态、API.md（如新增跨端点约定）、CHANGELOG
+- [x] 阶段 3（测试先行）：包名解析（scoped/unscoped）、packument 合成、tarball 地址重写纯函数
+- [x] 阶段 3：hosted——publish 解码与 integrity/shasum 校验、不可变 403、dist-tag 端点、scoped 全链路
+- [x] 阶段 3：proxy——packument TTL 缓存与地址重写、tarball 单飞回源与永久缓存、上游凭据零泄露断言
+- [x] 阶段 3：官方客户端协议测试与真机验收（2026-07-15）
+- [x] 文档同步：PRD 状态、API.md（如新增跨端点约定）、CHANGELOG
 
 ## 5. 验收标准
 

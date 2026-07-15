@@ -1,6 +1,6 @@
 # 功能规格：Maven 协议——hosted 与 proxy（M1-FR-015~016）
 
-> 状态：已批准 / 开发中　·　关联 PRD：M1-FR-015、M1-FR-016　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
+> 状态：已交付@v0.2.0　·　关联 PRD：M1-FR-015、M1-FR-016　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
 
 ## 1. 背景与目标
 
@@ -44,11 +44,11 @@
 ## 4. 任务拆分
 
 - [x] 阶段 1：通用格式路径 GET/HEAD/PUT/DELETE 已纳入同一 OpenAPI 并挂载 501 占位；Maven metadata/sidecar 端点族由同一通配路径承载，具体协议语义随阶段 3 实现。
-- [ ] 阶段 3（测试先行）：布局解析与 ComparableVersion 纯函数 + 官方样例测试集
-- [ ] 阶段 3：hosted——版本策略、release 覆盖语义、sidecar 上传核验、两级 metadata 权威生成（含并发 deploy 场景）
-- [ ] 阶段 3：proxy——构件永久缓存、metadata TTL 与 stale-if-error、上游 sidecar 核验
-- [ ] 阶段 3：官方客户端协议测试与真机验收（见 §5）
-- [ ] 文档同步：PRD 状态、API.md（如新增跨端点约定）、CHANGELOG
+- [x] 阶段 3（测试先行）：布局解析与 ComparableVersion 纯函数 + 官方样例测试集
+- [x] 阶段 3：hosted——版本策略、release 覆盖语义、sidecar 上传核验、两级 metadata 权威生成（含并发 deploy 场景）
+- [x] 阶段 3：proxy——构件永久缓存、metadata TTL 与 stale-if-error、上游 sidecar 核验
+- [x] 阶段 3：官方客户端协议测试与真机验收（2026-07-15）
+- [x] 文档同步：PRD 状态、API.md（如新增跨端点约定）、CHANGELOG
 
 ## 5. 验收标准
 

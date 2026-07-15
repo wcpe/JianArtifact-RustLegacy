@@ -1,6 +1,6 @@
 # 功能规格：Raw 协议——hosted 与 proxy（M1-FR-013~014）
 
-> 状态：已批准 / 开发中　·　关联 PRD：M1-FR-013、M1-FR-014　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
+> 状态：已交付@v0.2.0　·　关联 PRD：M1-FR-013、M1-FR-014　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
 
 ## 1. 背景与目标
 
@@ -43,7 +43,7 @@
 - [x] 阶段 1：通用格式路径 GET/HEAD/PUT/DELETE 已纳入同一 OpenAPI 并挂载 501 占位；Raw 目录索引与具体状态码随阶段 3 实现补全。
 - [x] 阶段 3：hosted 实现与协议测试（PUT/GET/HEAD/DELETE、根与子目录 JSON、allow/deny、404、权限、响应头与管理浏览搜索）
 - [x] 阶段 3：proxy 实现与协议测试（命中/未命中、HEAD 首次缓存、32 并发单飞、404/连接失败/3xx/4xx/5xx/断流、405/400、URL 更新前后单飞隔离与旧提交拒绝后一次有界重试，失败缓存零污染）
-- [ ] 阶段 3：恶意路径样本集继续扩充并完成 5 GiB/cgroup 大文件验收（NFR 载体）
+- [x] 阶段 3：恶意路径样本集已扩充，5 GiB/cgroup 大文件验收通过（2026-07-15）
 - [x] 文档同步：PRD 状态、API.md、ARCHITECTURE、ROADMAP、CHANGELOG 与 OpenAPI 生成物
 
 ## 5. 验收标准

@@ -161,7 +161,7 @@ export function AuthenticatedLayout() {
           <BrandMark />
           <div className={cn('leading-tight', collapsibleText(collapsed))}>
             <p className="text-[15px] font-semibold tracking-tight">JianArtifact</p>
-            <p className="font-mono text-[10px] text-muted-foreground">v0.1.0</p>
+            <p className="font-mono text-[10px] text-muted-foreground">v0.2.0</p>
           </div>
         </button>
 

@@ -4,7 +4,7 @@
 
 ## 状态
 
-规格与治理体系已建立，业务实现尚未开始；开发按 [`docs/PRD.md`](docs/PRD.md) 的 M1 功能需求（FR）迭代推进。当前版本 0.1.0。
+当前版本 0.2.0 已交付认证与授权、Raw/Maven/npm hosted/proxy/group、仓库管理与浏览、单二进制发布及 rootless systemd 部署回滚能力；Nexus 迁移域继续按 [`docs/ROADMAP.md`](docs/ROADMAP.md) 推进。
 
 ## 能力（M1 目标）
 

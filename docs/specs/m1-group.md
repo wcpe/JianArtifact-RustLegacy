@@ -1,6 +1,6 @@
 # 功能规格：group 只读聚合仓库（M1-FR-012）
 
-> 状态：已批准 / 开发中　·　关联 PRD：M1-FR-012（三格式 group 语义）、M1-FR-027（迁移后 group 目标语义的协议真源）　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
+> 状态：M1-FR-012 已交付@v0.2.0；M1-FR-027 随迁移域继续开发　·　关联 PRD：M1-FR-012（三格式 group 语义）、M1-FR-027（迁移后 group 目标语义的协议真源）　·　分支：main 直接提交，按域三步工序推进（ADR-0014）
 
 ## 1. 背景与目标
 
@@ -46,11 +46,11 @@
 
 ## 4. 任务拆分
 
-- [ ] 阶段 3（测试先行）：逐成员 ACL 过滤器 + 三格式聚合纯函数（first-match、metadata 聚合、packument 合并、冲突前序优先）
-- [ ] 阶段 3：Raw/Maven/npm group 端到端接线，两道权限门顺序落地
-- [ ] 阶段 3：零泄露穷举测试（见 §5）——本域核心验收
-- [ ] 阶段 3：proxy 成员回源经 group 触发的缓存归属与单飞验证
-- [ ] 文档同步：PRD 状态、ARCHITECTURE（group 机制如需补）、CHANGELOG
+- [x] 阶段 3（测试先行）：逐成员 ACL 过滤器 + 三格式聚合纯函数（first-match、metadata 聚合、packument 合并、冲突前序优先）
+- [x] 阶段 3：Raw/Maven/npm group 端到端接线，两道权限门顺序落地
+- [x] 阶段 3：零泄露穷举测试（见 §5）——本域核心验收
+- [x] 阶段 3：proxy 成员回源经 group 触发的缓存归属与单飞验证
+- [x] 文档同步：PRD 状态、ARCHITECTURE（group 机制如需补）、CHANGELOG
 
 ## 5. 验收标准
 
