@@ -31,7 +31,15 @@ if [ "${#missing[@]}" -gt 0 ]; then
 fi
 
 SSH_OPTS=()
-[ -n "${DEPLOY_SSH_KEY:-}" ] && SSH_OPTS+=(-i "$DEPLOY_SSH_KEY")
+SCP_OPTS=()
+if [ -n "${DEPLOY_SSH_PORT:-}" ]; then
+    SSH_OPTS+=(-p "$DEPLOY_SSH_PORT")
+    SCP_OPTS+=(-P "$DEPLOY_SSH_PORT")
+fi
+if [ -n "${DEPLOY_SSH_KEY:-}" ]; then
+    SSH_OPTS+=(-o IdentitiesOnly=yes -i "$DEPLOY_SSH_KEY")
+    SCP_OPTS+=(-o IdentitiesOnly=yes -i "$DEPLOY_SSH_KEY")
+fi
 REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
 # 透传远端配置（空值由远端脚本按默认值处理；值不要包含单引号）
 PASS_ENV="DEPLOY_DIR='${DEPLOY_DIR:-}' DEPLOY_SERVICE='${DEPLOY_SERVICE:-}' DEPLOY_KEEP_RELEASES='${DEPLOY_KEEP_RELEASES:-}' DEPLOY_HEALTH_URL='${DEPLOY_HEALTH_URL:-}'"
@@ -43,7 +51,7 @@ case "$MODE" in
         [ -f "dist/$pkg" ] || { echo "错误：发布包 dist/$pkg 不存在，请先执行 make release" >&2; exit 1; }
         echo "==> 上传发布包到 $DEPLOY_HOST"
         remote_tmp="$(ssh "${SSH_OPTS[@]}" "$REMOTE" mktemp -d)"
-        scp -q "${SSH_OPTS[@]}" "dist/$pkg" "dist/$pkg.sha256" "$REMOTE:$remote_tmp/"
+        scp -q "${SCP_OPTS[@]}" "dist/$pkg" "dist/$pkg.sha256" "$REMOTE:$remote_tmp/"
         echo "==> 在目标机执行安装"
         ssh "${SSH_OPTS[@]}" "$REMOTE" "$PASS_ENV bash -s -- deploy '$remote_tmp/$pkg'" \
             < scripts/deploy/remote-install.sh

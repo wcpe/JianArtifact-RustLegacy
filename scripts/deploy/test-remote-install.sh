@@ -167,4 +167,13 @@ if ! grep -q "MSYS2_ARG_CONV_EXCL" scripts/deploy.sh; then
 fi
 ok "宿主侧：Windows Git Bash 原样透传远端绝对路径"
 
+# ---------- 10. 自定义 SSH 端口 ----------
+if ! grep -q "DEPLOY_SSH_PORT" scripts/deploy.sh; then
+    die "deploy.sh 未读取 DEPLOY_SSH_PORT"
+fi
+if ! grep -q 'SCP_OPTS.*-P' scripts/deploy.sh; then
+    die "deploy.sh 未使用 SCP 的大写 -P 透传自定义端口"
+fi
+ok "宿主侧：SSH 与 SCP 使用自定义端口"
+
 echo "部署脚本逻辑测试全部通过（${PASS_COUNT} 项）"
