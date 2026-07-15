@@ -161,4 +161,10 @@ fi
 grep -q "DEPLOY_HOST" "$WORK/deploy.log" || die "deploy.sh 报错未指出缺失变量"
 ok "宿主侧：缺必填配置立即失败且不发起连接"
 
+# ---------- 9. Windows Git Bash 远端路径透传 ----------
+if ! grep -q "MSYS2_ARG_CONV_EXCL" scripts/deploy.sh; then
+    die "deploy.sh 未禁用 MSYS 参数路径转换，远端绝对路径会被改写为 Windows 路径"
+fi
+ok "宿主侧：Windows Git Bash 原样透传远端绝对路径"
+
 echo "部署脚本逻辑测试全部通过（${PASS_COUNT} 项）"

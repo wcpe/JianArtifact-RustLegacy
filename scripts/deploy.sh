@@ -4,6 +4,11 @@
 # rootless：目标机全程用户级 systemd，无 sudo。凭据不回显、不入日志。
 set -euo pipefail
 
+# Windows Git Bash 会把远端 Linux 绝对路径参数改写为本机盘符路径，SSH/SCP 必须禁用该转换。
+if [[ "${OSTYPE:-}" == msys* ]]; then
+    export MSYS2_ARG_CONV_EXCL="*"
+fi
+
 cd "$(dirname "$0")/.."
 
 MODE="${1:?用法：deploy.sh deploy | deploy.sh rollback}"
