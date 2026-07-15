@@ -7,8 +7,8 @@ use sqlx::SqlitePool;
 use crate::artifact::ArtifactService;
 use crate::domain::artifact::ArtifactDirectory;
 use crate::domain::repository::{
-    AccessSurface, AclRecord, AuthorizationDecision, Format, OverwritePolicy, Permission, RepoType,
-    Repository, Subject, VersionPolicy, Visibility, authorize,
+    AccessSurface, AclRecord, AuthorizationDecision, Format, OverwritePolicy, Permission,
+    ProtocolRepositoryContext, RepoType, Repository, Subject, VersionPolicy, Visibility, authorize,
 };
 use crate::error::ApiError;
 use crate::persistence::{
@@ -307,6 +307,48 @@ pub async fn protocol_repository(
     authorized_repository_for(pool, subject, name, action, AccessSurface::Protocol).await
 }
 
+/// 校验 group 本身读取权限，再批量加载并过滤协议面不可读成员。
+pub async fn protocol_repository_context(
+    pool: &SqlitePool,
+    subject: Subject,
+    name: &str,
+) -> Result<ProtocolRepositoryContext, ApiError> {
+    let repository = protocol_repository(pool, subject, name, Permission::Read).await?;
+    let members = if repository.repo_type == RepoType::Group {
+        protocol_group_members(pool, subject, repository.id).await?
+    } else {
+        Vec::new()
+    };
+    Ok(ProtocolRepositoryContext {
+        repository,
+        members,
+    })
+}
+
+async fn protocol_group_members(
+    pool: &SqlitePool,
+    subject: Subject,
+    group_repo_id: i64,
+) -> Result<Vec<Repository>, ApiError> {
+    let candidates =
+        persistence::find_protocol_group_member_access(pool, group_repo_id, subject.user_id())
+            .await?;
+    Ok(candidates
+        .into_iter()
+        .filter(|(repository, granted)| {
+            authorize(
+                subject,
+                repository.visibility,
+                *granted,
+                Permission::Read,
+                repository.disabled,
+                AccessSurface::Protocol,
+            ) == AuthorizationDecision::Allowed
+        })
+        .map(|(repository, _)| repository)
+        .collect())
+}
+
 async fn authorized_repository_for(
     pool: &SqlitePool,
     subject: Subject,
@@ -419,12 +461,26 @@ fn resolve_hosted(input: CreateRepository) -> Result<ResolvedCreate, ApiError> {
             format: input.format,
             repo_type: input.repo_type,
             visibility: input.visibility,
-            overwrite_policy: Some(input.overwrite_policy.unwrap_or(OverwritePolicy::Allow)),
+            overwrite_policy: Some(default_hosted_overwrite(
+                input.format,
+                input.overwrite_policy,
+            )),
             version_policy,
             upstream_url: None,
             upstream_credential_ref: None,
         },
         members: None,
+    })
+}
+
+fn default_hosted_overwrite(
+    format: Format,
+    configured: Option<OverwritePolicy>,
+) -> OverwritePolicy {
+    configured.unwrap_or(if format == Format::Maven {
+        OverwritePolicy::Deny
+    } else {
+        OverwritePolicy::Allow
     })
 }
 
@@ -709,7 +765,7 @@ mod tests {
         let maven = create_repository(&pool, admin(), hosted("maven-hosted", Format::Maven))
             .await
             .unwrap();
-        assert_eq!(maven.overwrite_policy, Some(OverwritePolicy::Allow));
+        assert_eq!(maven.overwrite_policy, Some(OverwritePolicy::Deny));
         assert_eq!(maven.version_policy, Some(VersionPolicy::Mixed));
 
         let invalid = CreateRepository {

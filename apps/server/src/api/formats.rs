@@ -7,7 +7,7 @@ use axum::response::Response;
 
 use crate::api::extractor::{ArtifactRoute, OptionalAuth, subject_from_optional};
 use crate::error::ApiError;
-use crate::protocol::raw;
+use crate::protocol::{self, raw};
 use crate::state::AppState;
 
 /// 读取仓库路径内容。
@@ -36,8 +36,9 @@ pub async fn get(
     State(state): State<AppState>,
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    raw::get(&state, subject_from_optional(auth), route, &uri).await
+    protocol::get(&state, subject_from_optional(auth), route, &uri, &headers).await
 }
 
 /// 探测仓库路径内容元数据。
@@ -64,8 +65,9 @@ pub async fn head(
     State(state): State<AppState>,
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    raw::head(&state, subject_from_optional(auth), route, &uri).await
+    protocol::head(&state, subject_from_optional(auth), route, &uri, &headers).await
 }
 
 /// 向仓库路径写入内容。
@@ -99,7 +101,7 @@ pub async fn put(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    raw::put(
+    protocol::put(
         &state,
         subject_from_optional(auth),
         route,
@@ -135,7 +137,7 @@ pub async fn delete(
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, ApiError> {
-    raw::delete(&state, subject_from_optional(auth), route, &uri).await
+    protocol::delete(&state, subject_from_optional(auth), route, &uri).await
 }
 
 /// 读取仓库根目录。
@@ -159,8 +161,9 @@ pub async fn root_get(
     State(state): State<AppState>,
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    raw::get(&state, subject_from_optional(auth), route, &uri).await
+    protocol::get(&state, subject_from_optional(auth), route, &uri, &headers).await
 }
 
 /// 仓库根目录不支持 HEAD。
@@ -181,8 +184,9 @@ pub async fn root_head(
     State(state): State<AppState>,
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    raw::head(&state, subject_from_optional(auth), route, &uri).await
+    protocol::head(&state, subject_from_optional(auth), route, &uri, &headers).await
 }
 
 /// 仓库根目录不支持写入。
@@ -207,7 +211,7 @@ pub async fn root_put(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    raw::put(
+    protocol::put(
         &state,
         subject_from_optional(auth),
         route,
@@ -238,5 +242,5 @@ pub async fn root_delete(
     route: ArtifactRoute,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, ApiError> {
-    raw::delete(&state, subject_from_optional(auth), route, &uri).await
+    protocol::delete(&state, subject_from_optional(auth), route, &uri).await
 }

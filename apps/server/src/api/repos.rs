@@ -1,10 +1,10 @@
-//! 仓库核心管理 API：元数据生命周期、可见性、ACL、制品浏览与路径搜索。
-//! 使用片段仍保持契约占位，格式协议由 protocol 分域实现。
+//! 仓库核心管理 API：元数据生命周期、可见性、ACL、制品浏览、路径搜索与使用片段。
+//! 格式协议由 protocol 分域实现。
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
@@ -321,6 +321,159 @@ pub struct UsageSnippet {
     pub title: String,
     /// 可复制内容。
     pub content: String,
+}
+
+fn usage_base_url(state: &AppState, headers: &HeaderMap, uri: &Uri) -> Result<String, ApiError> {
+    if let Some(configured) = state
+        .config
+        .public_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_public_base_url(configured);
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(invalid_usage_origin)?;
+    host.parse::<axum::http::uri::Authority>()
+        .map_err(|_| invalid_usage_origin())?;
+    let scheme = request_scheme(headers, uri)?;
+    Ok(format!("{scheme}://{host}"))
+}
+
+fn normalize_public_base_url(value: &str) -> Result<String, ApiError> {
+    let uri = value.parse::<Uri>().map_err(|_| invalid_usage_origin())?;
+    match (uri.scheme_str(), uri.authority()) {
+        (Some("http" | "https"), Some(_)) if uri.query().is_none() => {
+            Ok(value.trim_end_matches('/').to_string())
+        }
+        _ => Err(invalid_usage_origin()),
+    }
+}
+
+fn request_scheme<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Result<&'a str, ApiError> {
+    let forwarded = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim);
+    let scheme = forwarded.or_else(|| uri.scheme_str()).unwrap_or("http");
+    match scheme {
+        "http" | "https" => Ok(scheme),
+        _ => Err(invalid_usage_origin()),
+    }
+}
+
+fn invalid_usage_origin() -> ApiError {
+    ApiError::bad_request("USAGE_INVALID_ORIGIN", "无法确定有效的仓库公开地址")
+}
+
+fn usage_snippets(repository: &Repository, origin: &str) -> Vec<UsageSnippet> {
+    let repository_url = format!("{origin}/repository/{}", repository.name);
+    match repository.format {
+        Format::Raw => raw_usage(repository.repo_type, &repository_url),
+        Format::Maven => maven_usage(&repository.name, &repository_url),
+        Format::Npm => npm_usage(repository.repo_type, &repository_url),
+    }
+}
+
+fn snippet(title: &str, content: String) -> UsageSnippet {
+    UsageSnippet {
+        title: title.to_string(),
+        content,
+    }
+}
+
+fn raw_usage(repo_type: RepoType, repository_url: &str) -> Vec<UsageSnippet> {
+    let mut snippets = Vec::new();
+    if repo_type == RepoType::Hosted {
+        snippets.push(snippet(
+            "curl 上传",
+            format!("curl -u <用户名>:<令牌> -T ./文件.bin {repository_url}/文件.bin"),
+        ));
+    }
+    snippets.push(snippet(
+        "curl 下载",
+        format!("curl -u <用户名>:<令牌> -O {repository_url}/文件.bin"),
+    ));
+    snippets
+}
+
+fn maven_usage(name: &str, repository_url: &str) -> Vec<UsageSnippet> {
+    vec![
+        snippet(
+            "pom.xml 仓库配置",
+            format!(
+                "<repository>\n  <id>{name}</id>\n  <url>{repository_url}</url>\n</repository>"
+            ),
+        ),
+        snippet(
+            "settings.xml 凭据",
+            format!(
+                "<server>\n  <id>{name}</id>\n  <username><用户名></username>\n  <password><令牌></password>\n</server>"
+            ),
+        ),
+        snippet(
+            "build.gradle（Groovy DSL）",
+            format!(
+                "maven {{\n  url = uri('{repository_url}')\n  credentials {{\n    username = '<用户名>'\n    password = '<令牌>'\n  }}\n}}"
+            ),
+        ),
+        snippet(
+            "build.gradle.kts（Kotlin DSL）",
+            format!(
+                "maven {{\n  url = uri(\"{repository_url}\")\n  credentials {{\n    username = \"<用户名>\"\n    password = \"<令牌>\"\n  }}\n}}"
+            ),
+        ),
+    ]
+}
+
+fn npm_usage(repo_type: RepoType, repository_url: &str) -> Vec<UsageSnippet> {
+    let registry = format!("{repository_url}/");
+    let auth_path = repository_url
+        .strip_prefix("https://")
+        .or_else(|| repository_url.strip_prefix("http://"))
+        .unwrap_or(repository_url);
+    let mut snippets = vec![
+        snippet(
+            ".npmrc 配置",
+            format!("registry={registry}\n//{auth_path}/:_authToken=<令牌>"),
+        ),
+        snippet(
+            ".yarnrc.yml 配置",
+            format!("npmRegistryServer: \"{repository_url}\"\nnpmAuthToken: \"<令牌>\""),
+        ),
+    ];
+    snippets.extend(npm_client_usage(repo_type, &registry));
+    snippets
+}
+
+fn npm_client_usage(repo_type: RepoType, registry: &str) -> Vec<UsageSnippet> {
+    let hosted = repo_type == RepoType::Hosted;
+    [
+        ("npm", format!("npm install <包名> --registry={registry}")),
+        ("yarn", "yarn add <包名>".to_string()),
+        ("pnpm", format!("pnpm add <包名> --registry={registry}")),
+    ]
+    .into_iter()
+    .map(|(client, install)| {
+        let (title, content) = if hosted {
+            let publish = match client {
+                "yarn" => format!("yarn npm publish --publish-registry {registry}"),
+                _ => format!("{client} publish --registry={registry}"),
+            };
+            (
+                format!("{client} 安装与发布"),
+                format!("{install}\n{publish}"),
+            )
+        } else {
+            (format!("{client} 安装"), install)
+        };
+        snippet(&title, content)
+    })
+    .collect()
 }
 
 fn invalid_json(_: JsonRejection) -> ApiError {
@@ -728,6 +881,15 @@ pub async fn search(
         (status = 501, description = "使用片段尚未实现", body = crate::error::ErrorBody),
     ),
 )]
-pub async fn usage() -> ApiError {
-    ApiError::not_implemented("使用片段接口不在本批次范围")
+pub async fn usage(
+    auth: OptionalAuth,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<Json<Vec<UsageSnippet>>, ApiError> {
+    let repository =
+        repository::get_repository(&state.pool, subject_from_optional(auth), &name).await?;
+    let origin = usage_base_url(&state, &headers, &uri)?;
+    Ok(Json(usage_snippets(&repository, &origin)))
 }

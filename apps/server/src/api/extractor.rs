@@ -16,6 +16,7 @@ use crate::auth::revocation::{session_family_revoke_hash, session_revoke_hash};
 use crate::auth::token::hash_token;
 use crate::auth::{API_TOKEN_PREFIX, AuthIdentity, PASSWORD_CACHE_TTL_SECS, domain_hash};
 use crate::domain::Role;
+use crate::domain::encoding::strict_base64_decode;
 use crate::domain::repository::Subject;
 use crate::error::ApiError;
 use crate::persistence;
@@ -252,7 +253,7 @@ async fn identity_of_enabled_user(
 
 /// Basic：解码 `user:pass`；pass 先按 API Token 匹配，未命中再按账户口令（带 60 秒 Argon2 缓存）。
 async fn resolve_basic(state: &AppState, value: &str) -> Result<AuthIdentity, ApiError> {
-    let decoded = base64_decode(value).ok_or_else(err_unauthenticated)?;
+    let decoded = strict_base64_decode(value).ok_or_else(err_unauthenticated)?;
     let text = String::from_utf8(decoded).map_err(|_| err_unauthenticated())?;
     let (username, password) = text.split_once(':').ok_or_else(err_unauthenticated)?;
     // 先按 API Token 校验口令位：命中即用（供 CLI 以「任意用户名 + Token」方式鉴权）
@@ -319,114 +320,11 @@ fn cache_store(state: &AppState, key: String, user_id: i64) {
     cache.insert(key, (Instant::now(), user_id));
 }
 
-/// 标准 Base64 解码（RFC 4648），接受规范填充和无填充形式，仅供 Basic 凭据解码。
-/// 非法字符、非法填充、非法长度或非零未使用尾部位均返回 None（绝不 panic）。
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
-    let data_len = base64_data_len(bytes)?;
-    let data = &bytes[..data_len];
-    if !base64_tail_bits_are_zero(data) {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(data_len.saturating_mul(3) / 4);
-    for chunk in data.chunks(4) {
-        let first = base64_sextet(*chunk.first()?)?;
-        let second = base64_sextet(*chunk.get(1)?)?;
-        out.push((first << 2) | (second >> 4));
-        if let Some(&third) = chunk.get(2) {
-            let third = base64_sextet(third)?;
-            out.push((second << 4) | (third >> 2));
-            if let Some(&fourth) = chunk.get(3) {
-                out.push((third << 6) | base64_sextet(fourth)?);
-            }
-        }
-    }
-    Some(out)
-}
-
-/// 校验填充只能位于末尾，且填充数量与末组数据长度一致。
-fn base64_data_len(input: &[u8]) -> Option<usize> {
-    let padding = input.iter().rev().take_while(|&&byte| byte == b'=').count();
-    if padding > 2 {
-        return None;
-    }
-    let data_len = input.len().checked_sub(padding)?;
-    if input[..data_len].contains(&b'=') {
-        return None;
-    }
-    match padding {
-        0 if data_len % 4 != 1 => Some(data_len),
-        1 if input.len().is_multiple_of(4) && data_len % 4 == 3 => Some(data_len),
-        2 if input.len().is_multiple_of(4) && data_len % 4 == 2 => Some(data_len),
-        _ => None,
-    }
-}
-
-/// RFC 4648 要求末组未用于输出字节的低位必须为零。
-fn base64_tail_bits_are_zero(data: &[u8]) -> bool {
-    let Some(&last) = data.last() else {
-        return true;
-    };
-    let Some(last) = base64_sextet(last) else {
-        return false;
-    };
-    match data.len() % 4 {
-        2 => last & 0b0000_1111 == 0,
-        3 => last & 0b0000_0011 == 0,
-        _ => true,
-    }
-}
-
-/// 将标准 Base64 字母表字符转换为六位值。
-fn base64_sextet(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-
-    #[test]
-    fn base64解码接受标准填充与无填充形式() {
-        assert_eq!(base64_decode("dXNlcjpwYXNz").unwrap(), b"user:pass");
-        assert_eq!(base64_decode("YWRtaW46cHc=").unwrap(), b"admin:pw");
-        assert_eq!(base64_decode("Zg==").unwrap(), b"f");
-        assert_eq!(base64_decode("Zg").unwrap(), b"f");
-        assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
-        assert_eq!(base64_decode("Zm8").unwrap(), b"fo");
-        assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn base64解码拒绝填充位置与数量非法() {
-        for invalid in ["=AAA", "A=AA", "AA=A", "AA==A", "AAA==", "AAAA=", "AAAA=="] {
-            assert!(base64_decode(invalid).is_none(), "应拒绝 {invalid}");
-        }
-    }
-
-    #[test]
-    fn base64解码拒绝非法字符与长度() {
-        for invalid in ["****", "A", "AAAA A", " Zg==", "Zg== "] {
-            assert!(base64_decode(invalid).is_none(), "应拒绝 {invalid:?}");
-        }
-    }
-
-    #[test]
-    fn base64解码拒绝非零未使用尾部位() {
-        for invalid in ["AB==", "AB", "AAB=", "AAB"] {
-            assert!(base64_decode(invalid).is_none(), "应拒绝 {invalid}");
-        }
-    }
 
     #[test]
     fn 拆分鉴权头() {

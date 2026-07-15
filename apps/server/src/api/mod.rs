@@ -117,7 +117,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 
 /// 装配全部路由与中间件。
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/api/v1/openapi.json", get(openapi_json))
@@ -185,8 +185,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/migration/tasks/{id}/report",
             get(migration::task_report),
-        )
-        // 请求标识：入站缺失则生成 UUID，并在响应头回传，便于日志关联
+        );
+    #[cfg(feature = "embedded-web")]
+    let router = router.fallback(crate::web::fallback);
+    // 请求标识：入站缺失则生成 UUID，并在响应头回传，便于日志关联
+    router
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .with_state(state)

@@ -90,6 +90,10 @@ async fn setup() -> TestContext {
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: 8,
+        public_base_url: None,
+        maven_metadata_ttl_secs: 1800,
+        npm_packument_ttl_secs: 1800,
+        npm_publish_max_bytes: 134_217_728,
         max_artifact_bytes: 1024 * 1024,
         min_free_bytes: 0,
         min_free_percent: 0,
@@ -814,7 +818,7 @@ async fn 协议授权隐藏私有与停用仓库并拒绝无效路径和不支�
         )
         .await
         .status,
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::BAD_REQUEST
     );
     for repo in ["raw-group", "raw-proxy-write"] {
         assert_eq!(

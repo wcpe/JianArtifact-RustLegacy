@@ -2,6 +2,7 @@
 //! 依赖方向：domain（领域）→ auth（认证原语）/ persistence（基础设施），不反向依赖 api 入口层。
 
 pub mod artifact;
+pub mod encoding;
 pub mod repository;
 
 use serde::{Deserialize, Serialize};

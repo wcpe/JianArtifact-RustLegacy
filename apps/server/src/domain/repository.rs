@@ -216,6 +216,13 @@ pub struct Repository {
     pub created_at: String,
 }
 
+/// 协议入口使用的仓库上下文；group 成员已按配置顺序过滤为可读且启用的完整仓库。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolRepositoryContext {
+    pub repository: Repository,
+    pub members: Vec<Repository>,
+}
+
 /// ACL 条目领域实体。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclRecord {

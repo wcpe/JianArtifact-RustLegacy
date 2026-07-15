@@ -23,6 +23,14 @@ pub struct Config {
     pub jwt_secret: String,
     /// 会话令牌有效期（小时），默认 8。
     pub session_ttl_hours: u64,
+    /// 对外公开基础地址；未配置时由协议实现按请求上下文决定。
+    pub public_base_url: Option<String>,
+    /// Maven 元数据缓存有效期秒数，默认 1800。
+    pub maven_metadata_ttl_secs: u64,
+    /// npm packument 缓存有效期秒数，默认 1800。
+    pub npm_packument_ttl_secs: u64,
+    /// npm publish 请求最大字节数，默认 128 MiB。
+    pub npm_publish_max_bytes: u64,
     /// 单个制品允许写入的最大实际字节数，默认 5 GiB。
     pub max_artifact_bytes: u64,
     /// blob 写入前要求的最小可用空间字节数，默认 5 GiB。
@@ -41,6 +49,10 @@ impl Default for Config {
             // 密钥无内置默认值，须经环境变量注入；空值在 build_app 处被拒绝启动
             jwt_secret: String::new(),
             session_ttl_hours: 8,
+            public_base_url: None,
+            maven_metadata_ttl_secs: 1800,
+            npm_packument_ttl_secs: 1800,
+            npm_publish_max_bytes: 134_217_728,
             max_artifact_bytes: 5 * 1024 * 1024 * 1024,
             min_free_bytes: 5 * 1024 * 1024 * 1024,
             min_free_percent: 5,
@@ -76,6 +88,10 @@ mod tests {
         assert_eq!(config.max_artifact_bytes, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.min_free_bytes, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.min_free_percent, 5);
+        assert_eq!(config.public_base_url, None);
+        assert_eq!(config.maven_metadata_ttl_secs, 1800);
+        assert_eq!(config.npm_packument_ttl_secs, 1800);
+        assert_eq!(config.npm_publish_max_bytes, 134_217_728);
         let value = serde_json::to_value(config)?;
         assert!(value.get("max-artifact-bytes").is_some());
         assert!(value.get("min-free-bytes").is_some());

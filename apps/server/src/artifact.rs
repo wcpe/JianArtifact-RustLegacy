@@ -12,8 +12,19 @@ use tokio::sync::Notify;
 use crate::error::ApiError;
 use crate::persistence::{
     self, ArtifactCommitError, ArtifactDirectoryEntry, ArtifactRecord, ArtifactWriteInput,
-    BlobReclamation,
+    BlobReclamation, NpmHostedVersionInput, NpmProxyPackumentInput, NpmVersionCommitError,
 };
+pub use crate::persistence::{NpmPackageRecord, NpmProxyPackument, NpmProxyTarballInput};
+
+/// npm hosted 发布提交参数。
+pub struct NpmHostedCommit {
+    pub repo_id: i64,
+    pub package_name: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub tarball_path: String,
+    pub dist_tags: Vec<String>,
+}
 use crate::storage::{
     AbandonedBlob, BlobDeletePermit, BlobMetadata, BlobReadHandle, BlobStore, BlobWriter,
     PendingBlob, StorageError,
@@ -172,6 +183,134 @@ impl ArtifactService {
         .await
     }
 
+    /// 原子提交 npm hosted tarball、manifest 与 dist-tag。
+    pub async fn commit_npm_hosted(
+        &self,
+        commit: NpmHostedCommit,
+        pending: PendingBlob,
+    ) -> Result<ArtifactRecord, ApiError> {
+        let input = NpmHostedVersionInput {
+            artifact: artifact_write_input(
+                commit.repo_id,
+                &commit.tarball_path,
+                pending.metadata(),
+                false,
+            ),
+            package_name: commit.package_name,
+            version: commit.version,
+            manifest_json: commit.manifest_json,
+            dist_tags: commit.dist_tags,
+        };
+        let result = persistence::commit_npm_hosted_version(&self.pool, &input).await;
+        self.complete_npm_pending(result, pending).await
+    }
+
+    /// 读取 npm hosted 包元数据。
+    pub async fn npm_package(
+        &self,
+        repo_id: i64,
+        package_name: &str,
+    ) -> Result<Option<NpmPackageRecord>, ApiError> {
+        persistence::find_npm_package(&self.pool, repo_id, package_name).await
+    }
+
+    /// 按多个仓库与同一包名批量读取 npm hosted 包元数据。
+    pub async fn npm_packages_batch(
+        &self,
+        repo_ids: &[i64],
+        package_name: &str,
+    ) -> Result<std::collections::BTreeMap<i64, NpmPackageRecord>, ApiError> {
+        persistence::find_npm_packages(&self.pool, repo_ids, package_name).await
+    }
+
+    /// 设置 npm dist-tag，返回目标版本是否存在。
+    pub async fn set_npm_dist_tag(
+        &self,
+        repo_id: i64,
+        package_name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<bool, ApiError> {
+        persistence::set_npm_dist_tag(&self.pool, repo_id, package_name, tag, version).await
+    }
+
+    /// 删除 npm dist-tag，返回是否命中。
+    pub async fn delete_npm_dist_tag(
+        &self,
+        repo_id: i64,
+        package_name: &str,
+        tag: &str,
+    ) -> Result<bool, ApiError> {
+        persistence::delete_npm_dist_tag(&self.pool, repo_id, package_name, tag).await
+    }
+
+    /// 读取 npm proxy packument 缓存。
+    pub async fn npm_proxy_packument(
+        &self,
+        repo_id: i64,
+        package_name: &str,
+    ) -> Result<Option<NpmProxyPackument>, ApiError> {
+        persistence::find_npm_proxy_packument(&self.pool, repo_id, package_name).await
+    }
+
+    /// 按多个仓库与同一包名批量读取 npm proxy packument 缓存。
+    pub async fn npm_proxy_packuments_batch(
+        &self,
+        repo_ids: &[i64],
+        package_name: &str,
+    ) -> Result<std::collections::BTreeMap<i64, NpmProxyPackument>, ApiError> {
+        persistence::find_npm_proxy_packuments(&self.pool, repo_ids, package_name).await
+    }
+
+    /// 原子替换 npm proxy packument 与最小 tarball 映射。
+    pub async fn cache_npm_proxy_packument(
+        &self,
+        input: &NpmProxyPackumentInput,
+    ) -> Result<(), ApiError> {
+        persistence::upsert_npm_proxy_packument(&self.pool, input)
+            .await
+            .map_err(map_npm_commit_error)
+    }
+
+    /// 原子提交 npm proxy tarball 与本地路径绑定。
+    pub async fn commit_npm_proxy_tarball(
+        &self,
+        repo_id: i64,
+        package_name: &str,
+        version: &str,
+        tarball_path: &str,
+        expected_upstream_url: &str,
+        pending: PendingBlob,
+    ) -> Result<ArtifactRecord, ApiError> {
+        let input = artifact_write_input(repo_id, tarball_path, pending.metadata(), true);
+        let result = persistence::commit_npm_proxy_tarball(
+            &self.pool,
+            &input,
+            package_name,
+            version,
+            expected_upstream_url,
+        )
+        .await;
+        self.complete_npm_pending(result, pending).await
+    }
+
+    async fn complete_npm_pending(
+        &self,
+        result: Result<ArtifactRecord, NpmVersionCommitError>,
+        pending: PendingBlob,
+    ) -> Result<ArtifactRecord, ApiError> {
+        match result {
+            Ok(record) => {
+                pending.complete().await;
+                Ok(record)
+            }
+            Err(error) => {
+                self.cleanup_abandoned(pending.abandon()).await;
+                Err(map_npm_commit_error(error))
+            }
+        }
+    }
+
     async fn commit_pending_inner(
         &self,
         repo_id: i64,
@@ -207,6 +346,11 @@ impl ArtifactService {
         })
     }
 
+    /// 丢弃尚未提交索引的待定 blob，并立即清理无引用内容。
+    pub async fn discard_pending(&self, pending: PendingBlob) {
+        self.cleanup_abandoned(pending.abandon()).await;
+    }
+
     /// 按仓库与路径读取索引及带租约的 blob 句柄。
     pub async fn read(&self, repo_id: i64, path: &str) -> Result<Option<ArtifactRead>, ApiError> {
         let Some(record) = persistence::find_artifact_by_path(&self.pool, repo_id, path).await?
@@ -219,6 +363,43 @@ impl ArtifactService {
             .await
             .map_err(map_storage_error)?;
         Ok(Some(ArtifactRead { record, blob }))
+    }
+
+    /// 按多个仓库与同一路径批量读取制品记录。
+    pub async fn find_by_path_batch(
+        &self,
+        repo_ids: &[i64],
+        path: &str,
+    ) -> Result<std::collections::BTreeMap<i64, ArtifactRecord>, ApiError> {
+        persistence::find_artifacts_by_path(&self.pool, repo_ids, path).await
+    }
+
+    /// 按路径前缀稳定列出完整制品记录。
+    pub async fn list_by_prefix(
+        &self,
+        repo_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<ArtifactRecord>, ApiError> {
+        persistence::list_artifacts_by_prefix(&self.pool, repo_id, prefix).await
+    }
+
+    /// 按多个仓库与同一路径前缀批量列出制品记录。
+    pub async fn list_by_prefix_batch(
+        &self,
+        repo_ids: &[i64],
+        prefix: &str,
+    ) -> Result<std::collections::BTreeMap<i64, Vec<ArtifactRecord>>, ApiError> {
+        persistence::list_artifacts_by_prefix_batch(&self.pool, repo_ids, prefix).await
+    }
+
+    /// 按 TTL 读取制品索引及新鲜度。
+    pub async fn cache_status(
+        &self,
+        repo_id: i64,
+        path: &str,
+        ttl_secs: u64,
+    ) -> Result<Option<persistence::ArtifactCacheStatus>, ApiError> {
+        persistence::find_artifact_cache_status(&self.pool, repo_id, path, ttl_secs).await
     }
 
     /// 分页列出目录的直接子项。
@@ -476,6 +657,20 @@ fn map_commit_error(error: ArtifactCommitError) -> ApiError {
             "代理仓库配置连续变化，请稍后重试",
         ),
         ArtifactCommitError::Internal(error) => error,
+    }
+}
+
+fn map_npm_commit_error(error: NpmVersionCommitError) -> ApiError {
+    match error {
+        NpmVersionCommitError::Conflict => {
+            ApiError::forbidden("NPM_VERSION_IMMUTABLE", "不能覆盖已发布的 npm 版本")
+        }
+        NpmVersionCommitError::StaleProxyConfiguration => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PROXY_CONFIGURATION_CHANGED",
+            "代理仓库配置连续变化，请稍后重试",
+        ),
+        NpmVersionCommitError::Internal(error) => error,
     }
 }
 

@@ -14,6 +14,8 @@ pub mod protocol;
 pub mod repository;
 pub mod state;
 pub mod storage;
+#[cfg(feature = "embedded-web")]
+pub mod web;
 
 use axum::Router;
 
@@ -121,6 +123,10 @@ mod tests {
             log_level: "warn".to_string(),
             jwt_secret: JWT_SECRET.to_string(),
             session_ttl_hours: 8,
+            public_base_url: None,
+            maven_metadata_ttl_secs: 1800,
+            npm_packument_ttl_secs: 1800,
+            npm_publish_max_bytes: 134_217_728,
             max_artifact_bytes: 5 * 1024 * 1024 * 1024,
             min_free_bytes: 5 * 1024 * 1024 * 1024,
             min_free_percent: 5,

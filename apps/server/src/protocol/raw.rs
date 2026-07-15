@@ -18,7 +18,7 @@ use crate::api::extractor::ArtifactRoute;
 use crate::api::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 use crate::domain::artifact::{ArtifactDirectory, ArtifactPath};
 use crate::domain::repository::{
-    Format, OverwritePolicy, Permission, RepoType, Repository, Subject,
+    Format, OverwritePolicy, Permission, ProtocolRepositoryContext, RepoType, Repository, Subject,
 };
 use crate::error::ApiError;
 use crate::persistence::{ArtifactDirectoryEntry, ArtifactRecord};
@@ -58,15 +58,14 @@ pub async fn get(
     subject: Subject,
     route: ArtifactRoute,
     uri: &Uri,
+    context: ProtocolRepositoryContext,
 ) -> Result<Response, ApiError> {
-    let repository =
-        repository::protocol_repository(&state.pool, subject, &route.repository, Permission::Read)
-            .await?;
+    let repository = context.repository;
     ensure_raw(&repository)?;
     match repository.repo_type {
         RepoType::Hosted => hosted_get(state, &repository, &route, uri).await,
         RepoType::Proxy => proxy_get(state, subject, repository, &route, uri, false).await,
-        RepoType::Group => Err(not_implemented()),
+        RepoType::Group => group_get(state, subject, &context.members, &route, uri, false).await,
     }
 }
 
@@ -76,15 +75,14 @@ pub async fn head(
     subject: Subject,
     route: ArtifactRoute,
     uri: &Uri,
+    context: ProtocolRepositoryContext,
 ) -> Result<Response, ApiError> {
-    let repository =
-        repository::protocol_repository(&state.pool, subject, &route.repository, Permission::Read)
-            .await?;
+    let repository = context.repository;
     ensure_raw(&repository)?;
     match repository.repo_type {
         RepoType::Hosted => hosted_head(state, &repository, &route, uri).await,
         RepoType::Proxy => proxy_get(state, subject, repository, &route, uri, true).await,
-        RepoType::Group => Err(not_implemented()),
+        RepoType::Group => group_get(state, subject, &context.members, &route, uri, true).await,
     }
 }
 
@@ -96,10 +94,9 @@ pub async fn put(
     uri: &Uri,
     headers: &HeaderMap,
     body: Body,
+    context: ProtocolRepositoryContext,
 ) -> Result<Response, ApiError> {
-    let repository =
-        repository::protocol_repository(&state.pool, subject, &route.repository, Permission::Read)
-            .await?;
+    let repository = context.repository;
     ensure_raw(&repository)?;
     let path = artifact_path(&route, uri)?;
     ensure_hosted_type(&repository, uri)?;
@@ -115,10 +112,9 @@ pub async fn delete(
     subject: Subject,
     route: ArtifactRoute,
     uri: &Uri,
+    context: ProtocolRepositoryContext,
 ) -> Result<Response, ApiError> {
-    let repository =
-        repository::protocol_repository(&state.pool, subject, &route.repository, Permission::Read)
-            .await?;
+    let repository = context.repository;
     ensure_raw(&repository)?;
     let path = artifact_path(&route, uri)?;
     ensure_hosted_type(&repository, uri)?;
@@ -128,6 +124,76 @@ pub async fn delete(
         Some(_) => Ok(StatusCode::NO_CONTENT.into_response()),
         None => Err(artifact_not_found()),
     }
+}
+
+async fn group_get(
+    state: &AppState,
+    subject: Subject,
+    members: &[Repository],
+    route: &ArtifactRoute,
+    uri: &Uri,
+    head: bool,
+) -> Result<Response, ApiError> {
+    if route.trailing_slash {
+        if head {
+            return Err(invalid_path());
+        }
+        return group_directory(state, members, route, uri).await;
+    }
+    let path = artifact_path(route, uri)?;
+    let repo_ids = members.iter().map(|member| member.id).collect::<Vec<_>>();
+    let cached = state
+        .artifacts
+        .find_by_path_batch(&repo_ids, path.as_str())
+        .await?;
+    for member in members {
+        if cached.contains_key(&member.id) {
+            return local_artifact_response(state, member.id, &path, head).await;
+        }
+        if member.repo_type != RepoType::Proxy {
+            continue;
+        }
+        let member_route = ArtifactRoute {
+            repository: member.name.clone(),
+            path: route.path.clone(),
+            trailing_slash: false,
+        };
+        match proxy_get(state, subject, member.clone(), &member_route, uri, head).await {
+            Err(error) if error.status() == StatusCode::NOT_FOUND => continue,
+            result => return result,
+        }
+    }
+    Err(artifact_not_found())
+}
+
+async fn group_directory(
+    state: &AppState,
+    members: &[Repository],
+    route: &ArtifactRoute,
+    uri: &Uri,
+) -> Result<Response, ApiError> {
+    validate_encoded_path(uri)?;
+    let directory = ArtifactDirectory::parse(&route.path).map_err(|_| invalid_path())?;
+    let query = parse_directory_query(uri.query())?;
+    for member in members
+        .iter()
+        .filter(|member| member.repo_type == RepoType::Hosted)
+    {
+        let (entries, total) = state
+            .artifacts
+            .list_directory(member.id, directory.as_str(), query.page, query.page_size)
+            .await?;
+        if total > 0 {
+            return Ok(Json(DirectoryResponse {
+                items: entries.into_iter().map(DirectoryItem::from).collect(),
+                page: query.page,
+                page_size: query.page_size,
+                total,
+            })
+            .into_response());
+        }
+    }
+    Err(artifact_not_found())
 }
 
 async fn hosted_get(

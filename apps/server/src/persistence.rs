@@ -54,9 +54,10 @@ pub async fn referenced_blob_hashes(pool: &SqlitePool) -> Result<HashSet<String>
 
 const ARTIFACT_COLUMNS: &str =
     "id, repo_id, path, sha256, sha1, md5, sha512, size, cached, created_at, updated_at";
+const BATCH_ARTIFACT_COLUMNS: &str = "artifacts.id, artifacts.repo_id, artifacts.path, artifacts.sha256, artifacts.sha1, artifacts.md5, artifacts.sha512, artifacts.size, artifacts.cached, artifacts.created_at, artifacts.updated_at";
 
 /// 制品索引记录。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactRecord {
     pub id: i64,
     pub repo_id: i64,
@@ -81,6 +82,84 @@ pub struct ArtifactWriteInput {
     pub sha512: String,
     pub size: u64,
     pub cached: bool,
+}
+
+/// 制品缓存状态，携带更新时间与按 TTL 计算的新鲜度。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArtifactCacheStatus {
+    pub record: ArtifactRecord,
+    pub fresh: bool,
+}
+
+/// npm hosted 版本原子提交输入。
+pub struct NpmHostedVersionInput {
+    pub artifact: ArtifactWriteInput,
+    pub package_name: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub dist_tags: Vec<String>,
+}
+
+/// npm proxy tarball 映射输入。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NpmProxyTarballInput {
+    pub version: String,
+    pub tarball_url: String,
+    pub integrity: Option<String>,
+    pub shasum: Option<String>,
+    pub artifact_path: Option<String>,
+}
+
+/// npm proxy 重写 packument 原子替换输入。
+pub struct NpmProxyPackumentInput {
+    pub repo_id: i64,
+    pub package_name: String,
+    pub rewritten_json: String,
+    pub upstream_url_snapshot: String,
+    pub ttl_secs: u64,
+    pub tarballs: Vec<NpmProxyTarballInput>,
+}
+
+/// npm proxy packument 缓存记录。
+#[derive(Debug, PartialEq, Eq)]
+pub struct NpmProxyPackument {
+    pub rewritten_json: String,
+    pub upstream_url_snapshot: String,
+    pub ttl_secs: u64,
+    pub fetched_at: String,
+    pub fresh: bool,
+    pub tarballs: Vec<NpmProxyTarballInput>,
+}
+
+/// npm hosted 版本记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmVersionRecord {
+    pub package_name: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub tarball_path: String,
+    pub sha1: String,
+    pub sha512: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// npm 包元数据记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmPackageRecord {
+    pub versions: Vec<NpmVersionRecord>,
+    pub dist_tags: BTreeMap<String, String>,
+}
+
+/// npm hosted 版本提交错误。
+#[derive(Debug, thiserror::Error)]
+pub enum NpmVersionCommitError {
+    #[error("npm 版本已存在")]
+    Conflict,
+    #[error("代理仓库配置已变化")]
+    StaleProxyConfiguration,
+    #[error("npm 版本提交失败")]
+    Internal(ApiError),
 }
 
 /// 持久化 blob 回收令牌。
@@ -177,6 +256,76 @@ struct ArtifactRow {
     updated_at: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct ArtifactCacheStatusRow {
+    id: i64,
+    repo_id: i64,
+    path: String,
+    sha256: String,
+    sha1: String,
+    md5: String,
+    sha512: String,
+    size: i64,
+    cached: bool,
+    created_at: String,
+    updated_at: String,
+    fresh: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct NpmVersionRow {
+    package_name: String,
+    version: String,
+    manifest_json: String,
+    tarball_path: String,
+    sha1: String,
+    sha512: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct NpmProxyPackumentRow {
+    rewritten_json: String,
+    upstream_url_snapshot: String,
+    ttl_secs: i64,
+    fetched_at: String,
+    fresh: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct BatchNpmVersionRow {
+    repo_id: i64,
+    package_name: String,
+    version: String,
+    manifest_json: String,
+    tarball_path: String,
+    sha1: String,
+    sha512: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct BatchNpmProxyPackumentRow {
+    repo_id: i64,
+    rewritten_json: String,
+    upstream_url_snapshot: String,
+    ttl_secs: i64,
+    fetched_at: String,
+    fresh: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct BatchNpmProxyTarballRow {
+    repo_id: i64,
+    version: String,
+    tarball_url: String,
+    integrity: Option<String>,
+    shasum: Option<String>,
+    artifact_path: Option<String>,
+}
+
 impl From<BlobReclamationRow> for BlobReclamation {
     fn from(row: BlobReclamationRow) -> Self {
         Self {
@@ -216,6 +365,43 @@ impl TryFrom<ArtifactRow> for ArtifactRecord {
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
+    }
+}
+
+impl TryFrom<ArtifactCacheStatusRow> for ArtifactCacheStatus {
+    type Error = ApiError;
+
+    fn try_from(row: ArtifactCacheStatusRow) -> Result<Self, Self::Error> {
+        let fresh = row.fresh;
+        let record = ArtifactRecord::try_from(ArtifactRow {
+            id: row.id,
+            repo_id: row.repo_id,
+            path: row.path,
+            sha256: row.sha256,
+            sha1: row.sha1,
+            md5: row.md5,
+            sha512: row.sha512,
+            size: row.size,
+            cached: row.cached,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })?;
+        Ok(Self { record, fresh })
+    }
+}
+
+impl From<NpmVersionRow> for NpmVersionRecord {
+    fn from(row: NpmVersionRow) -> Self {
+        Self {
+            package_name: row.package_name,
+            version: row.version,
+            manifest_json: row.manifest_json,
+            tarball_path: row.tarball_path,
+            sha1: row.sha1,
+            sha512: row.sha512,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
     }
 }
 
@@ -356,6 +542,116 @@ pub async fn find_artifact_by_path(
         .map_err(|_| ApiError::internal("查询制品失败"))?
         .map(ArtifactRecord::try_from)
         .transpose()
+}
+
+/// 按多个仓库与同一路径批量读取制品索引。
+pub async fn find_artifacts_by_path(
+    pool: &SqlitePool,
+    repo_ids: &[i64],
+    path: &str,
+) -> Result<BTreeMap<i64, ArtifactRecord>, ApiError> {
+    if repo_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let sql = format!(
+        "WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT {BATCH_ARTIFACT_COLUMNS} FROM artifacts JOIN requested ON requested.repo_id = artifacts.repo_id WHERE artifacts.path = ? ORDER BY artifacts.repo_id, artifacts.id"
+    );
+    let rows = sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id_payload(repo_ids)?)
+        .bind(path)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量查询制品失败"))?;
+    artifact_rows_by_repo(rows)
+}
+
+/// 按多个仓库与同一路径前缀批量列出制品索引。
+pub async fn list_artifacts_by_prefix_batch(
+    pool: &SqlitePool,
+    repo_ids: &[i64],
+    prefix: &str,
+) -> Result<BTreeMap<i64, Vec<ArtifactRecord>>, ApiError> {
+    if repo_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let pattern = format!("{}%", escape_like(prefix));
+    let sql = format!(
+        "WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT {BATCH_ARTIFACT_COLUMNS} FROM artifacts JOIN requested ON requested.repo_id = artifacts.repo_id WHERE artifacts.path LIKE ? ESCAPE '\\' ORDER BY artifacts.repo_id, artifacts.path, artifacts.id"
+    );
+    let rows = sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id_payload(repo_ids)?)
+        .bind(pattern)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量按前缀查询制品失败"))?;
+    let mut records = BTreeMap::<i64, Vec<ArtifactRecord>>::new();
+    for row in rows {
+        let record = ArtifactRecord::try_from(row)?;
+        records.entry(record.repo_id).or_default().push(record);
+    }
+    Ok(records)
+}
+
+fn artifact_rows_by_repo(
+    rows: Vec<ArtifactRow>,
+) -> Result<BTreeMap<i64, ArtifactRecord>, ApiError> {
+    rows.into_iter()
+        .map(|row| {
+            let record = ArtifactRecord::try_from(row)?;
+            Ok((record.repo_id, record))
+        })
+        .collect()
+}
+
+fn repo_id_payload(repo_ids: &[i64]) -> Result<String, ApiError> {
+    serde_json::to_string(repo_ids).map_err(|_| ApiError::internal("序列化仓库标识列表失败"))
+}
+
+/// 按路径前缀列出完整制品记录，稳定按路径与标识排序。
+pub async fn list_artifacts_by_prefix(
+    pool: &SqlitePool,
+    repo_id: i64,
+    prefix: &str,
+) -> Result<Vec<ArtifactRecord>, ApiError> {
+    let pattern = format!("{}%", escape_like(prefix));
+    let sql = format!(
+        "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE repo_id = ? AND path LIKE ? ESCAPE '\\' ORDER BY path, id"
+    );
+    let rows = sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(repo_id)
+        .bind(pattern)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("按前缀查询制品失败"))?;
+    rows.into_iter().map(ArtifactRecord::try_from).collect()
+}
+
+/// 读取制品更新时间，并按调用方 TTL 计算缓存新鲜度。
+pub async fn find_artifact_cache_status(
+    pool: &SqlitePool,
+    repo_id: i64,
+    path: &str,
+    ttl_secs: u64,
+) -> Result<Option<ArtifactCacheStatus>, ApiError> {
+    let ttl = i64::try_from(ttl_secs).map_err(|_| ApiError::internal("缓存 TTL 超出数据库范围"))?;
+    let sql = format!(
+        "SELECT {ARTIFACT_COLUMNS}, (unixepoch('now') - unixepoch(updated_at) <= ?) AS fresh FROM artifacts WHERE repo_id = ? AND path = ?"
+    );
+    let row = sqlx::query_as::<_, ArtifactCacheStatusRow>(&sql)
+        .bind(ttl)
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询制品缓存状态失败"))?;
+    row.map(ArtifactCacheStatus::try_from).transpose()
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// 统计指定内容摘要的全局索引引用数。
@@ -586,6 +882,441 @@ async fn finish_artifact_upsert(
         reclamation,
         created: old.is_none(),
     })
+}
+
+/// 原子提交 npm hosted 的制品索引、版本清单与 dist-tag。
+pub async fn commit_npm_hosted_version(
+    pool: &SqlitePool,
+    input: &NpmHostedVersionInput,
+) -> Result<ArtifactRecord, NpmVersionCommitError> {
+    let size = artifact_size_i64(input.artifact.size).map_err(NpmVersionCommitError::Internal)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| npm_internal("开启 npm 发布事务失败"))?;
+    let sql = format!(
+        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {ARTIFACT_COLUMNS}"
+    );
+    let artifact = bind_artifact_write(
+        sqlx::query_as::<_, ArtifactRow>(&sql),
+        &input.artifact,
+        size,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(map_npm_commit_error)?;
+    insert_npm_version(&mut tx, input, artifact.id).await?;
+    replace_npm_tags(&mut tx, input).await?;
+    tx.commit()
+        .await
+        .map_err(|_| npm_internal("提交 npm 发布事务失败"))?;
+    ArtifactRecord::try_from(artifact).map_err(NpmVersionCommitError::Internal)
+}
+
+async fn insert_npm_version(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &NpmHostedVersionInput,
+    artifact_id: i64,
+) -> Result<(), NpmVersionCommitError> {
+    sqlx::query("INSERT INTO npm_versions (repo_id, package_name, version, manifest_json, tarball_path, artifact_id, sha256, sha1, md5, sha512) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(input.artifact.repo_id)
+        .bind(&input.package_name)
+        .bind(&input.version)
+        .bind(&input.manifest_json)
+        .bind(&input.artifact.path)
+        .bind(artifact_id)
+        .bind(&input.artifact.sha256)
+        .bind(&input.artifact.sha1)
+        .bind(&input.artifact.md5)
+        .bind(&input.artifact.sha512)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_npm_commit_error)?;
+    Ok(())
+}
+
+async fn replace_npm_tags(
+    tx: &mut Transaction<'_, Sqlite>,
+    input: &NpmHostedVersionInput,
+) -> Result<(), NpmVersionCommitError> {
+    let tags = serde_json::to_string(&input.dist_tags)
+        .map_err(|_| npm_internal("序列化 npm dist-tag 失败"))?;
+    sqlx::query("INSERT INTO npm_dist_tags (repo_id, package_name, tag, version) SELECT ?, ?, value, ? FROM json_each(?) WHERE true ON CONFLICT(repo_id, package_name, tag) DO UPDATE SET version = excluded.version, updated_at = datetime('now')")
+        .bind(input.artifact.repo_id)
+        .bind(&input.package_name)
+        .bind(&input.version)
+        .bind(tags)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_npm_commit_error)?;
+    Ok(())
+}
+
+fn map_npm_commit_error(error: sqlx::Error) -> NpmVersionCommitError {
+    match error {
+        sqlx::Error::Database(database_error) if database_error.is_unique_violation() => {
+            NpmVersionCommitError::Conflict
+        }
+        _ => npm_internal("写入 npm 发布元数据失败"),
+    }
+}
+
+fn npm_internal(message: &'static str) -> NpmVersionCommitError {
+    NpmVersionCommitError::Internal(ApiError::internal(message))
+}
+
+/// 读取 npm hosted 包的版本与 dist-tag。
+pub async fn find_npm_package(
+    pool: &SqlitePool,
+    repo_id: i64,
+    package_name: &str,
+) -> Result<Option<NpmPackageRecord>, ApiError> {
+    let versions = sqlx::query_as::<_, NpmVersionRow>("SELECT package_name, version, manifest_json, tarball_path, sha1, sha512, created_at, updated_at FROM npm_versions WHERE repo_id = ? AND package_name = ? ORDER BY created_at, version")
+        .bind(repo_id)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询 npm 包版本失败"))?;
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let tags: Vec<(String, String)> = sqlx::query_as("SELECT tag, version FROM npm_dist_tags WHERE repo_id = ? AND package_name = ? ORDER BY tag")
+        .bind(repo_id)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询 npm dist-tag 失败"))?;
+    Ok(Some(NpmPackageRecord {
+        versions: versions.into_iter().map(NpmVersionRecord::from).collect(),
+        dist_tags: tags.into_iter().collect(),
+    }))
+}
+
+/// 按多个仓库与同一包名批量读取 npm hosted 版本与 dist-tag。
+pub async fn find_npm_packages(
+    pool: &SqlitePool,
+    repo_ids: &[i64],
+    package_name: &str,
+) -> Result<BTreeMap<i64, NpmPackageRecord>, ApiError> {
+    if repo_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let payload = repo_id_payload(repo_ids)?;
+    let versions = batch_npm_versions(pool, &payload, package_name).await?;
+    let tags = batch_npm_tags(pool, &payload, package_name).await?;
+    let mut packages = BTreeMap::<i64, NpmPackageRecord>::new();
+    for row in versions {
+        packages
+            .entry(row.repo_id)
+            .or_insert_with(empty_npm_package)
+            .versions
+            .push(row.into_version());
+    }
+    for (repo_id, tag, version) in tags {
+        if let Some(package) = packages.get_mut(&repo_id) {
+            package.dist_tags.insert(tag, version);
+        }
+    }
+    Ok(packages)
+}
+
+async fn batch_npm_versions(
+    pool: &SqlitePool,
+    payload: &str,
+    package_name: &str,
+) -> Result<Vec<BatchNpmVersionRow>, ApiError> {
+    sqlx::query_as("WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT npm_versions.repo_id, npm_versions.package_name, npm_versions.version, npm_versions.manifest_json, npm_versions.tarball_path, npm_versions.sha1, npm_versions.sha512, npm_versions.created_at, npm_versions.updated_at FROM npm_versions JOIN requested ON requested.repo_id = npm_versions.repo_id WHERE npm_versions.package_name = ? ORDER BY npm_versions.repo_id, npm_versions.created_at, npm_versions.version")
+        .bind(payload)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量查询 npm 包版本失败"))
+}
+
+async fn batch_npm_tags(
+    pool: &SqlitePool,
+    payload: &str,
+    package_name: &str,
+) -> Result<Vec<(i64, String, String)>, ApiError> {
+    sqlx::query_as("WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT npm_dist_tags.repo_id, npm_dist_tags.tag, npm_dist_tags.version FROM npm_dist_tags JOIN requested ON requested.repo_id = npm_dist_tags.repo_id WHERE npm_dist_tags.package_name = ? ORDER BY npm_dist_tags.repo_id, npm_dist_tags.tag")
+        .bind(payload)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量查询 npm dist-tag 失败"))
+}
+
+fn empty_npm_package() -> NpmPackageRecord {
+    NpmPackageRecord {
+        versions: Vec::new(),
+        dist_tags: BTreeMap::new(),
+    }
+}
+
+impl BatchNpmVersionRow {
+    fn into_version(self) -> NpmVersionRecord {
+        NpmVersionRecord {
+            package_name: self.package_name,
+            version: self.version,
+            manifest_json: self.manifest_json,
+            tarball_path: self.tarball_path,
+            sha1: self.sha1,
+            sha512: self.sha512,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// 设置 npm dist-tag，目标版本不存在时不写入。
+pub async fn set_npm_dist_tag(
+    pool: &SqlitePool,
+    repo_id: i64,
+    package_name: &str,
+    tag: &str,
+    version: &str,
+) -> Result<bool, ApiError> {
+    let result = sqlx::query("INSERT INTO npm_dist_tags (repo_id, package_name, tag, version) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM npm_versions WHERE repo_id = ? AND package_name = ? AND version = ?) ON CONFLICT(repo_id, package_name, tag) DO UPDATE SET version = excluded.version, updated_at = datetime('now')")
+        .bind(repo_id)
+        .bind(package_name)
+        .bind(tag)
+        .bind(version)
+        .bind(repo_id)
+        .bind(package_name)
+        .bind(version)
+        .execute(pool)
+        .await
+        .map_err(|_| ApiError::internal("设置 npm dist-tag 失败"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 删除 npm dist-tag。
+pub async fn delete_npm_dist_tag(
+    pool: &SqlitePool,
+    repo_id: i64,
+    package_name: &str,
+    tag: &str,
+) -> Result<bool, ApiError> {
+    let result =
+        sqlx::query("DELETE FROM npm_dist_tags WHERE repo_id = ? AND package_name = ? AND tag = ?")
+            .bind(repo_id)
+            .bind(package_name)
+            .bind(tag)
+            .execute(pool)
+            .await
+            .map_err(|_| ApiError::internal("删除 npm dist-tag 失败"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 原子替换 npm proxy 的重写 packument 与最小 tarball 上游映射。
+pub async fn upsert_npm_proxy_packument(
+    pool: &SqlitePool,
+    input: &NpmProxyPackumentInput,
+) -> Result<(), NpmVersionCommitError> {
+    let ttl = i64::try_from(input.ttl_secs.max(1))
+        .map_err(|_| npm_internal("npm 缓存 TTL 超出数据库范围"))?;
+    let tarballs = serde_json::to_string(&input.tarballs)
+        .map_err(|_| npm_internal("序列化 npm tarball 映射失败"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| npm_internal("开启 npm packument 缓存事务失败"))?;
+    let current: Option<(String,)> = sqlx::query_as(
+        "SELECT upstream_url FROM repositories WHERE id = ? AND repo_type = 'proxy'",
+    )
+    .bind(input.repo_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| npm_internal("核对 npm 上游快照失败"))?;
+    if current.as_ref().map(|row| row.0.as_str()) != Some(input.upstream_url_snapshot.as_str()) {
+        return Err(NpmVersionCommitError::StaleProxyConfiguration);
+    }
+    sqlx::query("INSERT INTO npm_proxy_packuments (repo_id, package_name, rewritten_json, upstream_url_snapshot, ttl_secs, fetched_at, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now', '+' || ? || ' seconds')) ON CONFLICT(repo_id, package_name) DO UPDATE SET rewritten_json = excluded.rewritten_json, upstream_url_snapshot = excluded.upstream_url_snapshot, ttl_secs = excluded.ttl_secs, fetched_at = excluded.fetched_at, expires_at = excluded.expires_at")
+        .bind(input.repo_id)
+        .bind(&input.package_name)
+        .bind(&input.rewritten_json)
+        .bind(&input.upstream_url_snapshot)
+        .bind(ttl)
+        .bind(ttl)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| npm_internal("写入 npm packument 缓存失败"))?;
+    sqlx::query("DELETE FROM npm_proxy_tarballs WHERE repo_id = ? AND package_name = ?")
+        .bind(input.repo_id)
+        .bind(&input.package_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| npm_internal("清理旧 npm tarball 映射失败"))?;
+    sqlx::query("INSERT INTO npm_proxy_tarballs (repo_id, package_name, version, tarball_url, integrity, shasum, artifact_path) SELECT ?, ?, json_extract(value, '$.version'), json_extract(value, '$.tarball_url'), json_extract(value, '$.integrity'), json_extract(value, '$.shasum'), json_extract(value, '$.artifact_path') FROM json_each(?)")
+        .bind(input.repo_id)
+        .bind(&input.package_name)
+        .bind(tarballs)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| npm_internal("写入 npm tarball 映射失败"))?;
+    tx.commit()
+        .await
+        .map_err(|_| npm_internal("提交 npm packument 缓存事务失败"))?;
+    Ok(())
+}
+
+/// 读取 npm proxy packument 与 tarball 映射。
+pub async fn find_npm_proxy_packument(
+    pool: &SqlitePool,
+    repo_id: i64,
+    package_name: &str,
+) -> Result<Option<NpmProxyPackument>, ApiError> {
+    let row = sqlx::query_as::<_, NpmProxyPackumentRow>("SELECT rewritten_json, upstream_url_snapshot, ttl_secs, fetched_at, (unixepoch('now') < unixepoch(expires_at)) AS fresh FROM npm_proxy_packuments WHERE repo_id = ? AND package_name = ?")
+        .bind(repo_id)
+        .bind(package_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询 npm packument 缓存失败"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let tarballs = sqlx::query_as::<_, (String, String, Option<String>, Option<String>, Option<String>)>("SELECT version, tarball_url, integrity, shasum, artifact_path FROM npm_proxy_tarballs WHERE repo_id = ? AND package_name = ? ORDER BY version")
+        .bind(repo_id)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询 npm tarball 映射失败"))?
+        .into_iter()
+        .map(|row| NpmProxyTarballInput {
+            version: row.0,
+            tarball_url: row.1,
+            integrity: row.2,
+            shasum: row.3,
+            artifact_path: row.4,
+        })
+        .collect();
+    let ttl_secs =
+        u64::try_from(row.ttl_secs).map_err(|_| ApiError::internal("npm 缓存 TTL 非法"))?;
+    Ok(Some(NpmProxyPackument {
+        rewritten_json: row.rewritten_json,
+        upstream_url_snapshot: row.upstream_url_snapshot,
+        ttl_secs,
+        fetched_at: row.fetched_at,
+        fresh: row.fresh,
+        tarballs,
+    }))
+}
+
+/// 按多个仓库与同一包名批量读取 npm proxy packument 与 tarball 映射。
+pub async fn find_npm_proxy_packuments(
+    pool: &SqlitePool,
+    repo_ids: &[i64],
+    package_name: &str,
+) -> Result<BTreeMap<i64, NpmProxyPackument>, ApiError> {
+    if repo_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let payload = repo_id_payload(repo_ids)?;
+    let packuments = batch_npm_proxy_packuments(pool, &payload, package_name).await?;
+    let tarballs = batch_npm_proxy_tarballs(pool, &payload, package_name).await?;
+    let mut result = BTreeMap::new();
+    for row in packuments {
+        result.insert(row.repo_id, row.try_into_packument()?);
+    }
+    for row in tarballs {
+        if let Some(packument) = result.get_mut(&row.repo_id) {
+            packument.tarballs.push(row.into_tarball());
+        }
+    }
+    Ok(result)
+}
+
+async fn batch_npm_proxy_packuments(
+    pool: &SqlitePool,
+    payload: &str,
+    package_name: &str,
+) -> Result<Vec<BatchNpmProxyPackumentRow>, ApiError> {
+    sqlx::query_as("WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT npm_proxy_packuments.repo_id, npm_proxy_packuments.rewritten_json, npm_proxy_packuments.upstream_url_snapshot, npm_proxy_packuments.ttl_secs, npm_proxy_packuments.fetched_at, (unixepoch('now') < unixepoch(npm_proxy_packuments.expires_at)) AS fresh FROM npm_proxy_packuments JOIN requested ON requested.repo_id = npm_proxy_packuments.repo_id WHERE npm_proxy_packuments.package_name = ? ORDER BY npm_proxy_packuments.repo_id")
+        .bind(payload)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量查询 npm packument 缓存失败"))
+}
+
+async fn batch_npm_proxy_tarballs(
+    pool: &SqlitePool,
+    payload: &str,
+    package_name: &str,
+) -> Result<Vec<BatchNpmProxyTarballRow>, ApiError> {
+    sqlx::query_as("WITH requested(repo_id) AS (SELECT DISTINCT CAST(value AS INTEGER) FROM json_each(?)) SELECT npm_proxy_tarballs.repo_id, npm_proxy_tarballs.version, npm_proxy_tarballs.tarball_url, npm_proxy_tarballs.integrity, npm_proxy_tarballs.shasum, npm_proxy_tarballs.artifact_path FROM npm_proxy_tarballs JOIN requested ON requested.repo_id = npm_proxy_tarballs.repo_id WHERE npm_proxy_tarballs.package_name = ? ORDER BY npm_proxy_tarballs.repo_id, npm_proxy_tarballs.version")
+        .bind(payload)
+        .bind(package_name)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("批量查询 npm tarball 映射失败"))
+}
+
+impl BatchNpmProxyPackumentRow {
+    fn try_into_packument(self) -> Result<NpmProxyPackument, ApiError> {
+        let ttl_secs =
+            u64::try_from(self.ttl_secs).map_err(|_| ApiError::internal("npm 缓存 TTL 非法"))?;
+        Ok(NpmProxyPackument {
+            rewritten_json: self.rewritten_json,
+            upstream_url_snapshot: self.upstream_url_snapshot,
+            ttl_secs,
+            fetched_at: self.fetched_at,
+            fresh: self.fresh,
+            tarballs: Vec::new(),
+        })
+    }
+}
+
+impl BatchNpmProxyTarballRow {
+    fn into_tarball(self) -> NpmProxyTarballInput {
+        NpmProxyTarballInput {
+            version: self.version,
+            tarball_url: self.tarball_url,
+            integrity: self.integrity,
+            shasum: self.shasum,
+            artifact_path: self.artifact_path,
+        }
+    }
+}
+
+/// 原子提交 npm proxy tarball 制品索引并绑定已验证的本地路径。
+pub async fn commit_npm_proxy_tarball(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+    package_name: &str,
+    version: &str,
+    expected_upstream_url: &str,
+) -> Result<ArtifactRecord, NpmVersionCommitError> {
+    let size = artifact_size_i64(input.size).map_err(NpmVersionCommitError::Internal)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| npm_internal("开启 npm tarball 缓存事务失败"))?;
+    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url)
+        .await
+        .map_err(|error| match error {
+            ArtifactCommitError::StaleProxyConfiguration => {
+                NpmVersionCommitError::StaleProxyConfiguration
+            }
+            ArtifactCommitError::Conflict => NpmVersionCommitError::Conflict,
+            ArtifactCommitError::Internal(error) => NpmVersionCommitError::Internal(error),
+        })?
+        .ok_or(NpmVersionCommitError::StaleProxyConfiguration)?;
+    let updated = sqlx::query("UPDATE npm_proxy_tarballs SET artifact_path = ? WHERE repo_id = ? AND package_name = ? AND version = ?")
+        .bind(&input.path)
+        .bind(input.repo_id)
+        .bind(package_name)
+        .bind(version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| npm_internal("绑定 npm tarball 缓存路径失败"))?;
+    if updated.rows_affected() != 1 {
+        return Err(npm_internal("npm tarball 映射已变化"));
+    }
+    tx.commit()
+        .await
+        .map_err(|_| npm_internal("提交 npm tarball 缓存事务失败"))?;
+    ArtifactRecord::try_from(row).map_err(NpmVersionCommitError::Internal)
 }
 
 /// 删除仓库内全部缓存索引，并在同一事务批量登记回收意图。
@@ -1653,6 +2384,24 @@ async fn load_member_names(
     Ok(grouped)
 }
 
+/// 单条 SQL 读取 group 有序成员及调用方 ACL，供协议面统一过滤。
+pub(crate) async fn find_protocol_group_member_access(
+    pool: &SqlitePool,
+    group_repo_id: i64,
+    user_id: Option<i64>,
+) -> Result<Vec<(Repository, Option<Permission>)>, ApiError> {
+    let sql = format!(
+        "SELECT {REPOSITORY_COLUMNS}, (SELECT permission FROM repository_acl WHERE repo_id = repositories.id AND user_id = ?) AS acl_permission FROM repository_group_members JOIN repositories ON repositories.id = repository_group_members.member_repo_id LEFT JOIN (SELECT repo_id, COUNT(*) AS object_count, SUM(size) AS total_bytes FROM artifacts GROUP BY repo_id) AS artifact_stats ON artifact_stats.repo_id = repositories.id WHERE repository_group_members.group_repo_id = ? ORDER BY repository_group_members.position"
+    );
+    let rows = sqlx::query_as::<_, RepositoryAccessRow>(&sql)
+        .bind(user_id)
+        .bind(group_repo_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| ApiError::internal("查询 group 协议成员失败"))?;
+    rows.into_iter().map(|row| row.split(Vec::new())).collect()
+}
+
 /// 批量读取 group 成员候选，供服务层验证存在性、格式与类型。
 pub(crate) async fn find_member_candidates(
     pool: &SqlitePool,
@@ -1745,6 +2494,11 @@ async fn delete_cached_artifacts_in_transaction(
         .execute(&mut **tx)
         .await
         .map_err(|_| ApiError::internal("失效仓库缓存制品失败"))?;
+    sqlx::query("DELETE FROM npm_proxy_packuments WHERE repo_id = ?")
+        .bind(repository_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("失效 npm packument 缓存失败"))?;
     Ok(reclamations)
 }
 
@@ -2508,12 +3262,6 @@ mod tests {
 
         assert_eq!(deleted.artifact.path, "a.bin");
         assert_eq!(deleted.artifact.size, 7);
-        assert!(
-            find_artifact_by_path(&pool, repo_id, "a.bin")
-                .await
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[tokio::test]
@@ -2628,7 +3376,7 @@ mod tests {
     async fn proxy仅在上游地址真实变化时事务失效正缓存() {
         let pool = test_pool().await;
         let repo_id: (i64,) = sqlx::query_as(
-            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('proxy-invalidate', 'raw', 'proxy', 'private', 'https://old.example/base') RETURNING id",
+            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('proxy-invalidate', 'npm', 'proxy', 'private', 'https://old.example/base') RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -2637,6 +3385,19 @@ mod tests {
             &pool,
             &制品输入(repo_id.0, "cached.bin", 'a', true, 3),
             false,
+        )
+        .await
+        .unwrap();
+        upsert_npm_proxy_packument(
+            &pool,
+            &NpmProxyPackumentInput {
+                repo_id: repo_id.0,
+                package_name: "demo".to_string(),
+                rewritten_json: r#"{"name":"demo"}"#.to_string(),
+                upstream_url_snapshot: "https://old.example/base".to_string(),
+                ttl_secs: 1800,
+                tarballs: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -2657,6 +3418,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(
+            find_npm_proxy_packument(&pool, repo_id.0, "demo")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let changed_url = RepositoryRowPatch {
             upstream_url: Some("https://new.example/base".to_string()),
@@ -2669,6 +3436,12 @@ mod tests {
         assert_eq!(reclamations[0].sha256, "a".repeat(64));
         assert!(
             find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find_npm_proxy_packument(&pool, repo_id.0, "demo")
                 .await
                 .unwrap()
                 .is_none()
