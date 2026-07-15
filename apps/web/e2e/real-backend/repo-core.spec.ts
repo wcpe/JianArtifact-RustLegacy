@@ -72,6 +72,17 @@ async function createRepositoryFromUi(page: Page, repoName: string): Promise<voi
   await expect(page.getByRole('heading', { name: repoName })).toBeVisible();
 }
 
+async function verifyUsageContract(page: Page, token: string, repoName: string): Promise<void> {
+  const response = await page.request.get(`/api/v1/repos/${repoName}/usage`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  expect(response.status()).toBe(200);
+  const snippets = (await response.json()) as { title: string; content: string }[];
+  expect(snippets.length).toBeGreaterThan(0);
+  expect(snippets.every((snippet) => snippet.title && snippet.content)).toBe(true);
+  expect(snippets.some((snippet) => snippet.content.includes('<令牌>'))).toBe(true);
+}
+
 async function updateRepositoryFromUi(page: Page, repoName: string): Promise<void> {
   await page.getByRole('tab', { name: '配置' }).click();
   await page.getByRole('combobox', { name: '可见性' }).click();
@@ -148,6 +159,25 @@ async function deleteRepositoryFromUi(page: Page, repoName: string): Promise<voi
   await expect(page).toHaveURL(/\/repos$/);
   await expect(page.getByRole('link', { name: repoName, exact: true })).toBeHidden();
 }
+
+test('真实 Rust 后端使用片段契约返回结构化占位内容', async ({ page }) => {
+  const credentials = readCredentials();
+  const repoName = `e2e-usage-${randomBytes(5).toString('hex')}`;
+  await login(page, credentials);
+  const token = await apiLogin(page, credentials);
+
+  try {
+    await createRepositoryFromUi(page, repoName);
+    await verifyUsageContract(page, token, repoName);
+  } finally {
+    await page.request.delete(`/api/v1/repos/${repoName}?mode=data`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'X-Confirm-Repository': repoName,
+      },
+    });
+  }
+});
 
 test('真实 Rust 后端完成仓库核心验收闭环', async ({ page }) => {
   const credentials = readCredentials();

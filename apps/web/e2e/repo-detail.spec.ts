@@ -11,7 +11,11 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test('详情页三标签页：浏览校验和与下载、配置保存、权限授权增删', async ({ page }) => {
+test('详情页三标签页：浏览校验和与下载、接入片段复制、配置保存、权限授权增删', async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await login(page);
   await page.goto('/repos/raw-hosted');
   // 浏览：树内展开 docs 并选中 manual.pdf，出现校验和卡与下载按钮
@@ -23,6 +27,14 @@ test('详情页三标签页：浏览校验和与下载、配置保存、权限�
     'href',
     '/repository/raw-hosted/docs/manual.pdf',
   );
+  // 接入片段：内容由 API 返回，复制按钮写入完整片段并给出中文反馈
+  const copyUpload = page.getByRole('button', { name: '复制 curl 上传' });
+  await expect(copyUpload).toBeVisible();
+  await copyUpload.click();
+  await expect(page.getByRole('status')).toHaveText('已复制 curl 上传');
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toContain('/repository/raw-hosted/文件.bin');
   // 配置：改可见性为私有并保存
   await page.getByRole('tab', { name: '配置' }).click();
   await page.getByRole('combobox', { name: '可见性' }).click();
