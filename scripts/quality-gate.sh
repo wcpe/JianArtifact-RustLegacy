@@ -47,7 +47,7 @@ fi
 
 echo "==> [6/14] 前端格式、类型、静态分析与测试"
 pnpm run format:check
-pnpm turbo typecheck lint test
+pnpm turbo typecheck lint test --concurrency=2
 
 echo "==> [7/14] 依赖漏洞审计"
 cargo audit
