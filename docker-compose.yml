@@ -10,6 +10,11 @@ services:
     environment:
       # pnpm 内容寻址存储固定到命名卷路径，避免写入宿主目录
       npm_config_store_dir: /workspace/.pnpm-store
+      # 验收运行态使用容器本地文件系统，避免大对象经 Windows 绑定挂载反复读写。
+      ACCEPTANCE_RUNTIME_DIR: /tmp/jianartifact-acceptance
+    # 目标部署机为 8 GiB；质量门与性能验收统一在 5 GiB cgroup 内运行并留存证据。
+    mem_limit: 5g
+    memswap_limit: 5g
     volumes:
       # 项目源代码（唯一挂载宿主目录的卷）
       - .:/workspace

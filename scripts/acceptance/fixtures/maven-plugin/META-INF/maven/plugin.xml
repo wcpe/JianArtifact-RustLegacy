@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin>
+  <name>JianArtifact Acceptance Maven Plugin</name>
+  <description>仅用于官方 Maven 客户端隔离验收</description>
+  <groupId>com.jianartifact.acceptance</groupId>
+  <artifactId>acceptance-maven-plugin</artifactId>
+  <version>1.0.0</version>
+  <goalPrefix>acceptance</goalPrefix>
+  <isolatedRealm>false</isolatedRealm>
+  <inheritedByDefault>true</inheritedByDefault>
+  <requiredJavaVersion>17</requiredJavaVersion>
+  <requiredMavenVersion>3.9.0</requiredMavenVersion>
+  <mojos>
+    <mojo>
+      <goal>deploy-file</goal><description>部署 release 或 snapshot</description><requiresProject>false</requiresProject>
+      <requiresDependencyResolution>none</requiresDependencyResolution><implementation>com.jianartifact.acceptance.DeployMojo</implementation>
+      <language>java</language><instantiationStrategy>per-lookup</instantiationStrategy><executionStrategy>once-per-session</executionStrategy>
+      <threadSafe>true</threadSafe><parameters/><configuration/>
+    </mojo>
+    <mojo>
+      <goal>dependency-get</goal><description>按坐标解析依赖</description><requiresProject>false</requiresProject>
+      <requiresDependencyResolution>none</requiresDependencyResolution><implementation>com.jianartifact.acceptance.GetMojo</implementation>
+      <language>java</language><instantiationStrategy>per-lookup</instantiationStrategy><executionStrategy>once-per-session</executionStrategy>
+      <threadSafe>true</threadSafe><parameters/><configuration/>
+    </mojo>
+  </mojos>
+  <dependencies/>
+</plugin>
