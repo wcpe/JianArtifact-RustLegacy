@@ -6,10 +6,11 @@ import type { SeedData, SeedFile, SeedRepo, SeedTask, SeedToken, SeedUser } from
 type RepoInfo = components['schemas']['RepoInfo'];
 type TaskInfo = components['schemas']['TaskInfo'];
 
-/** 八类场景标识。 */
+/** 九类场景标识。 */
 export type ScenarioId =
   | 'default'
   | 'empty'
+  | 'setup-required'
   | 'restricted'
   | 'upstream-failure'
   | 'migration-running'
@@ -26,6 +27,10 @@ export const SCENARIOS: Record<ScenarioId, { title: string; description: string 
   empty: {
     title: '空实例',
     description: '仅一名管理员，无仓库无任务，模拟首次启动体验',
+  },
+  'setup-required': {
+    title: '等待首启初始化',
+    description: '用户库为空且一次性设置入口有效，用于验证首名管理员创建流程',
   },
   restricted: {
     title: '权限受限',
@@ -60,6 +65,9 @@ export function isScenarioId(value: string): value is ScenarioId {
 
 // 种子时间统一取固定值，保证各场景数据可复现
 const SEED_TIME = '2026-07-01T08:00:00Z';
+
+/** 仅供 devmock 首启场景与测试使用的固定一次性令牌。 */
+export const DEVMOCK_SETUP_TOKEN = 'devmock-initial-admin-token';
 
 /** 种子管理员（测试凭据 admin/admin123，仅本包 mock 用）。 */
 function adminUser(): SeedUser {
@@ -478,6 +486,16 @@ export function seedFor(id: ScenarioId): SeedData {
         tasks: [],
         session: { userId: 1 },
         upstreamDown: false,
+      };
+    case 'setup-required':
+      return {
+        users: [],
+        tokens: [],
+        repos: [],
+        tasks: [],
+        session: null,
+        upstreamDown: false,
+        setupToken: DEVMOCK_SETUP_TOKEN,
       };
     case 'restricted': {
       const seed = defaultSeed();

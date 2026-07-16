@@ -1,28 +1,49 @@
-// Playwright devmock E2E 配置：显式开启 VITE_MOCK，保留原有浏览器测试通道。
-// 每次页面加载 mock store 重建为 default 场景，用例间天然隔离。
+// Playwright devmock E2E 配置：默认场景与首启场景使用隔离的 Vite 服务。
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
   testIgnore: '**/real-backend/**',
   outputDir: './test-results/devmock',
-  // 用例内已按需等待，整体超时给宽裕值防 CI 抖动
   timeout: 30_000,
   fullyParallel: false,
   retries: 0,
   reporter: [['list']],
   use: {
     baseURL: 'http://127.0.0.1:4173',
-    // 容器内以 root 运行 chromium 需要关闭沙箱
     launchOptions: { args: ['--no-sandbox'] },
     trace: 'retain-on-failure',
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
-  webServer: {
-    command: 'pnpm exec vite --port 4173 --strictPort --host 127.0.0.1',
-    url: 'http://127.0.0.1:4173',
-    env: { VITE_MOCK: 'true' },
-    reuseExistingServer: false,
-    timeout: 60_000,
-  },
+  projects: [
+    {
+      name: 'chromium',
+      testIgnore: ['**/real-backend/**', '**/setup.spec.ts'],
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'chromium-setup',
+      testMatch: '**/setup.spec.ts',
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: 'http://127.0.0.1:4175',
+        trace: 'off',
+      },
+    },
+  ],
+  webServer: [
+    {
+      command: 'pnpm exec vite --port 4173 --strictPort --host 127.0.0.1',
+      url: 'http://127.0.0.1:4173',
+      env: { VITE_MOCK: 'true' },
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      command: 'pnpm exec vite --port 4175 --strictPort --host 127.0.0.1',
+      url: 'http://127.0.0.1:4175',
+      env: { VITE_MOCK: 'true', VITE_MOCK_SCENARIO: 'setup-required' },
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+  ],
 });

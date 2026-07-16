@@ -1,19 +1,9 @@
 // 登录页：卡片式用户名/口令表单。已登录直接跳转仪表盘；登录成功回到来源或仪表盘。
 import { useState, type FormEvent } from 'react';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
-import {
-  Alert,
-  AlertDescription,
-  AlertTitle,
-  Button,
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  Input,
-  Label,
-} from '@jianartifact/ui';
+import { Alert, AlertDescription, AlertTitle, Button, Input, Label } from '@jianartifact/ui';
 import { ApiClientError } from '../api/client';
+import { AuthCardLayout } from '../components/AuthCardLayout';
 import { useAuth } from '../auth/AuthContext';
 
 export function LoginPage() {
@@ -52,48 +42,39 @@ export function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-svh items-center justify-center bg-background p-6">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          {/* 登录页主标题用语义 h1（无障碍：页面唯一一级标题），保留卡片标题样式 */}
-          <h1 className="leading-none font-semibold">登录 JianArtifact</h1>
-          <CardDescription>请输入用户名与口令以进入管理端</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
-            {error ? (
-              <Alert variant="destructive">
-                <AlertTitle>登录失败</AlertTitle>
-                <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            ) : null}
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="login-username">用户名</Label>
-              <Input
-                id="login-username"
-                value={username}
-                autoComplete="username"
-                onChange={(event) => setUsername(event.target.value)}
-                required
-              />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="login-password">口令</Label>
-              <Input
-                id="login-password"
-                type="password"
-                value={password}
-                autoComplete="current-password"
-                onChange={(event) => setPassword(event.target.value)}
-                required
-              />
-            </div>
-            <Button type="submit" disabled={submitting}>
-              {submitting ? '登录中…' : '登录'}
-            </Button>
-          </form>
-        </CardContent>
-      </Card>
-    </div>
+    <AuthCardLayout title="登录 JianArtifact" description="请输入用户名与口令以进入管理端">
+      <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+        {error ? (
+          <Alert variant="destructive">
+            <AlertTitle>登录失败</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        ) : null}
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="login-username">用户名</Label>
+          <Input
+            id="login-username"
+            value={username}
+            autoComplete="username"
+            onChange={(event) => setUsername(event.target.value)}
+            required
+          />
+        </div>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="login-password">口令</Label>
+          <Input
+            id="login-password"
+            type="password"
+            value={password}
+            autoComplete="current-password"
+            onChange={(event) => setPassword(event.target.value)}
+            required
+          />
+        </div>
+        <Button type="submit" disabled={submitting}>
+          {submitting ? '登录中…' : '登录'}
+        </Button>
+      </form>
+    </AuthCardLayout>
   );
 }

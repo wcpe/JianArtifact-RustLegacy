@@ -1,4 +1,4 @@
-// Playwright 真实后端通道：独立启动 Rust 服务与未启用 mock 的 Vite 开发服务器。
+// Playwright 真实后端通道：先经 setup 项目创建首名管理员，再运行既有真实后端用例。
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
@@ -14,7 +14,19 @@ export default defineConfig({
     launchOptions: { args: ['--no-sandbox'] },
     trace: 'retain-on-failure',
   },
-  projects: [{ name: 'chromium-real', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    {
+      name: 'setup-real',
+      testMatch: '**/setup.spec.ts',
+      use: { ...devices['Desktop Chrome'], trace: 'off' },
+    },
+    {
+      name: 'chromium-real',
+      testIgnore: '**/setup.spec.ts',
+      dependencies: ['setup-real'],
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
   webServer: [
     {
       command: 'node e2e/real-backend/start-server.mjs',

@@ -13,6 +13,13 @@ export type PageQuery = {
   q?: string;
 };
 
+// 首启初始化
+export const setupApi = {
+  status: () => apiRequest<Schemas['SetupStatus']>('/api/v1/setup/status'),
+  create: (body: Schemas['SetupRequest']) =>
+    apiRequest<undefined>('/api/v1/setup', { method: 'POST', body }),
+};
+
 // 认证
 export const authApi = {
   login: (body: Schemas['LoginRequest']) =>

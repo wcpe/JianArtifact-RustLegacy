@@ -366,6 +366,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 使用本地令牌创建首名管理员；并发请求最多一项成功。 */
+        post: operations["create"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/setup/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 查询是否仍需首启初始化；响应禁止缓存。 */
+        get: operations["status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tokens": {
         parameters: {
             query?: never;
@@ -970,6 +1004,20 @@ export interface components {
         SetAclRequest: {
             /** @description 授予权限。 */
             permission: components["schemas"]["Permission"];
+        };
+        /** @description 首启管理员创建请求。 */
+        SetupRequest: {
+            /** @description 首名管理员口令，不少于 12 个 Unicode 字符。 */
+            password: string;
+            /** @description 数据库旁令牌文件中的一次性令牌。 */
+            token: string;
+            /** @description 首名管理员用户名，服务端会去除首尾空白。 */
+            username: string;
+        };
+        /** @description 首启初始化状态。 */
+        SetupStatus: {
+            /** @description 用户库为空时为 true；一旦存在用户便永久为 false。 */
+            setup_required: boolean;
         };
         /**
          * @description 迁移来源类别（ADR-0015：默认离线直读原生数据目录）。
@@ -2162,6 +2210,66 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetupRequest"];
+            };
+        };
+        responses: {
+            /** @description 首名管理员创建成功 */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description 请求格式、用户名或口令不符合要求 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description 初始化不可用 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 首启初始化状态 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupStatus"];
                 };
             };
         };

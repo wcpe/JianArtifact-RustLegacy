@@ -3,7 +3,7 @@ import { setupServer } from 'msw/node';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createHandlers } from './handlers';
 import { createStore } from './store';
-import type { ScenarioId } from './scenarios';
+import { DEVMOCK_SETUP_TOKEN, type ScenarioId } from './scenarios';
 
 // 用测试私有的 store 实例，避免影响模块级默认 store
 const store = createStore('default');
@@ -48,6 +48,27 @@ async function currentScenario(): Promise<ScenarioId> {
 }
 
 describe('场景切换端点', () => {
+  it('setup-required 场景状态为 true，提交成功后状态永久关闭且令牌只消费一次', async () => {
+    await switchTo('setup-required');
+    const before = await fetch('http://127.0.0.1/api/v1/setup/status');
+    expect(await before.json()).toEqual({ setup_required: true });
+
+    const request = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token: DEVMOCK_SETUP_TOKEN,
+        username: 'first-admin',
+        password: '密'.repeat(12),
+      }),
+    } satisfies RequestInit;
+    expect((await fetch('http://127.0.0.1/api/v1/setup', request)).status).toBe(204);
+    expect((await fetch('http://127.0.0.1/api/v1/setup', request)).status).toBe(404);
+
+    const after = await fetch('http://127.0.0.1/api/v1/setup/status');
+    expect(await after.json()).toEqual({ setup_required: false });
+  });
+
   it('PUT 切换后 GET 反映新场景且数据整体重建', async () => {
     expect(await currentScenario()).toBe('default');
     expect((await switchTo('empty')).status).toBe(200);

@@ -13,6 +13,7 @@ import { MIGRATION_TASK_KEY, type Step } from './migration/types';
 import {
   DISCOVERY_KEY,
   PLAN_KEY,
+  STEP_KEY,
   clearWizardCache,
   readWizardBoot,
   saveCache,
@@ -85,9 +86,10 @@ export function MigrationPage() {
   const [discovery, setDiscovery] = useState<DiscoveryResult | null>(boot.discovery);
   const [plan, setPlan] = useState<MigrationPlan | null>(boot.plan);
 
-  // 切步时同步 URL 锚点（replaceState 不产生历史记录、不触发路由跳转）
+  // 切步时同步 URL 锚点与会话缓存；启动入口清除 fragment 后仍可恢复当前步骤
   useEffect(() => {
     window.history.replaceState(null, '', `#${step}`);
+    sessionStorage.setItem(STEP_KEY, step);
   }, [step]);
 
   // 步骤可进入判定：依赖数据齐才允许（步骤条回退与恢复共用同一判据）

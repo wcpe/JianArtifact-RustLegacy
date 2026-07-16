@@ -13,6 +13,7 @@ import {
 
 type Schemas = components['schemas'];
 type ErrorBody = Schemas['ErrorBody'];
+type SetupRequest = Schemas['SetupRequest'];
 type LoginRequest = Schemas['LoginRequest'];
 type ChangePasswordRequest = Schemas['ChangePasswordRequest'];
 type CreateTokenRequest = Schemas['CreateTokenRequest'];
@@ -44,6 +45,40 @@ function jsonOf<T>(result: StoreResult<T>, status = 200): Response {
 /** 仓储结果 → 无内容响应（成功 204）。 */
 function emptyOf(result: StoreResult<null>): Response {
   return result.ok ? new HttpResponse(null, { status: 204 }) : errorOf(result.error);
+}
+
+function invalidSetupRequest(): Response {
+  return HttpResponse.json<ErrorBody>(
+    { code: 'SETUP_REQUEST_INVALID', message: '初始化请求格式无效' },
+    { status: 400 },
+  );
+}
+
+function isSetupRequest(value: unknown): value is SetupRequest {
+  if (typeof value !== 'object' || value === null) return false;
+  const body = value as Record<string, unknown>;
+  return (
+    typeof body.token === 'string' &&
+    typeof body.username === 'string' &&
+    typeof body.password === 'string'
+  );
+}
+
+/** setup 与真实后端一致，只接受 JSON 内容类型和三个字符串字段。 */
+async function parseSetupRequest(request: Request): Promise<SetupRequest | null> {
+  const mediaType = request.headers.get('Content-Type')?.split(';', 1)[0]?.trim().toLowerCase();
+  const jsonType =
+    mediaType === 'application/json' ||
+    (mediaType !== undefined &&
+      mediaType.startsWith('application/') &&
+      mediaType.endsWith('+json'));
+  if (!jsonType) return null;
+  try {
+    const body: unknown = await request.json();
+    return isSetupRequest(body) ? body : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 路径参数统一取为字符串。 */
@@ -167,6 +202,18 @@ export function createHandlers(getStore: () => DevmockStore) {
         ? new HttpResponse(null, { status: 200 })
         : new HttpResponse(null, { status: 503 }),
     ),
+
+    // —— setup ——
+    http.get('*/api/v1/setup/status', () => {
+      const result = getStore().setupStatus();
+      if (!result.ok) return errorOf(result.error);
+      return HttpResponse.json(result.value, { headers: { 'Cache-Control': 'no-store' } });
+    }),
+    http.post('*/api/v1/setup', async ({ request }) => {
+      const body = await parseSetupRequest(request);
+      if (body === null) return invalidSetupRequest();
+      return emptyOf(getStore().setup(body.token, body.username, body.password));
+    }),
 
     // —— auth ——
     http.post('*/api/v1/auth/login', async ({ request }) => {

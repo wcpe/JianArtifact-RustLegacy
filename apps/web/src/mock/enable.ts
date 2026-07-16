@@ -16,5 +16,13 @@ export async function enableMocking(): Promise<void> {
     // 动态导入：仅在上述守卫成立的构建中才会生成并加载该 chunk
     const { worker } = await import('@jianartifact/devmock/browser');
     await worker.start({ onUnhandledRequest: 'bypass' });
+    const scenario = import.meta.env.VITE_MOCK_SCENARIO;
+    if (scenario) {
+      await fetch('/__devmock/scenario', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenario }),
+      });
+    }
   }
 }

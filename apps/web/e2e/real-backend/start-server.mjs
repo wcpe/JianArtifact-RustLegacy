@@ -41,8 +41,6 @@ const child = spawn(binary, [], {
     JIANARTIFACT_DATA_DIR: dataDir,
     JIANARTIFACT_LOG_LEVEL: 'warn',
     JIANARTIFACT_JWT_SECRET: randomBytes(32).toString('base64url'),
-    JIANARTIFACT_ADMIN_USER: username,
-    JIANARTIFACT_ADMIN_PASSWORD: password,
   },
   stdio: 'inherit',
 });

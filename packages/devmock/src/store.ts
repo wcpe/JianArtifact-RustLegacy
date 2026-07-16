@@ -12,6 +12,7 @@ type TokenInfo = Schemas['TokenInfo'];
 type CreatedToken = Schemas['CreatedToken'];
 type TokenListResponse = Schemas['TokenListResponse'];
 type SessionToken = Schemas['SessionToken'];
+type SetupStatus = Schemas['SetupStatus'];
 type RepoInfo = Schemas['RepoInfo'];
 type CreateRepoRequest = Schemas['CreateRepoRequest'];
 type UpdateRepoRequest = Schemas['UpdateRepoRequest'];
@@ -80,6 +81,8 @@ export interface SeedData {
   session: { userId: number } | null;
   /** 上游是否故障（proxy 浏览与在线发现失败，就绪自检报未就绪）。 */
   upstreamDown: boolean;
+  /** 首启一次性令牌；仅 setup-required 场景提供。 */
+  setupToken?: string;
 }
 
 /** 仓储层错误语义：HTTP 状态码 + 稳定错误码 + 中文消息。 */
@@ -124,6 +127,15 @@ function forbidden(message: string): StoreFailure {
 
 function notFound(message: string): StoreFailure {
   return fail(404, 'NOT_FOUND', message);
+}
+
+/** 校验首启管理员输入；令牌可用性由原子写入方法单独判断。 */
+function validateSetup(username: string, password: string): StoreFailure | null {
+  if (username === '') return fail(400, 'SETUP_USERNAME_REQUIRED', '用户名不能为空');
+  if (Array.from(password).length < 12) {
+    return fail(400, 'SETUP_PASSWORD_TOO_SHORT', '口令至少需要 12 个字符');
+  }
+  return null;
 }
 
 // 分页默认值与上限（NFR-16）
@@ -388,6 +400,7 @@ export class DevmockStore {
   private requestContext = false;
   private directUserId: number | null = null;
   private upstreamDown = false;
+  private setupToken: string | null = null;
   private readonly discoveries = new Map<string, DiscoveryResult>();
   private readonly plans = new Map<string, MigrationPlan>();
   private seq = 0;
@@ -489,6 +502,7 @@ export class DevmockStore {
     this.requestContext = false;
     this.directUserId = seed.session?.userId ?? null;
     this.upstreamDown = seed.upstreamDown;
+    this.setupToken = seed.setupToken ?? null;
     this.discoveries.clear();
     this.plans.clear();
     this.seq = 0;
@@ -497,6 +511,39 @@ export class DevmockStore {
   /** 就绪自检：上游故障场景视为存在未就绪依赖。 */
   isReady(): boolean {
     return !this.upstreamDown;
+  }
+
+  // —— 首启初始化 ——
+
+  /** 查询首启入口是否仍有效，不返回令牌或内部状态。 */
+  setupStatus(): StoreResult<SetupStatus> {
+    return ok({ setup_required: this.users.length === 0 && this.setupToken !== null });
+  }
+
+  /** 原子消费一次性令牌并创建首名管理员。 */
+  setup(token: string, username: string, password: string): StoreResult<null> {
+    const normalizedUsername = username.trim();
+    const invalid = validateSetup(normalizedUsername, password);
+    if (invalid) return invalid;
+    if (this.users.length !== 0 || this.setupToken === null || token !== this.setupToken) {
+      return fail(404, 'SETUP_UNAVAILABLE', '初始化入口不可用');
+    }
+
+    this.users.push({
+      info: {
+        id: 1,
+        username: normalizedUsername,
+        role: 'admin',
+        enabled: true,
+        created_at: now(),
+      },
+      password,
+    });
+    this.setupToken = null;
+    this.directUserId = null;
+    this.sessions.clear();
+    this.persistSessions();
+    return ok(null);
   }
 
   // —— 会话 ——

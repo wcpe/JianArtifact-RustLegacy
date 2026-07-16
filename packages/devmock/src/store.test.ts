@@ -1,5 +1,6 @@
 // 数据模型与场景行为测试（M1-FR-035）：会话、Token、用户保护、仓库权限、分页与迁移状态机。
 import { beforeAll, describe, expect, it } from 'vitest';
+import { DEVMOCK_SETUP_TOKEN } from './scenarios';
 import { createStore, type StoreResult } from './store';
 
 /** 断言成功结果并取出载荷。 */
@@ -13,6 +14,31 @@ function unwrapError<T>(result: StoreResult<T>) {
   if (result.ok) throw new Error('预期失败结果，实际成功');
   return result.error;
 }
+
+describe('首启管理员初始化', () => {
+  it('setup-required 场景报告需初始化，成功后原子关闭且令牌不可复用', () => {
+    const store = createStore('setup-required');
+    expect(unwrap(store.setupStatus()).setup_required).toBe(true);
+
+    const created = store.setup(DEVMOCK_SETUP_TOKEN, '  first-admin  ', '密'.repeat(12));
+    expect(created.ok).toBe(true);
+    expect(unwrap(store.setupStatus()).setup_required).toBe(false);
+    expect(unwrapError(store.setup(DEVMOCK_SETUP_TOKEN, 'other-admin', '密'.repeat(12))).code).toBe(
+      'SETUP_UNAVAILABLE',
+    );
+    expect(store.login('first-admin', '密'.repeat(12)).ok).toBe(true);
+  });
+
+  it('用户名与 Unicode 口令边界返回稳定错误码', () => {
+    const store = createStore('setup-required');
+    expect(unwrapError(store.setup(DEVMOCK_SETUP_TOKEN, '   ', '密'.repeat(12))).code).toBe(
+      'SETUP_USERNAME_REQUIRED',
+    );
+    expect(unwrapError(store.setup(DEVMOCK_SETUP_TOKEN, 'admin', '密'.repeat(11))).code).toBe(
+      'SETUP_PASSWORD_TOO_SHORT',
+    );
+  });
+});
 
 describe('会话流转', () => {
   it('退出后受保护操作返回 401，重新登录恢复会话', () => {

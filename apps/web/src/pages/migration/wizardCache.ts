@@ -13,6 +13,7 @@ export const SOURCE_FORM_KEY = `${PREFIX}source`;
 export const DISCOVERY_KEY = `${PREFIX}discovery`;
 export const SELECTIONS_KEY = `${PREFIX}selections`;
 export const PLAN_KEY = `${PREFIX}plan`;
+export const STEP_KEY = `${PREFIX}step`;
 
 // 源配置表单缓存结构（口令绝不缓存，恢复后须重新输入）
 export interface SourceFormCache {
@@ -91,7 +92,7 @@ export function saveCache(key: string, value: unknown): void {
 
 // 清空向导全部缓存（含在途任务标识），「重新开始」时调用
 export function clearWizardCache(): void {
-  for (const key of [SOURCE_FORM_KEY, DISCOVERY_KEY, SELECTIONS_KEY, PLAN_KEY]) {
+  for (const key of [SOURCE_FORM_KEY, DISCOVERY_KEY, SELECTIONS_KEY, PLAN_KEY, STEP_KEY]) {
     sessionStorage.removeItem(key);
   }
   localStorage.removeItem(MIGRATION_TASK_KEY);
@@ -105,15 +106,19 @@ export interface WizardBoot {
   taskId: string | null;
 }
 
-// 读取启动态。恢复优先级：有在途任务 → progress ＞ hash 指定步且缓存齐 → 该步 ＞ source。
-// #progress / #report 依赖在途任务标识（已被第一优先级覆盖），缺任务时同样回退 source。
+// 读取启动态。恢复优先级：有在途任务 → progress ＞ hash 或步骤缓存指定步且缓存齐 → 该步 ＞ source。
+// 启动入口会清除 URL fragment，因此步骤缓存同时承担刷新恢复职责。
 export function readWizardBoot(): WizardBoot {
   const taskId = localStorage.getItem(MIGRATION_TASK_KEY);
   const discovery = loadCache(DISCOVERY_KEY, isDiscoveryResult);
   const plan = loadCache(PLAN_KEY, isMigrationPlan);
   if (taskId) return { step: 'progress', discovery, plan, taskId };
-  const hash = window.location.hash.slice(1);
-  if (hash === 'discovery' && discovery) return { step: 'discovery', discovery, plan, taskId };
-  if (hash === 'plan' && discovery && plan) return { step: 'plan', discovery, plan, taskId };
+  const requestedStep = window.location.hash.slice(1) || sessionStorage.getItem(STEP_KEY);
+  if (requestedStep === 'discovery' && discovery) {
+    return { step: 'discovery', discovery, plan, taskId };
+  }
+  if (requestedStep === 'plan' && discovery && plan) {
+    return { step: 'plan', discovery, plan, taskId };
+  }
   return { step: 'source', discovery, plan, taskId };
 }

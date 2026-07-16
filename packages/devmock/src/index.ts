@@ -2,7 +2,7 @@
 export { handlers, createHandlers } from './handlers';
 export { createDevmockServer } from './node';
 export { worker } from './browser';
-export { SCENARIOS, isScenarioId, seedFor } from './scenarios';
+export { DEVMOCK_SETUP_TOKEN, SCENARIOS, isScenarioId, seedFor } from './scenarios';
 export type { ScenarioId } from './scenarios';
 export { DevmockStore, createStore, switchScenario } from './store';
 export type { ApiError, SeedData, StoreResult, TaskAction } from './store';

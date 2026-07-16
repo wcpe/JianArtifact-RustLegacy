@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { components } from '@jianartifact/devmock/schema';
 import { loginAs, renderWithProviders, resetScenario } from '../test/utils';
 import { MIGRATION_TASK_KEY } from './migration/types';
-import { DISCOVERY_KEY, PLAN_KEY } from './migration/wizardCache';
+import { DISCOVERY_KEY, PLAN_KEY, STEP_KEY } from './migration/wizardCache';
 import { MigrationPage } from './MigrationPage';
 
 type DiscoveryResult = components['schemas']['DiscoveryResult'];
@@ -100,6 +100,18 @@ describe('迁移向导', () => {
     expect(screen.getByText('仓库映射明细（1）')).toBeInTheDocument();
     expect(screen.getByText('maven-legacy')).toBeInTheDocument();
     expect(screen.getByText('maven-new')).toBeInTheDocument();
+  });
+
+  it('启动入口清除 hash 后仍按步骤缓存恢复到计划步', () => {
+    sessionStorage.setItem(DISCOVERY_KEY, JSON.stringify(discoveryFixture()));
+    sessionStorage.setItem(PLAN_KEY, JSON.stringify(planFixture()));
+    sessionStorage.setItem(STEP_KEY, 'plan');
+    window.history.replaceState(null, '', '/');
+
+    renderWithProviders(<MigrationPage />);
+
+    expect(screen.getByRole('button', { name: '开始迁移' })).toBeInTheDocument();
+    expect(screen.getByText('仓库映射明细（1）')).toBeInTheDocument();
   });
 
   it('缓存损坏时安全回退到源配置步', () => {

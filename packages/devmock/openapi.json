@@ -1352,6 +1352,71 @@
         }
       }
     },
+    "/api/v1/setup": {
+      "post": {
+        "tags": [
+          "setup"
+        ],
+        "summary": "使用本地令牌创建首名管理员；并发请求最多一项成功。",
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "首名管理员创建成功"
+          },
+          "400": {
+            "description": "请求格式、用户名或口令不符合要求",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "初始化不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/setup/status": {
+      "get": {
+        "tags": [
+          "setup"
+        ],
+        "summary": "查询是否仍需首启初始化；响应禁止缓存。",
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "首启初始化状态",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/tokens": {
       "get": {
         "tags": [
@@ -3407,6 +3472,42 @@
           }
         }
       },
+      "SetupRequest": {
+        "type": "object",
+        "description": "首启管理员创建请求。",
+        "required": [
+          "token",
+          "username",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "首名管理员口令，不少于 12 个 Unicode 字符。"
+          },
+          "token": {
+            "type": "string",
+            "description": "数据库旁令牌文件中的一次性令牌。"
+          },
+          "username": {
+            "type": "string",
+            "description": "首名管理员用户名，服务端会去除首尾空白。"
+          }
+        }
+      },
+      "SetupStatus": {
+        "type": "object",
+        "description": "首启初始化状态。",
+        "required": [
+          "setup_required"
+        ],
+        "properties": {
+          "setup_required": {
+            "type": "boolean",
+            "description": "用户库为空时为 true；一旦存在用户便永久为 false。"
+          }
+        }
+      },
       "SourceKind": {
         "type": "string",
         "description": "迁移来源类别（ADR-0015：默认离线直读原生数据目录）。",
@@ -3790,6 +3891,10 @@
     {
       "name": "health",
       "description": "健康检查与就绪自检"
+    },
+    {
+      "name": "setup",
+      "description": "首启初始化"
     },
     {
       "name": "auth",
