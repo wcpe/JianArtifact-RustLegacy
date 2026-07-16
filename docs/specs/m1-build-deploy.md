@@ -27,15 +27,16 @@
   - 一次性前置条件（写入 `docs/OPERATIONS.md` 与 `.env.example` 注释）：目标机需 `loginctl enable-linger <部署用户>`（多数发行版需管理员执行一次，否则服务随登出停止）；deploy 脚本检测 linger 未开启时给出中文警告但不阻断。
 - `make deploy` 调用宿主侧 `scripts/deploy.sh`（bash，经宿主 OpenSSH 客户端执行 ssh/scp；构建部分仍在 Docker 内）。
 - 配置全部来自项目根 `.env`（已被 `.gitignore` 排除），提供 `.env.example` 模板（每个变量中文注释、无真实值）：
-  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `~/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；应指向服务的就绪自检接口 `/readyz`（M1-FR-021），探活仅依据 HTTP 状态码、200 为健康；未配置时探活降级，见下）、`DEPLOY_KEEP_RELEASES`（保留的发布份数，默认 3）。
+  - `DEPLOY_HOST`（必填）、`DEPLOY_USER`（必填）、`DEPLOY_SSH_KEY`（可选，缺省走 ssh agent / 默认密钥）、`DEPLOY_DIR`（默认 `~/jianartifact`）、`DEPLOY_SERVICE`（默认 `jianartifact`）、`DEPLOY_HEALTH_URL`（可选；必须是指向服务 `/readyz` 的完整 `http://` 或 `https://` URL，探活仅依据 HTTP 状态码、200 为健康；未配置时探活降级，见下）、`DEPLOY_PUBLIC_URL`（可选；FR-046 初始化页公网基址）、`DEPLOY_DATABASE_PATH`（可选，默认 `data/jianartifact.db`；相对路径以部署目录为基准）、`DEPLOY_KEEP_RELEASES`（保留的发布份数，默认 3）。
 - **发布目录布局（支撑回滚）**：`DEPLOY_DIR/releases/<版本>-<打包时间戳>/` 存放各版发布内容，`DEPLOY_DIR/current` 为指向活动发布的符号链接；unit 的 `ExecStart` 走 `current` 路径。切换 = 符号链接原子替换（临时链接 + `mv -T`），超出保留份数的最旧发布自动清理（活动发布与其上一版永不清理）。
 - 部署流程（幂等，重复执行安全）：
   1. 目标依赖链保证先完成 `release`（防复用陈旧包——上一代踩过的坑）；
   2. 上传 tar 与 `.sha256` 到目标机临时路径，远端校验 sha256，不匹配即失败；
   3. 解压为新的 `releases/<版本>-<时间戳>/`，原子切换 `current`；
-  4. 安装/更新用户级 unit（内容有变化才复制并 `systemctl --user daemon-reload`）、`systemctl --user enable --now` 或 `restart`；
+  4. 把数据库路径写入权限为 `0600` 的运行环境文件并安装/更新用户级 unit（内容有变化才复制并 `systemctl --user daemon-reload`）、`systemctl --user enable --now` 或 `restart`；
   5. 健康确认：服务须进入 `active` 状态；配置了 `DEPLOY_HEALTH_URL` 时再请求探活并重试若干次（未配置时打印「探活降级为仅服务状态检查（待 M1-FR-021 落地后配置）」）；
-  6. **自动回滚**：健康确认失败（服务未 active，或探活重试全失败）→ 自动切回上一发布、重启、输出回滚结果，并以非零退出报告本次部署失败。
+  6. 健康确认成功且配置了 `DEPLOY_PUBLIC_URL` 时，先查询 setup 状态；仅在服务明确仍需初始化且数据库同目录令牌文件安全有效时，向当前 SSH 标准输出展示一次性 fragment 链接，其他情况不得输出令牌；
+  7. **自动回滚**：健康确认失败（服务未 active，或探活重试全失败）→ 自动切回上一发布、重启、输出回滚结果，并以非零退出报告本次部署失败。
 - **手动回滚**：`make rollback` 切换 `current` 到上一发布并重启、执行同样的健康确认；无上一发布时明确报错。
 - 凭据与主机信息不得进入构建产物与仓库；脚本禁用 `set -x`，输出不回显私钥路径以外的敏感值；SSH 失败、校验失败、服务启动失败均中文报错并非零退出。
 - 范围内：deploy 与 rollback 脚本、`.env.example`、用户级 unit 模板的安装逻辑、发布保留与清理。

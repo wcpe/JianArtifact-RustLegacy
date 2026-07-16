@@ -19,6 +19,7 @@
   - Maven：Maven2 标准仓库布局（POM、构件、metadata、checksum sidecar）。
   - npm：npm registry 协议布局（packument、tarball、dist-tag、scoped package）。
 - 格式协议通用路径的 GET/HEAD/PUT/DELETE 与仓库根目录 GET 已纳入同一 OpenAPI 并真实挂载；Raw hosted/proxy 已落地真实 HTTP 语义，Maven、npm 与 group 仍按路线图逐域替换占位。包管理器与自动化客户端只依赖该路径空间，无需理解管理 API。
+- 首启管理员设置页固定为 `/setup`，一次性令牌只放在 URL fragment（`/setup#token=<令牌>`）；fragment 不属于 HTTP 请求路径，服务端不得从 query 或路径接收令牌。页面调用 `/api/v1/setup/*` 完成状态查询与提交。
 - 健康检查端点独立于上述两个路径空间（见 §5）。
 
 ### 2.2 鉴权
@@ -30,14 +31,22 @@
 - JWT 会话同时校验签名、到期时间、会话撤销哈希、用户启用状态与用户会话版本；同一旧会话并发刷新仅允许一个请求换发成功。
 - 会话退出、Token 吊销、用户禁用或口令修改提交成功后，下一次使用对应既有凭据的请求必定失败。
 
-### 2.3 敏感数据
+### 2.3 首启管理员初始化
+
+- `GET /api/v1/setup/status` 无需鉴权，固定返回 200 与 JSON `{"setup_required": true|false}`。只有用户表为空且一次性设置入口有效时为 `true`；响应不得包含令牌、令牌文件路径、数据库路径或环境变量状态。
+- `POST /api/v1/setup` 无需既有账号鉴权，请求 JSON 为 `token`、`username`、`password` 三个字符串字段。用户名去除首尾空白后必须非空；口令按 Unicode 字符数而非 UTF-8 字节数计至少 12 个字符。有效令牌成功创建首个 Admin 时返回 204 且无响应体。
+- 令牌来自数据库同目录权限为 `0600` 的 `initial-admin.token`，内容为 32 字节密码学安全随机数的 64 位小写十六进制表示。浏览器从 `/setup#token=<令牌>` 的 fragment 读取后仅在 POST 请求体提交；不得把令牌写入 query、路径、响应、日志或数据库。
+- 首个用户创建使用数据库原子条件保护；多个有效并发请求只能一个返回 204，其余统一返回 404 / `SETUP_UNAVAILABLE`。创建成功后用户表非空是永久关闭依据，并删除令牌文件；不得通过重启、重新放置令牌文件或配置开关重新开放。
+- 稳定错误：请求体为空、JSON 损坏或 `Content-Type` 不是 JSON 时返回 400 / `SETUP_REQUEST_INVALID`；用户名为空返回 400 / `SETUP_USERNAME_REQUIRED`；口令不足 12 个 Unicode 字符返回 400 / `SETUP_PASSWORD_TOO_SHORT`；令牌无效、入口已关闭、令牌重复使用或并发请求被其他请求抢先完成时，均统一返回 404 / `SETUP_UNAVAILABLE`。错误响应沿用 §3 统一结构，不回显敏感输入，也不得让调用方区分具体不可用原因。
+
+### 2.4 敏感数据
 
 - API Token 明文只在签发响应中出现一次；此后任何接口只返回其元数据（名称、创建时间、过期时间等），持久化只存哈希。
 - 外部系统凭据（迁移用 Nexus 凭据、proxy 上游凭据等）在所有请求、响应、持久化与报告中一律以安全运行时引用表示，任何接口不得返回明文。
 - 「使用方式片段」等生成内容不得内嵌真实 Token，只允许占位提示用户自行填入。
 - 任何响应与错误消息不得包含密码、令牌明文、内部文件路径或内部拓扑信息。
 
-### 2.4 仓库管理契约
+### 2.5 仓库管理契约
 
 - 仓库列表、详情、创建、PATCH、删除、ACL、目录浏览与路径搜索端点已由真实 Rust 领域服务和 SQLite 持久化承载；使用片段仍按路线图后续落地。
 - ACL 设置与移除以精确用户名作为路径键：`/api/v1/repos/{name}/acl/{username}`；客户端必须对用户名做路径编码，不得依赖数据库用户 ID。仓库 admin 可直接按用户名授权，不依赖全局用户列表权限。
@@ -47,7 +56,7 @@
 - 私有仓库无 read 权与仓库不存在统一返回 `REPO_NOT_FOUND` / `仓库不存在或无权访问`，列表与详情均不得泄露名称或数量；已有 read 但动作权限不足时返回 403。group 成员配置中，不存在与调用方不可读的候选统一返回 `REPO_INVALID_CONFIG` / `group 成员不存在或无权访问`。
 - 删除先校验仓库 admin 权限，再校验确认头与删除模式，避免无权调用方利用确认参数探测仓库存在性；`mode=config` 删除配置与索引、保留无引用 blob 并报告 `orphaned_blobs`，`mode=data` 仅物理回收无其他仓库引用的 blob 并报告 `reclaimed_blobs`。
 
-### 2.5 Raw hosted/proxy 协议
+### 2.6 Raw hosted/proxy 协议
 
 - hosted `PUT` 流式写入并按覆盖策略返回 201/200/409；`GET` 流式下载，`HEAD` 返回同组元数据头且无响应体，`DELETE` 返回 204/404。对象响应固定携带 `Content-Length`、按扩展名推断的 `Content-Type`、强 `ETag`，以及 `X-Checksum-Sha256`、`X-Checksum-Sha1`、`X-Checksum-Sha512`、`X-Checksum-Md5`。
 - hosted 目录以尾随 `/` 表示，仓库根 `/repository/{name}/` 返回 JSON 分页索引；对象路径不得为空或尾随 `/`，规范化后 UTF-8 长度上限为 4096 字节。hosted query 不参与路径键。

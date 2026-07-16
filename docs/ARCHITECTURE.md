@@ -64,7 +64,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 |---|---|
 | `api` | 管理 API 路由与 handler（axum），鉴权提取、请求校验、统一错误映射；utoipa 注解在此生成 OpenAPI |
 | `protocol` | Raw、Maven、npm 格式协议适配：路径解析、协议元数据生成、checksum sidecar、packument 合并等；**严禁直接读写数据库，必须经领域服务与仓储接口** |
-| `auth` | 认证与授权：Argon2 口令校验、JWT 会话签发与撤销校验、API Token、授权判定 |
+| `auth` | 认证与授权：Argon2 口令校验、JWT 会话签发与撤销校验、API Token、首启一次性令牌校验、本地口令重置、授权判定 |
 | `artifact` | 共享制品服务：索引原子提交、带租约读取、引用安全回收、proxy 单飞与长生命周期上游客户端 |
 | `repository` | 仓库领域服务：仓库 CRUD、配置失效、浏览搜索、group 成员关系与 ACL 应用 |
 | `domain` | 核心领域类型与纯逻辑：仓库/制品/用户模型、路径规范化、覆盖策略、状态机 |
@@ -92,6 +92,8 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | 迁移任务 | 任务标识、不可变参数快照、状态机状态、节流进度、幂等信息 |
 | 迁移分仓明细 | 每仓库的对象/字节计数、校验结果、凭据引用状态、有界失败样本 |
 
+M1-FR-046 的 `initial-admin.token` 不属于数据表：它是仅在用户表为空且未完整提供环境变量自举凭据时生成的数据库同目录一次性文件，保存 32 字节随机数的十六进制表示，权限固定为 `0600`。创建时先把完整内容写入并同步同目录 `0600` 临时文件，再以同文件系统硬链接原子发布正式路径，避免崩溃留下半写令牌。用户表非空是首启入口永久关闭的权威状态，不能以令牌文件存在与否反向开启功能。
+
 ## 4. blob 存储与提交模型
 
 沿用已验证的设计：
@@ -112,7 +114,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期、ACL、制品统计、目录浏览与路径搜索已真实现，使用片段及迁移仍为契约骨架。仓库列表在 SQL 中按 read 权限过滤并聚合制品数/总大小，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期、ACL、制品统计、目录浏览与路径搜索已真实现，首启管理员状态/提交接口（M1-FR-046）、使用片段及迁移按各自开发状态推进。setup 页面只从 `/setup#token=<令牌>` 的 fragment 取值并向 `/api/v1/setup` 请求体提交，令牌不进入请求路径或 query。仓库列表在 SQL 中按 read 权限过滤并聚合制品数/总大小，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
 - **格式协议端点**：Raw hosted/proxy 已由 `protocol::raw` 实现 GET/HEAD/PUT/DELETE 与 JSON 目录索引，`api::formats` 只负责提取请求和 OpenAPI。Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）与 group 后续按域接入同一 `ArtifactService`，协议层始终不得直连数据库。
 - **健康检查**：`/healthz` 只报告进程存活；`/readyz` 以临时事务写入并回滚探测 SQLite，以随机且排他创建的临时文件探测 blob 目录，运行期挂载丢失时不自愈重建，响应不泄露路径、凭据或内部拓扑。
 
@@ -125,6 +127,8 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 - API Token 仅持久化 `sha256("api-token:" + 明文)`；Bearer `jat_` 与 Basic 口令位均可使用，吊销或用户禁用后下一次请求立即失败。
 - Basic 口令校验仅缓存 Argon2 正向结果 60 秒，缓存键绑定口令、当前 PHC 与 `token_version`；身份、角色和启用状态仍逐请求查库。
 - 管理端通过 `GET /api/v1/auth/me` 获取权威用户角色，不按用户名猜测；前端隐藏入口仅为体验优化。
+- **首启管理员初始化（M1-FR-046，开发中）**：服务打开数据库并检查用户表后，优先使用完整的 `JIANARTIFACT_ADMIN_USER` / `JIANARTIFACT_ADMIN_PASSWORD` 创建首个 Admin；空表且变量不完整时生成数据库同目录的 `initial-admin.token`，由 `/setup#token=<令牌>` 页面调用无鉴权 status/submit API。令牌校验、空表复核与 Admin 写入使用同一 SQLite 原子边界，保证并发仅一个成功；成功后删除令牌文件，用户表非空使两条入口永久关闭。
+- **本地口令重置（M1-FR-047，开发中）**：CLI 参数解析与隐藏终端/标准输入读取位于进程入口，口令校验、Argon2 哈希与用户更新复用认证领域服务。CLI 只打开配置指向的既有数据库；短事务只更新 `password_hash` 并递增 `token_version`，角色、启用状态与 API Token 表不参与写入。Argon2 计算在事务外执行，避免持有 SQLite 写锁进行高开销计算。
 - **授权判定为无 IO 纯函数**：输入主体（匿名/用户/Admin）、仓库可见性与 ACL、动作，输出允许/拒绝，便于穷举测试整张权限矩阵。前端不复制授权规则，权限拒绝一律以后端结果为准。
 
 ### 6.2 proxy 缓存与单飞
@@ -164,7 +168,8 @@ Raw proxy 使用进程内长生命周期 reqwest/rustls 客户端，连接超时
 - 目标交付物为**单个 Rust 二进制**（前端产物编译期内嵌）；当前阶段 Rust 服务与前端仍分别构建，静态资源内嵌待后续部署域落地。后端保持零系统级 C 库依赖（sqlx SQLite bundled，不依赖系统 sqlite3），Rust 生产代码 `forbid(unsafe)`。
 - 当前运行时依赖为 SQLite 文件、就绪探针使用的可写数据目录与启动配置；blob 目录语义随存储域落地。
 - TLS 由反向代理终止；服务自身不管理证书。
-- 首次启动通过管理员自举流程创建首个管理员，成功后入口永久关闭。
+- 首次启动先尝试环境变量管理员自举；空用户库且变量不完整时，以数据库同目录 `initial-admin.token` 和 `/setup#token=<令牌>` 完成首个管理员初始化。任一方式成功后用户表非空，入口永久关闭并删除令牌文件。
+- 主机管理员可执行 `jianartifact admin reset-password <用户名>` 重置本地用户口令；命令只打开既有数据库，不提供命令行明文口令参数，也不改变角色、启用状态与 API Token。
 - 构建、测试、lint、typecheck 与协议验收统一在 Docker 中执行，宿主项目目录不产生 `target`、`node_modules` 或大型测试产物。
 
 ## 8. 关键裁决与不做项

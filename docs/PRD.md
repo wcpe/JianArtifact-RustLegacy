@@ -173,6 +173,8 @@ JianArtifact 是一个以**低运维成本**为目标的自托管制品仓库，
 | M1-FR-043 | SSH + systemd 部署脚本（rootless + 可回滚） | `make deploy` 读取不入库的 env 配置（提供无真实值的示例模板），自动依赖 release 产物防止复用陈旧包；采用用户级 systemd，日常部署/升级/回滚全程无需 root；发布落 releases 目录并以 current 符号链接原子切换，保留可配置份数；健康确认失败自动回滚到上一发布，另提供 `make rollback` 手动回滚；失败非零退出并给中文错误；重复执行幂等；凭据不进日志不进仓库；真机验收为非 root 用户部署到 Linux 主机后健康检查通过且回滚可用 | 已交付@v0.2.0 |
 | M1-FR-044 | 前端工程基座与严格静态检查接线 | 四个前端子工程（apps/web、apps/wiki、packages/ui、packages/devmock）脚手架落地；`packages/eslint-config` 与 `packages/typescript-config` 为真实共享配置（ESLint `--max-warnings 0`、TS `strict`+`noUncheckedIndexedAccess`+`isolatedModules`、Prettier 只检不改）；四工程各自独立 typecheck/lint/test/build 全绿并纳入 Docker 质量门；故意引入违规样例能使门禁失败（红→绿证据） | 已交付@v0.2.0 |
 | M1-FR-045 | 口令修改与重置 | 登录用户以旧口令验证后修改本人口令（管理端模态框），旧口令错误明确拒绝；Admin 可在用户管理中为任意用户重置口令；新旧口令均不进日志与响应；修改/重置提交成功后旧口令立即失效 | 已交付@v0.2.0 |
+| M1-FR-046 | 首启管理员初始化 | 环境变量自举优先；空用户库且未提供完整自举变量时，在数据库同目录生成权限为 0600 的一次性令牌文件，通过 `/setup#token=<令牌>` 完成首个 Admin 初始化；并发提交仅一个成功，成功后用户表非空使入口永久关闭并删除令牌文件 | 开发中 |
+| M1-FR-047 | 本地口令重置 CLI | `jianartifact admin reset-password <用户名>` 仅打开既有数据库，以隐藏双输或 `--password-stdin` 单行读取至少 12 个 Unicode 字符的新口令，拒绝命令行明文 `--password`；成功后只更新口令哈希并递增 `token_version`，不改变角色、启用状态与 API Token | 开发中 |
 
 > 状态取值：计划 / 开发中 / 已交付@vX.Y.Z。
 > 标 `已交付` 是有门的：只有该 FR 对应 spec 的验收标准全部满足、对应测试与实机验收通过后，才在发版时统一标 `已交付@vX.Y.Z`——开发/修复过程中不得自行预标。FR 标了 `已交付` 实际是断的（false-done）：功能坏了要修回，走缺陷修复流程把状态归真（从没真正工作过则回退 `开发中`）；需求本身要撤/推迟则走变更回退流程。
@@ -427,7 +429,7 @@ M1 期内的交付工序（前端/mock 先行、契约骨架、阶段门禁）�
 
 | 规格文档 | 覆盖范围 | 状态 |
 |---|---|---|
-| `docs/specs/m1-auth.md` | 管理员自举、登录、会话、API Token、CLI 鉴权、用户管理与口令修改/重置（M1-FR-001~006、045） | 已产出 |
+| `docs/specs/m1-auth.md` | 管理员自举、登录、会话、API Token、CLI 鉴权、用户管理、口令修改/重置、首启管理员初始化与本地口令重置 CLI（M1-FR-001~006、045~047） | 已产出 |
 | `docs/specs/m1-repository-core.md` | 仓库可见性、ACL、仓库管理、hosted/proxy 通用能力、浏览、使用片段、健康检查（M1-FR-007~011、019~021） | 已产出 |
 | `docs/specs/m1-raw.md` | Raw hosted 与 Raw proxy 协议行为（M1-FR-013~014） | 已产出 |
 | `docs/specs/m1-maven.md` | Maven hosted 与 Maven proxy 协议行为（M1-FR-015~016） | 已产出 |
