@@ -10,6 +10,8 @@ DEPLOY_DIR="${DEPLOY_DIR:-$HOME/jianartifact}"
 DEPLOY_SERVICE="${DEPLOY_SERVICE:-jianartifact}"
 DEPLOY_KEEP_RELEASES="${DEPLOY_KEEP_RELEASES:-3}"
 DEPLOY_HEALTH_URL="${DEPLOY_HEALTH_URL:-}"
+DEPLOY_PUBLIC_URL="${DEPLOY_PUBLIC_URL:-}"
+DEPLOY_DATABASE_PATH="${DEPLOY_DATABASE_PATH:-data/jianartifact.db}"
 # 健康确认的重试参数（逻辑测试会调小以加速）
 HEALTH_RETRIES="${HEALTH_RETRIES:-10}"
 HEALTH_INTERVAL="${HEALTH_INTERVAL:-2}"
@@ -18,6 +20,13 @@ UNIT_FILE="$HOME/.config/systemd/user/${DEPLOY_SERVICE}.service"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
 fail() { echo "$@" >&2; exit 1; }
+
+if [[ "$DEPLOY_DATABASE_PATH" == *"'"* || "$DEPLOY_DATABASE_PATH" == *$'\n'* || "$DEPLOY_DATABASE_PATH" == *$'\r'* ]]; then
+    fail "错误：DEPLOY_DATABASE_PATH 包含不安全字符"
+fi
+if [ -n "$DEPLOY_HEALTH_URL" ] && [[ ! "$DEPLOY_HEALTH_URL" =~ ^https?://(\[[0-9A-Fa-f:]+\]|[^/:?#[:space:]]+)(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+    fail "错误：DEPLOY_HEALTH_URL 必须是完整的 http:// 或 https:// URL"
+fi
 
 # linger 未开启时服务会随登出停止——只警告不阻断（开启需管理员一次性执行）
 check_linger() {
@@ -59,12 +68,81 @@ service_healthy() {
     return 1
 }
 
-# 安装/更新 unit：ExecStart 改写为实际部署目录；内容有变化才复制并 daemon-reload
+warn_setup_link() { echo "警告：$1，已禁止输出初始化链接" >&2; }
+
+resolved_database_path() {
+    if [[ "$DEPLOY_DATABASE_PATH" = /* ]]; then
+        printf '%s\n' "$DEPLOY_DATABASE_PATH"
+    else
+        printf '%s\n' "$DEPLOY_DIR/$DEPLOY_DATABASE_PATH"
+    fi
+}
+
+setup_status_required() {
+    local body compact
+    if ! body="$(curl --fail --silent --show-error "${DEPLOY_PUBLIC_URL%/}/api/v1/setup/status")"; then
+        warn_setup_link "初始化状态查询失败"
+        return 1
+    fi
+    compact="${body//[$' \t\r\n']/}"
+    if [ "$compact" = '{"setup_required":true}' ]; then
+        return 0
+    fi
+    if [ "$compact" != '{"setup_required":false}' ]; then
+        warn_setup_link "初始化状态响应无效"
+    fi
+    return 1
+}
+
+# 仅在部署健康确认后读取一次性令牌，并只向当前 SSH 标准输出展示链接。
+show_initial_setup_link() {
+    local token_file token permissions size
+    token_file="$(dirname -- "$(resolved_database_path)")/initial-admin.token"
+    if [ ! -e "$token_file" ] && [ ! -L "$token_file" ]; then
+        return 0
+    fi
+    if [ ! -f "$token_file" ] || [ -L "$token_file" ]; then
+        warn_setup_link "初始化令牌不是普通文件"
+        return 0
+    fi
+    permissions="$(stat --format='%a' -- "$token_file" 2>/dev/null)" || permissions=""
+    if [ "$permissions" != "600" ]; then
+        warn_setup_link "初始化令牌权限不是 0600"
+        return 0
+    fi
+    size="$(stat --format='%s' -- "$token_file" 2>/dev/null)" || size=""
+    token="$(< "$token_file")"
+    if [ "$size" != "64" ] || [[ ! "$token" =~ ^[0-9a-f]{64}$ ]]; then
+        warn_setup_link "初始化令牌格式无效"
+        return 0
+    fi
+    if [ -z "$DEPLOY_PUBLIC_URL" ]; then
+        echo "提示：检测到待使用的初始化令牌，但未配置 DEPLOY_PUBLIC_URL；请在受保护的目标机上按运维流程完成初始化"
+        return 0
+    fi
+    setup_status_required || return 0
+    echo "提醒：请尽快在受控浏览器中完成首个管理员初始化；一次性链接如下"
+    printf '%s\n' "${DEPLOY_PUBLIC_URL%/}/setup#token=$token"
+}
+
+write_runtime_environment() {
+    local tmp="$DEPLOY_DIR/jianartifact.env.tmp.$$"
+    mkdir -p "$DEPLOY_DIR"
+    printf "JIANARTIFACT_DATABASE_PATH='%s'\n" "$DEPLOY_DATABASE_PATH" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$DEPLOY_DIR/jianartifact.env"
+}
+
+# 安装/更新 unit：工作目录、环境文件与启动路径改写为实际部署目录；内容有变化才重新加载
 install_unit() {
     local src="$1" tmp
     mkdir -p "$(dirname "$UNIT_FILE")"
+    write_runtime_environment
     tmp="$(mktemp)"
-    sed "s|^ExecStart=.*|ExecStart=$DEPLOY_DIR/current/bin/jianartifact|" "$src" > "$tmp"
+    sed -e "s|^WorkingDirectory=.*|WorkingDirectory=$DEPLOY_DIR|" \
+        -e "s|^EnvironmentFile=.*|EnvironmentFile=-$DEPLOY_DIR/jianartifact.env|" \
+        -e "s|^ExecStart=.*|ExecStart=$DEPLOY_DIR/current/bin/jianartifact|" \
+        "$src" > "$tmp"
     if [ ! -f "$UNIT_FILE" ] || ! cmp -s "$tmp" "$UNIT_FILE"; then
         cp "$tmp" "$UNIT_FILE"
         systemctl --user daemon-reload
@@ -142,6 +220,7 @@ do_deploy() {
     if service_healthy; then
         cleanup_releases
         echo "部署成功：current -> $rel_dir"
+        show_initial_setup_link
         return 0
     fi
 

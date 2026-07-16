@@ -1,12 +1,15 @@
 # JianArtifact 用户级 systemd unit 模板（随发布包分发，由部署脚本安装到用户 systemd 目录）
-# 部署目录非默认值（~/jianartifact）时，部署脚本负责改写 ExecStart 中的路径。
+# 部署目录非默认值（~/jianartifact）时，部署脚本负责改写 WorkingDirectory 与 ExecStart。
 
 [Unit]
 Description=JianArtifact 制品仓库服务
 
 [Service]
 Type=simple
-# %h 为用户家目录；current 是部署脚本维护的、指向活动发布的符号链接
+# %h 为用户家目录；相对数据路径固定落在部署目录，current 指向活动发布
+WorkingDirectory=%h/jianartifact
+# SQLite 数据库路径由部署脚本写入运行环境文件；相对路径以 WorkingDirectory 为基准
+EnvironmentFile=-%h/jianartifact/jianartifact.env
 ExecStart=%h/jianartifact/current/bin/jianartifact
 Restart=on-failure
 RestartSec=3
