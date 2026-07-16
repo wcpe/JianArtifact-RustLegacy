@@ -5,6 +5,7 @@ pub mod extractor;
 pub mod formats;
 pub mod migration;
 pub mod repos;
+pub mod setup;
 pub mod tokens;
 pub mod users;
 
@@ -55,6 +56,8 @@ impl PageQuery {
     paths(
         health::healthz,
         health::readyz,
+        setup::status,
+        setup::create,
         auth::login,
         auth::refresh,
         auth::logout,
@@ -100,6 +103,7 @@ impl PageQuery {
     components(schemas(repos::DeleteMode)),
     tags(
         (name = "health", description = "健康检查与就绪自检"),
+        (name = "setup", description = "首启初始化"),
         (name = "auth", description = "登录、会话刷新与退出"),
         (name = "tokens", description = "API Token 管理"),
         (name = "users", description = "用户管理（Admin）"),
@@ -121,6 +125,8 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         .route("/api/v1/openapi.json", get(openapi_json))
+        .route("/api/v1/setup/status", get(setup::status))
+        .route("/api/v1/setup", post(setup::create))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/refresh", post(auth::refresh))
         .route("/api/v1/auth/logout", post(auth::logout))

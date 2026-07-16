@@ -22,15 +22,16 @@ use crate::error::{ApiError, StartupError};
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// 建立连接池并执行全部未应用的迁移。
-pub async fn init(database_url: &str, database_path: &Path) -> Result<SqlitePool, StartupError> {
-    // 确保库文件所在目录存在（sqlite rwc 模式只创建文件不创建目录）
+pub async fn init(_database_url: &str, database_path: &Path) -> Result<SqlitePool, StartupError> {
+    // 确保库文件所在目录存在（SQLite 只创建文件，不创建父目录）
     if let Some(parent) = database_path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let options = database_url
-        .parse::<SqliteConnectOptions>()?
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
@@ -1830,6 +1831,23 @@ pub async fn compare_and_update_password(
     .execute(pool)
     .await
     .map_err(|_| ApiError::internal("更新口令失败"))?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// 本地管理员 CLI 按用户名单条更新口令并推进会话版本；未命中返回 false。
+pub async fn reset_password_by_username(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> Result<bool, ApiError> {
+    let result = sqlx::query(
+        "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE username = ?",
+    )
+    .bind(password_hash)
+    .bind(username)
+    .execute(pool)
+    .await
+    .map_err(|_| ApiError::internal("本地重置口令失败"))?;
     Ok(result.rows_affected() == 1)
 }
 

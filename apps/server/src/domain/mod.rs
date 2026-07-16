@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
-use crate::auth::password::{hash_password_async, verify_password_async};
+use crate::auth::password::{hash_password_async, password_is_long_enough, verify_password_async};
 use crate::error::{ApiError, StartupError};
 use crate::persistence::{self, User};
 
@@ -151,6 +151,11 @@ pub(crate) async fn bootstrap_admin_with(
     }
     match (username, password) {
         (Some(username), Some(password)) => {
+            if !password_is_long_enough(&password) {
+                return Err(StartupError::AuthConfig(
+                    "管理员自举口令至少需要 12 个字符".to_string(),
+                ));
+            }
             let hash = hash_password_async(&password)
                 .await
                 .map_err(|_| StartupError::AuthConfig("管理员自举口令哈希失败".to_string()))?;
@@ -358,9 +363,13 @@ mod tests {
     #[tokio::test]
     async fn 自举空库有凭据创建可登录管理员() {
         let pool = test_pool().await;
-        bootstrap_admin_with(&pool, Some("admin".to_string()), Some("secret".to_string()))
-            .await
-            .unwrap();
+        bootstrap_admin_with(
+            &pool,
+            Some("admin".to_string()),
+            Some("bootstrap-password".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(count_users(&pool).await.unwrap(), 1);
         let u = find_user_by_username(&pool, "admin")
             .await
@@ -375,7 +384,7 @@ mod tests {
                 .unwrap();
         assert!(enabled);
         assert!(matches!(role, Role::Admin));
-        assert!(verify_password("secret", &hash));
+        assert!(verify_password("bootstrap-password", &hash));
     }
 
     #[tokio::test]
@@ -384,9 +393,13 @@ mod tests {
         create_user(&pool, "existing", "pw", Role::User)
             .await
             .unwrap();
-        bootstrap_admin_with(&pool, Some("admin".to_string()), Some("secret".to_string()))
-            .await
-            .unwrap();
+        bootstrap_admin_with(
+            &pool,
+            Some("admin".to_string()),
+            Some("bootstrap-password".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(count_users(&pool).await.unwrap(), 1, "表非空不应新增");
         assert!(
             find_user_by_username(&pool, "admin")
@@ -410,7 +423,7 @@ mod tests {
             bootstrap_admin_with(
                 &pool1,
                 Some("bootstrap-admin-1".to_string()),
-                Some("secret-1".to_string()),
+                Some("bootstrap-password-1".to_string()),
             )
             .await
         });
@@ -419,7 +432,7 @@ mod tests {
             bootstrap_admin_with(
                 &pool2,
                 Some("bootstrap-admin-2".to_string()),
-                Some("secret-2".to_string()),
+                Some("bootstrap-password-2".to_string()),
             )
             .await
         });

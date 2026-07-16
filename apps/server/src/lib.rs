@@ -1,6 +1,7 @@
 //! JianArtifact 后端库：模块声明与应用装配。
 //! 分层依赖单向：api（入口层）→ 领域服务层 → persistence/storage（基础设施层），config 只读引用。
 
+pub mod admin;
 pub mod api;
 pub mod artifact;
 pub mod auth;
@@ -12,6 +13,7 @@ pub mod logging;
 pub mod persistence;
 pub mod protocol;
 pub mod repository;
+pub mod setup;
 pub mod state;
 pub mod storage;
 #[cfg(feature = "embedded-web")]
@@ -69,8 +71,8 @@ pub(crate) async fn build_app_with_bootstrap(
         blob_store.as_ref().clone(),
     ));
     recover_blob_reclamations(&artifacts).await?;
-    // 元数据库就绪后执行管理员自举（空库且提供自举变量时创建首个 admin）
-    domain::bootstrap_admin_with(&pool, username, password).await?;
+    // 环境变量自举优先；仍为空库时创建或复用数据库旁首启令牌
+    setup::initialize(&pool, &config.database_path, username, password).await?;
     let auth = std::sync::Arc::new(crate::auth::AuthRuntime::new(
         &config.jwt_secret,
         config.session_ttl_hours,
@@ -154,14 +156,19 @@ mod tests {
     async fn 空库有凭据创建管理员且可经路由登录() {
         let 目录 = tempfile::tempdir().unwrap();
         let 口令 = "bootstrap-secret-response-check";
+        let config = 测试配置(&目录);
+        tokio::fs::write(setup::token_path(&config.database_path), "a".repeat(64))
+            .await
+            .unwrap();
         let app = build_app_with_bootstrap(
-            测试配置(&目录),
+            config.clone(),
             Some("bootstrap-admin".to_string()),
             Some(口令.to_string()),
         )
         .await
         .unwrap();
 
+        assert!(!setup::token_path(&config.database_path).exists());
         let (status, login_body) = 登录(&app, "bootstrap-admin", 口令).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!login_body.contains(口令), "登录响应不得包含自举口令");
@@ -193,6 +200,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let stale_token = setup::token_path(&config.database_path);
+        tokio::fs::write(&stale_token, "a".repeat(64))
+            .await
+            .unwrap();
         let second_app = build_app_with_bootstrap(
             config.clone(),
             Some("second-admin".to_string()),
@@ -201,6 +212,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(!stale_token.exists());
         assert_eq!(
             登录(&first_app, "first-admin", "first-password").await.0,
             StatusCode::OK
@@ -218,13 +230,74 @@ mod tests {
     #[tokio::test]
     async fn 空库无凭据可装配且用户接口返回未认证() {
         let 目录 = tempfile::tempdir().unwrap();
-        let app = build_app_with_bootstrap(测试配置(&目录), None, None)
+        let config = 测试配置(&目录);
+        let app = build_app_with_bootstrap(config.clone(), None, None)
+            .await
+            .unwrap();
+        let token = tokio::fs::read_to_string(setup::token_path(&config.database_path))
             .await
             .unwrap();
         let request = Request::get("/api/v1/users").body(Body::empty()).unwrap();
 
+        assert_eq!(token.len(), 64);
         let (status, _) = 发送请求(&app, request).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn 完整自举变量口令十一字符拒绝且十二字符接受() {
+        let 短目录 = tempfile::tempdir().unwrap();
+        let 短配置 = 测试配置(&短目录);
+        let 短结果 = build_app_with_bootstrap(
+            短配置.clone(),
+            Some("short-admin".to_string()),
+            Some("密".repeat(11)),
+        )
+        .await;
+        assert!(matches!(&短结果, Err(StartupError::AuthConfig(_))));
+        let 错误文本 = match 短结果 {
+            Err(StartupError::AuthConfig(message)) => message,
+            _ => String::new(),
+        };
+        assert!(错误文本.contains("至少需要 12 个字符"));
+        assert!(!错误文本.contains(&短配置.database_path.display().to_string()));
+        assert!(!setup::token_path(&短配置.database_path).exists());
+        let pool = persistence::init(&短配置.database_url(), &短配置.database_path)
+            .await
+            .unwrap();
+        assert_eq!(persistence::count_users(&pool).await.unwrap(), 0);
+        pool.close().await;
+
+        let 边界目录 = tempfile::tempdir().unwrap();
+        let 边界配置 = 测试配置(&边界目录);
+        let _app = build_app_with_bootstrap(
+            边界配置.clone(),
+            Some("boundary-admin".to_string()),
+            Some("密".repeat(12)),
+        )
+        .await
+        .unwrap();
+        let pool = persistence::init(&边界配置.database_url(), &边界配置.database_path)
+            .await
+            .unwrap();
+        assert_eq!(persistence::count_users(&pool).await.unwrap(), 1);
+        assert!(!setup::token_path(&边界配置.database_path).exists());
+    }
+
+    #[tokio::test]
+    async fn 自举变量不完整时保留空库并创建令牌() {
+        let 目录 = tempfile::tempdir().unwrap();
+        let config = 测试配置(&目录);
+        let _app =
+            build_app_with_bootstrap(config.clone(), Some("partial-admin".to_string()), None)
+                .await
+                .unwrap();
+
+        assert!(setup::token_path(&config.database_path).exists());
+        let pool = persistence::init(&config.database_url(), &config.database_path)
+            .await
+            .unwrap();
+        assert_eq!(persistence::count_users(&pool).await.unwrap(), 0);
     }
 
     #[tokio::test]

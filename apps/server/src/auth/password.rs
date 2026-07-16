@@ -8,6 +8,14 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use crate::auth::{ARGON2_ITERATIONS, ARGON2_MEMORY_KIB, ARGON2_PARALLELISM};
 use crate::error::ApiError;
 
+/// setup 与本地重置口令要求的最少 Unicode 字符数。
+pub const MIN_PASSWORD_CHARS: usize = 12;
+
+/// 按 Unicode 标量值计数判定口令是否达到最小长度。
+pub fn password_is_long_enough(password: &str) -> bool {
+    password.chars().count() >= MIN_PASSWORD_CHARS
+}
+
 /// 以钉死参数构造 Argon2id 哈希器。
 fn hasher() -> Result<Argon2<'static>, ApiError> {
     let params = Params::new(
@@ -87,6 +95,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn 最小长度按unicode字符计数() {
+        assert!(!password_is_long_enough(&"密".repeat(11)));
+        assert!(password_is_long_enough(&"密".repeat(12)));
+    }
 
     #[test]
     fn 哈希后可用原口令校验通过() {
