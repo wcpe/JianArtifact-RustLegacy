@@ -1071,7 +1071,7 @@ async fn put_manifest(
         .put_manifest(&repo, &image, &reference, &media_type, body.to_vec())
         .await
     {
-        Ok(digest) => {
+        Ok(outcome) => {
             let loc = location(
                 &state,
                 &format!("/v2/{repo_name}/{image}/manifests/{reference}"),
@@ -1082,7 +1082,7 @@ async fn put_manifest(
             if let Ok(v) = HeaderValue::from_str(&loc) {
                 h.insert(header::LOCATION, v);
             }
-            if let Ok(v) = HeaderValue::from_str(&digest) {
+            if let Ok(v) = HeaderValue::from_str(&outcome.digest) {
                 h.insert(CONTENT_DIGEST_HEADER, v);
             }
             resp

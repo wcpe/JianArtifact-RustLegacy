@@ -45,6 +45,9 @@ pub struct JwtClaims {
     pub iat: u64,
     /// 过期时间（Unix 秒）。
     pub exp: u64,
+    /// 会话唯一标识；旧版已签发 JWT 缺失时仍兼容校验，并改用完整 token 的安全哈希撤销。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 /// docker 范围令牌中的单条访问授权（对应 registry v2 token 的 `access` 项）。
@@ -141,6 +144,7 @@ impl JwtSigner {
             role: role.as_str().to_string(),
             iat: now,
             exp: now + self.ttl_secs,
+            jti: Some(uuid::Uuid::new_v4().to_string()),
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)?;
         Ok(token)
@@ -285,6 +289,37 @@ mod tests {
         assert_eq!(claims.username, "alice");
         assert_eq!(claims.role, "admin");
         assert!(claims.exp > claims.iat);
+        assert!(claims.jti.is_some());
+    }
+
+    #[test]
+    fn 每次签发生成不同的随机_jti() {
+        let signer = JwtSigner::from_secret(b"jti-secret-32-bytes-xxxxxxxxxxxx", 3600);
+        let first = signer
+            .verify(&signer.issue("uid", "u", Role::User).unwrap())
+            .unwrap();
+        let second = signer
+            .verify(&signer.issue("uid", "u", Role::User).unwrap())
+            .unwrap();
+        assert_ne!(first.jti, second.jti);
+    }
+
+    #[test]
+    fn 兼容缺少_jti_的旧版_jwt() {
+        let signer = JwtSigner::from_secret(b"legacy-secret-32-bytes-xxxxxxxxx", 3600);
+        let now = now_unix();
+        let claims = JwtClaims {
+            sub: "uid-legacy".to_string(),
+            username: "legacy".to_string(),
+            role: "user".to_string(),
+            iat: now,
+            exp: now + 3600,
+            jti: None,
+        };
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &signer.encoding).unwrap();
+
+        let verified = signer.verify(&token).unwrap();
+        assert!(verified.jti.is_none());
     }
 
     #[test]

@@ -114,7 +114,7 @@ pub struct MigrationProgressSnapshot {
 }
 
 /// 单个分仓库明细报告项（入库 / 查询共用）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationRepoReport {
     /// 源仓库名。
     pub source_repo: String,
@@ -130,6 +130,19 @@ pub struct MigrationRepoReport {
     pub skipped_existing_artifacts: i64,
     /// 失败跳过数。
     pub skipped_artifacts: i64,
+    pub total_bytes: i64,
+    pub done_bytes: i64,
+    pub migrated_bytes: i64,
+    pub skipped_bytes: i64,
+    pub duration_ms: i64,
+}
+
+/// 终态持久化的失败资产明细。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationAssetFailureReport {
+    pub source_repo: String,
+    pub asset: String,
+    pub reason: String,
 }
 
 /// 起任务时的首行写入入参。
@@ -178,6 +191,8 @@ pub struct MigrationTaskRecord {
     pub migrated_bytes: i64,
     /// 跳过 / 失败逻辑字节数。
     pub skipped_bytes: i64,
+    /// 因容量限制省略的失败资产明细数。
+    pub omitted_asset_failures: i64,
     /// 失败原因。
     pub error: Option<String>,
     /// 起始时刻。
@@ -205,35 +220,60 @@ pub struct MigrationTaskRepoRow {
     pub skipped_existing_artifacts: i64,
     /// 失败跳过数。
     pub skipped_artifacts: i64,
+    pub total_bytes: i64,
+    pub done_bytes: i64,
+    pub migrated_bytes: i64,
+    pub skipped_bytes: i64,
+    pub duration_ms: i64,
+}
+
+/// 失败资产明细查询行。
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MigrationTaskAssetFailureRow {
+    pub source_repo: String,
+    pub asset: String,
+    pub reason: String,
+}
+
+/// 同一只读事务读取的迁移任务完整详情。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationTaskDetail {
+    pub task: MigrationTaskRecord,
+    pub repos: Vec<MigrationTaskRepoRow>,
+    pub asset_failures: Vec<MigrationTaskAssetFailureRow>,
 }
 
 impl MetaStore {
     /// 起任务即时落首行（state = running）。同 id 重复登记视为覆盖（幂等，供重跑复用 id 场景）。
     pub async fn upsert_migration_task(&self, task: &NewMigrationTask) -> Result<(), MetaError> {
+        let mut tx = self.pool().begin().await?;
         sqlx::query(
             "INSERT INTO migration_tasks \
                 (id, kind, state, label, params_snapshot, phase) \
              VALUES (?, ?, 'running', ?, ?, 'enumerating') \
              ON CONFLICT(id) DO UPDATE SET \
-                kind = excluded.kind, \
-                state = 'running', \
-                label = excluded.label, \
-                params_snapshot = excluded.params_snapshot, \
-                phase = 'enumerating', \
-                total_assets = 0, done_assets = 0, \
-                migrated = 0, skipped_existing = 0, skipped = 0, \
+                kind = excluded.kind, state = 'running', label = excluded.label, \
+                params_snapshot = excluded.params_snapshot, phase = 'enumerating', \
+                total_assets = 0, done_assets = 0, migrated = 0, skipped_existing = 0, skipped = 0, \
                 total_bytes = 0, done_bytes = 0, migrated_bytes = 0, skipped_bytes = 0, \
-                error = NULL, \
-                started_at = CURRENT_TIMESTAMP, \
-                updated_at = CURRENT_TIMESTAMP, \
-                finished_at = NULL",
+                omitted_asset_failures = 0, error = NULL, started_at = CURRENT_TIMESTAMP, \
+                updated_at = CURRENT_TIMESTAMP, finished_at = NULL",
         )
         .bind(&task.id)
         .bind(task.kind.as_str())
         .bind(&task.label)
         .bind(&task.params_snapshot)
-        .execute(self.pool())
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM migration_task_repos WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM migration_task_asset_failures WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -298,6 +338,8 @@ impl MetaStore {
         state: MigrationTaskState,
         snapshot: &MigrationProgressSnapshot,
         repos: &[MigrationRepoReport],
+        failures: &[MigrationAssetFailureReport],
+        omitted_asset_failures: i64,
         error: Option<&str>,
     ) -> Result<(), MetaError> {
         let mut tx = self.pool().begin().await?;
@@ -308,7 +350,7 @@ impl MetaStore {
                 total_assets = ?, done_assets = ?, \
                 migrated = ?, skipped_existing = ?, skipped = ?, \
                 total_bytes = ?, done_bytes = ?, migrated_bytes = ?, skipped_bytes = ?, \
-                error = ?, \
+                omitted_asset_failures = ?, error = ?, \
                 updated_at = CURRENT_TIMESTAMP, \
                 finished_at = CURRENT_TIMESTAMP \
              WHERE id = ?",
@@ -324,6 +366,7 @@ impl MetaStore {
         .bind(snapshot.done_bytes)
         .bind(snapshot.migrated_bytes)
         .bind(snapshot.skipped_bytes)
+        .bind(omitted_asset_failures)
         .bind(error)
         .bind(id)
         .execute(&mut *tx)
@@ -338,8 +381,9 @@ impl MetaStore {
             sqlx::query(
                 "INSERT INTO migration_task_repos \
                     (task_id, position, source_repo, target_repo, format, created, \
-                     migrated_artifacts, skipped_existing_artifacts, skipped_artifacts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     migrated_artifacts, skipped_existing_artifacts, skipped_artifacts, \
+                     total_bytes, done_bytes, migrated_bytes, skipped_bytes, duration_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(position as i64)
@@ -350,6 +394,29 @@ impl MetaStore {
             .bind(r.migrated_artifacts)
             .bind(r.skipped_existing_artifacts)
             .bind(r.skipped_artifacts)
+            .bind(r.total_bytes)
+            .bind(r.done_bytes)
+            .bind(r.migrated_bytes)
+            .bind(r.skipped_bytes)
+            .bind(r.duration_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query("DELETE FROM migration_task_asset_failures WHERE task_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for (position, failure) in failures.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO migration_task_asset_failures \
+                    (task_id, position, source_repo, asset, reason) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(position as i64)
+            .bind(&failure.source_repo)
+            .bind(&failure.asset)
+            .bind(&failure.reason)
             .execute(&mut *tx)
             .await?;
         }
@@ -384,7 +451,7 @@ impl MetaStore {
             "SELECT id, kind, state, label, params_snapshot, phase, \
                     total_assets, done_assets, migrated, skipped_existing, skipped, \
                     total_bytes, done_bytes, migrated_bytes, skipped_bytes, \
-                    error, started_at, updated_at, finished_at \
+                    omitted_asset_failures, error, started_at, updated_at, finished_at \
              FROM migration_tasks \
              ORDER BY started_at DESC, id DESC \
              LIMIT ?",
@@ -404,13 +471,57 @@ impl MetaStore {
             "SELECT id, kind, state, label, params_snapshot, phase, \
                     total_assets, done_assets, migrated, skipped_existing, skipped, \
                     total_bytes, done_bytes, migrated_bytes, skipped_bytes, \
-                    error, started_at, updated_at, finished_at \
+                    omitted_asset_failures, error, started_at, updated_at, finished_at \
              FROM migration_tasks WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(self.pool())
         .await?;
         Ok(record)
+    }
+
+    /// 在同一只读事务中读取任务、分仓库报告与失败明细。
+    pub async fn get_migration_task_detail(
+        &self,
+        id: &str,
+    ) -> Result<Option<MigrationTaskDetail>, MetaError> {
+        let mut tx = self.pool().begin().await?;
+        let task = sqlx::query_as::<_, MigrationTaskRecord>(
+            "SELECT id, kind, state, label, params_snapshot, phase, \
+                    total_assets, done_assets, migrated, skipped_existing, skipped, \
+                    total_bytes, done_bytes, migrated_bytes, skipped_bytes, \
+                    omitted_asset_failures, error, started_at, updated_at, finished_at \
+             FROM migration_tasks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(task) = task else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let repos = sqlx::query_as::<_, MigrationTaskRepoRow>(
+            "SELECT source_repo, target_repo, format, created, migrated_artifacts, \
+                    skipped_existing_artifacts, skipped_artifacts, total_bytes, done_bytes, \
+                    migrated_bytes, skipped_bytes, duration_ms FROM migration_task_repos \
+             WHERE task_id = ? ORDER BY position ASC",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let asset_failures = sqlx::query_as::<_, MigrationTaskAssetFailureRow>(
+            "SELECT source_repo, asset, reason FROM migration_task_asset_failures \
+             WHERE task_id = ? ORDER BY position ASC",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(MigrationTaskDetail {
+            task,
+            repos,
+            asset_failures,
+        }))
     }
 
     /// 查某任务的分仓库明细报告，按 position 升序。
@@ -420,8 +531,24 @@ impl MetaStore {
     ) -> Result<Vec<MigrationTaskRepoRow>, MetaError> {
         let rows = sqlx::query_as::<_, MigrationTaskRepoRow>(
             "SELECT source_repo, target_repo, format, created, \
-                    migrated_artifacts, skipped_existing_artifacts, skipped_artifacts \
+                    migrated_artifacts, skipped_existing_artifacts, skipped_artifacts, \
+                    total_bytes, done_bytes, migrated_bytes, skipped_bytes, duration_ms \
              FROM migration_task_repos WHERE task_id = ? ORDER BY position ASC",
+        )
+        .bind(id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    /// 查某任务的失败资产明细，按最早发生顺序返回。
+    pub async fn get_migration_task_asset_failures(
+        &self,
+        id: &str,
+    ) -> Result<Vec<MigrationTaskAssetFailureRow>, MetaError> {
+        let rows = sqlx::query_as::<_, MigrationTaskAssetFailureRow>(
+            "SELECT source_repo, asset, reason FROM migration_task_asset_failures \
+             WHERE task_id = ? ORDER BY position ASC",
         )
         .bind(id)
         .fetch_all(self.pool())
@@ -551,6 +678,7 @@ mod tests {
                 migrated_artifacts: 3,
                 skipped_existing_artifacts: 1,
                 skipped_artifacts: 0,
+                ..Default::default()
             },
             MigrationRepoReport {
                 source_repo: "maven-snapshots".to_string(),
@@ -560,6 +688,7 @@ mod tests {
                 migrated_artifacts: 1,
                 skipped_existing_artifacts: 1,
                 skipped_artifacts: 2,
+                ..Default::default()
             },
         ];
         store
@@ -568,6 +697,8 @@ mod tests {
                 MigrationTaskState::Succeeded,
                 &进度("done"),
                 &repos,
+                &[],
+                0,
                 None,
             )
             .await
@@ -600,6 +731,8 @@ mod tests {
                 MigrationTaskState::Failed,
                 &进度("failed"),
                 &[],
+                &[],
+                0,
                 Some("源系统鉴权失败"),
             )
             .await
@@ -627,6 +760,7 @@ mod tests {
             migrated_artifacts: 1,
             skipped_existing_artifacts: 0,
             skipped_artifacts: 0,
+            ..Default::default()
         }];
         store
             .finish_migration_task(
@@ -634,6 +768,8 @@ mod tests {
                 MigrationTaskState::Succeeded,
                 &进度("done"),
                 &first,
+                &[],
+                0,
                 None,
             )
             .await
@@ -650,6 +786,7 @@ mod tests {
                 migrated_artifacts: 0,
                 skipped_existing_artifacts: 1,
                 skipped_artifacts: 0,
+                ..Default::default()
             },
             MigrationRepoReport {
                 source_repo: "r2".to_string(),
@@ -659,6 +796,7 @@ mod tests {
                 migrated_artifacts: 5,
                 skipped_existing_artifacts: 0,
                 skipped_artifacts: 0,
+                ..Default::default()
             },
         ];
         store
@@ -667,6 +805,8 @@ mod tests {
                 MigrationTaskState::Succeeded,
                 &进度("done"),
                 &second,
+                &[],
+                0,
                 None,
             )
             .await
@@ -675,6 +815,95 @@ mod tests {
         assert_eq!(rows.len(), 2, "应替换为新明细而非叠加");
         assert_eq!(rows[0].skipped_existing_artifacts, 1);
         assert_eq!(rows[1].source_repo, "r2");
+    }
+
+    #[tokio::test]
+    async fn 终态事务替换失败明细且重跑起始清空() {
+        let store = MetaStore::open_in_memory().await.unwrap();
+        store
+            .upsert_migration_task(&新任务("t-detail"))
+            .await
+            .unwrap();
+        let first = vec![MigrationAssetFailureReport {
+            source_repo: "r1".to_string(),
+            asset: "a.jar".to_string(),
+            reason: "源资产下载失败".to_string(),
+        }];
+        store
+            .finish_migration_task(
+                "t-detail",
+                MigrationTaskState::Failed,
+                &进度("failed"),
+                &[],
+                &first,
+                3,
+                Some("迁移失败"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_migration_task("t-detail")
+                .await
+                .unwrap()
+                .unwrap()
+                .omitted_asset_failures,
+            3
+        );
+        assert_eq!(
+            store
+                .get_migration_task_asset_failures("t-detail")
+                .await
+                .unwrap(),
+            vec![MigrationTaskAssetFailureRow {
+                source_repo: "r1".to_string(),
+                asset: "a.jar".to_string(),
+                reason: "源资产下载失败".to_string(),
+            }]
+        );
+
+        let second = vec![MigrationAssetFailureReport {
+            source_repo: "r2".to_string(),
+            asset: "b.tgz".to_string(),
+            reason: "目标制品写入失败".to_string(),
+        }];
+        store
+            .finish_migration_task(
+                "t-detail",
+                MigrationTaskState::Succeeded,
+                &进度("done"),
+                &[],
+                &second,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        let rows = store
+            .get_migration_task_asset_failures("t-detail")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_repo, "r2");
+
+        store
+            .upsert_migration_task(&新任务("t-detail"))
+            .await
+            .unwrap();
+        assert!(store
+            .get_migration_task_asset_failures("t-detail")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_migration_task("t-detail")
+                .await
+                .unwrap()
+                .unwrap()
+                .omitted_asset_failures,
+            0
+        );
     }
 
     #[tokio::test]
@@ -694,6 +923,8 @@ mod tests {
                 MigrationTaskState::Succeeded,
                 &进度("done"),
                 &[],
+                &[],
+                0,
                 None,
             )
             .await
@@ -771,6 +1002,7 @@ mod tests {
             migrated_artifacts: 1,
             skipped_existing_artifacts: 0,
             skipped_artifacts: 0,
+            ..Default::default()
         }];
         store
             .finish_migration_task(
@@ -778,6 +1010,8 @@ mod tests {
                 MigrationTaskState::Succeeded,
                 &进度("done"),
                 &repos,
+                &[],
+                0,
                 None,
             )
             .await

@@ -1,16 +1,16 @@
 //! 认证端点：登录、登出、刷新会话、当前用户（ADR-0003 / ADR-0011）。
 //!
-//! Web 会话以无状态 JWT 承载，放 `Authorization: Bearer` 头（不走 Cookie）。
-//! 登出在无状态 JWT 下由客户端丢弃令牌完成，服务端返回 200（不维护服务端 denylist，
-//! 该增强属可选项，本批不实现）。
+//! Web 会话以 JWT 承载，放 `Authorization: Bearer` 头（不走 Cookie）。
+//! 登出把当前 JWT 会话的安全撤销键写入撤销表，使该会话即时失效；其他 JWT 与 API Token 不受影响。
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, http::HeaderMap, Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::auth::verify_password;
 use crate::meta::UserRecord;
 
+use super::identity::CurrentJwtSession;
 use super::{ApiError, AppState, AuditResult, ClientIp, Identity};
 
 /// 请求 ID 头名称（与 api::mod 设置保持一致），登录审计据此关联请求。
@@ -163,12 +163,29 @@ fn provider_auto_provision(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-/// 登出：无状态 JWT 下由客户端丢弃令牌，服务端返回 200。
+/// 登出：仅即时撤销当前 JWT 会话；Basic / API Token 调用保持成功但不撤销其凭据。
 ///
-/// 需已认证（避免匿名误调）；服务端不维护 denylist（可选增强，本批不做）。
-pub async fn logout(identity: Identity) -> Result<Json<Value>, ApiError> {
+/// 新 JWT 按 jti 的域分隔哈希撤销，旧 JWT 按完整 token 的域分隔哈希撤销；
+/// 请求扩展与数据库均只接触安全哈希键。匿名调用继续返回 401。
+pub async fn logout(
+    State(state): State<AppState>,
+    identity: Identity,
+    session: Option<Extension<CurrentJwtSession>>,
+) -> Result<Json<Value>, ApiError> {
     identity.require_authenticated()?;
-    Ok(Json(json!({ "status": "ok" })))
+    let Some(Extension(session)) = session else {
+        return Ok(Json(json!({
+            "status": "ok",
+            "session_revoked": false,
+            "reason": "non_jwt_credential"
+        })));
+    };
+
+    state
+        .meta
+        .revoke_jwt_session(&session.session_key, session.exp)
+        .await?;
+    Ok(Json(json!({ "status": "ok", "session_revoked": true })))
 }
 
 /// 刷新会话：凭未过期的 JWT 会话换发新 JWT，过期 / 无效则 401。

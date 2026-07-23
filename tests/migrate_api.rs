@@ -913,8 +913,8 @@ async fn 重启后残留在途任务标已中断且历史报告可查() {
     // 模拟：进程 A 写入一个「运行中」任务 + 一个已完成任务（含报告）→ 退出 → 进程 B 用同一 DB 重开。
     // 断言：重开后启动中断标记把 running 归为 interrupted，已完成任务与其报告跨重启仍可查。
     use jianartifact::meta::{
-        MigrationProgressSnapshot, MigrationRepoReport, MigrationTaskKind, MigrationTaskState,
-        NewMigrationTask,
+        MigrationAssetFailureReport, MigrationProgressSnapshot, MigrationRepoReport,
+        MigrationTaskKind, MigrationTaskState, NewMigrationTask,
     };
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("persist.db");
@@ -969,7 +969,18 @@ async fn 重启后残留在途任务标已中断且历史报告可查() {
                     migrated_artifacts: 2,
                     skipped_existing_artifacts: 1,
                     skipped_artifacts: 0,
+                    total_bytes: 300,
+                    done_bytes: 300,
+                    migrated_bytes: 200,
+                    skipped_bytes: 100,
+                    duration_ms: 45,
                 }],
+                &[MigrationAssetFailureReport {
+                    source_repo: "maven-releases".to_string(),
+                    asset: "com/example/bad.jar".to_string(),
+                    reason: "源资产下载失败".to_string(),
+                }],
+                2,
                 None,
             )
             .await
@@ -1013,6 +1024,17 @@ async fn 重启后残留在途任务标已中断且历史报告可查() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0]["migrated_artifacts"], 2);
     assert_eq!(repos[0]["skipped_existing_artifacts"], 1);
+    assert_eq!(repos[0]["total_bytes"], 300);
+    assert_eq!(repos[0]["done_bytes"], 300);
+    assert_eq!(repos[0]["migrated_bytes"], 200);
+    assert_eq!(repos[0]["skipped_bytes"], 100);
+    assert_eq!(repos[0]["duration_ms"], 45);
+    assert_eq!(detail["omitted_asset_failures"], 2);
+    let failures = detail["asset_failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["source_repo"], "maven-releases");
+    assert_eq!(failures[0]["asset"], "com/example/bad.jar");
+    assert_eq!(failures[0]["reason"], "源资产下载失败");
 }
 
 #[tokio::test]

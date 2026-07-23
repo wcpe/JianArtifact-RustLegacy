@@ -13,6 +13,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::meta::ArtifactRecord;
 
+mod blob_commit;
 mod browse;
 mod cargo;
 pub mod docker;

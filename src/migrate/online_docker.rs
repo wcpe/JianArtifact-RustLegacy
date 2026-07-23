@@ -17,11 +17,12 @@
 //! - 幂等重跑：已按 digest 落库且一致的 blob / manifest 跳过（内容寻址天然去重），进度区分新搬 vs 跳过。
 //! - 单镜像 / 单 tag 失败记跳过、不中断整批；取消 / 暂停在 tag 边界响应（复用 FR-91）。
 
+use crate::format::docker_registry::DockerWriteOutcome;
 use crate::format::{DockerError, DockerRegistry};
 use crate::meta::RepositoryRecord;
 use crate::storage::BlobStore;
 
-use super::online::await_control;
+use super::online::{await_control, record_asset_failure};
 use super::{
     parse_manifest_refs, DockerRegistryClient, JobControl, ManifestRefs, MigrateError,
     OnlinePullPhase, OnlinePullProgress,
@@ -33,6 +34,30 @@ const MAX_DOCKER_ATTEMPTS: u32 = 3;
 /// manifest list 递归搬运的最大深度：防御异常的自引用 / 深层嵌套（正常镜像仅 list → image 两层）。
 const MAX_MANIFEST_DEPTH: u32 = 4;
 
+/// 单个 Docker tag 的稳定、脱敏失败分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagFailureReason {
+    ManifestRead,
+    ManifestParse,
+    ContentDigest,
+    BlobDownload,
+    BlobWrite,
+    ManifestWrite,
+}
+
+impl TagFailureReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::ManifestRead => "Docker manifest 读取失败",
+            Self::ManifestParse => "Docker manifest 解析失败",
+            Self::ContentDigest => "Docker 内容摘要不匹配",
+            Self::BlobDownload => "Docker blob 下载失败",
+            Self::BlobWrite => "Docker blob 写入失败",
+            Self::ManifestWrite => "Docker manifest 写入失败",
+        }
+    }
+}
+
 /// 单源 docker 仓库在线搬运的结果计数（供上层汇总 [`super::OnlineRepoMigrationOutcome`]）。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct DockerRepoPullResult {
@@ -42,6 +67,14 @@ pub(crate) struct DockerRepoPullResult {
     pub skipped_existing: usize,
     /// 失败跳过数（镜像 / tag 拉取失败、digest 不符、layer 缺失等）。
     pub skipped: usize,
+    /// 已发现的 blob 与 manifest payload 总字节数。
+    pub total_bytes: u64,
+    /// 已处理 blob 与 manifest payload 字节数。
+    pub done_bytes: u64,
+    /// 本次新写入 payload 字节数。
+    pub migrated_bytes: u64,
+    /// 幂等命中或失败跳过 payload 字节数。
+    pub skipped_bytes: u64,
     /// 是否在 tag 边界被取消（提前结束本仓库、未搬完）。
     pub cancelled: bool,
 }
@@ -92,7 +125,6 @@ where
 
     {
         let mut p = lock_progress(progress);
-        p.total_assets += targets.len();
         p.phase = OnlinePullPhase::Downloading;
     }
 
@@ -121,17 +153,44 @@ where
         )
         .await;
 
+        // 失败时，已知但未完成的 manifest payload 按失败跳过计入。
+        if outcome.is_err() {
+            let failed_bytes = counts.total_bytes.saturating_sub(counts.done_bytes);
+            counts.done_bytes = counts.total_bytes;
+            counts.skipped_bytes = counts.skipped_bytes.saturating_add(failed_bytes);
+        }
         // 无论 tag 整体成败，已成功搬运的 blob / manifest 计入对应计数（半途失败不回退已落定的合法 blob）
         let mut p = lock_progress(progress);
         result.migrated += counts.migrated;
         result.skipped_existing += counts.skipped_existing;
+        result.total_bytes = result.total_bytes.saturating_add(counts.total_bytes);
+        result.done_bytes = result.done_bytes.saturating_add(counts.done_bytes);
+        result.migrated_bytes = result.migrated_bytes.saturating_add(counts.migrated_bytes);
+        result.skipped_bytes = result.skipped_bytes.saturating_add(counts.skipped_bytes);
         p.migrated += counts.migrated;
         p.skipped_existing += counts.skipped_existing;
+        p.total_bytes = p.total_bytes.saturating_add(counts.total_bytes);
+        p.done_bytes = p.done_bytes.saturating_add(counts.done_bytes);
+        p.migrated_bytes = p.migrated_bytes.saturating_add(counts.migrated_bytes);
+        p.skipped_bytes = p.skipped_bytes.saturating_add(counts.skipped_bytes);
+        let payloads = counts.migrated + counts.skipped_existing;
+        p.total_assets += payloads;
+        p.done_assets += payloads;
         if outcome.is_err() {
             result.skipped += 1;
             p.skipped += 1;
+            p.total_assets += 1;
+            p.done_assets += 1;
         }
-        p.done_assets += 1;
+        drop(p);
+        if let Err(reason) = outcome {
+            record_asset_failure(
+                progress,
+                source_repo,
+                &format!("{image}:{tag}"),
+                reason.message(),
+            );
+        }
     }
 
     Ok(result)
@@ -144,6 +203,31 @@ struct TagCounts {
     migrated: usize,
     /// 增量跳过数。
     skipped_existing: usize,
+    /// 已发现 payload 字节数。
+    total_bytes: u64,
+    /// 已处理 payload 字节数。
+    done_bytes: u64,
+    /// 新写入 payload 字节数。
+    migrated_bytes: u64,
+    /// 幂等命中 payload 字节数。
+    skipped_bytes: u64,
+}
+
+/// 纯 tag 新增或改指向不重复统计 manifest payload；其余情况统计本次输入实体。
+fn manifest_payload_size(
+    reference: &str,
+    outcome: &DockerWriteOutcome,
+    payload_existed: bool,
+) -> u64 {
+    let tag_only = payload_existed
+        && outcome.written
+        && !outcome.payload_written
+        && !crate::format::docker::is_digest_reference(reference);
+    if tag_only {
+        0
+    } else {
+        outcome.size
+    }
 }
 
 /// 搬运单个 tag 的 manifest 图：拉 tag manifest → 遍历图搬 blob / 子 manifest → 写 manifest + tag 指针。
@@ -161,7 +245,7 @@ async fn pull_tag<C, S>(
     target_repo: &RepositoryRecord,
     credential: Option<&super::NexusCredential>,
     counts: &mut TagCounts,
-) -> Result<(), ()>
+) -> Result<(), TagFailureReason>
 where
     C: DockerRegistryClient,
     S: BlobStore,
@@ -170,7 +254,11 @@ where
     let top = fetch_manifest_checked(client, base_url, source_repo, image, tag, credential)
         .await
         .map_err(|e| {
-            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, tag = %tag, 错误 = %e, "拉取 tag manifest 失败，跳过");
+            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, tag = %tag, "拉取 tag manifest 失败，跳过");
+            match e {
+                FetchManifestError::DigestMismatch => TagFailureReason::ContentDigest,
+                FetchManifestError::Read => TagFailureReason::ManifestRead,
+            }
         })?;
 
     // 深度优先搬运 manifest 图：先把顶层 manifest 引用的 blob / 子 manifest 全搬入，再写顶层 manifest。
@@ -208,19 +296,23 @@ async fn ingest_manifest_graph<C, S>(
     credential: Option<&super::NexusCredential>,
     counts: &mut TagCounts,
     depth: u32,
-) -> Result<(), ()>
+) -> Result<(), TagFailureReason>
 where
     C: DockerRegistryClient,
     S: BlobStore,
 {
     if depth > MAX_MANIFEST_DEPTH {
         tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, "manifest 嵌套过深，跳过");
-        return Err(());
+        return Err(TagFailureReason::ManifestParse);
     }
 
+    counts.total_bytes = counts
+        .total_bytes
+        .saturating_add(u64::try_from(manifest.bytes.len()).unwrap_or(u64::MAX));
     // 解析本 manifest 引用的 blob / 子 manifest digest
-    let refs: ManifestRefs = parse_manifest_refs(&manifest.bytes).map_err(|e| {
-        tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, 引用 = %reference, 错误 = %e, "manifest 解析失败，跳过");
+    let refs: ManifestRefs = parse_manifest_refs(&manifest.bytes).map_err(|_| {
+        tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, 引用 = %reference, "manifest 解析失败，跳过");
+        TagFailureReason::ManifestParse
     })?;
 
     // 单架构：搬 config + 各 layer blob（按 digest 内容寻址、校验）
@@ -245,7 +337,11 @@ where
             fetch_manifest_checked(client, base_url, source_repo, image, sub_digest, credential)
                 .await
                 .map_err(|e| {
-                    tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %sub_digest, 错误 = %e, "拉取子 manifest 失败，跳过");
+                    tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %sub_digest, "拉取子 manifest 失败，跳过");
+                    match e {
+                        FetchManifestError::DigestMismatch => TagFailureReason::ContentDigest,
+                        FetchManifestError::Read => TagFailureReason::ManifestRead,
+                    }
                 })?;
         // 递归：先搬子 manifest 引用的 blob，再写子 manifest（按 digest）
         Box::pin(ingest_manifest_graph(
@@ -265,6 +361,11 @@ where
     }
 
     // 图内引用就位后，写本 manifest 自身（顶层用 tag、子用 digest；put_manifest 幂等 + 内容寻址）
+    let manifest_digest = format!("sha256:{}", sha256_hex(&manifest.bytes));
+    let payload_existed = registry
+        .get_manifest(target_repo, image, &manifest_digest)
+        .await
+        .is_ok();
     match registry
         .put_manifest(
             target_repo,
@@ -275,14 +376,31 @@ where
         )
         .await
     {
-        Ok(_) => {
-            // put_manifest 未区分新写 / 幂等命中；统一按新写计入（tag 指针每次覆盖写入，属正常搬运）
-            counts.migrated += 1;
+        Ok(outcome) => {
+            let payload_size = manifest_payload_size(reference, &outcome, payload_existed);
+            if payload_size == 0 {
+                counts.total_bytes = counts.total_bytes.saturating_sub(outcome.size);
+            }
+            counts.done_bytes = counts.done_bytes.saturating_add(payload_size);
+            if outcome.written {
+                counts.migrated += 1;
+            } else {
+                counts.skipped_existing += 1;
+            }
+            if outcome.payload_written {
+                counts.migrated_bytes = counts.migrated_bytes.saturating_add(payload_size);
+            } else {
+                counts.skipped_bytes = counts.skipped_bytes.saturating_add(payload_size);
+            }
             Ok(())
         }
-        Err(e) => {
-            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, 引用 = %reference, 错误 = %e, "写入 manifest 失败，跳过");
-            Err(())
+        Err(DockerError::DigestMismatch) => {
+            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, 引用 = %reference, "manifest 内容摘要不匹配，跳过");
+            Err(TagFailureReason::ContentDigest)
+        }
+        Err(_) => {
+            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, 引用 = %reference, "写入 manifest 失败，跳过");
+            Err(TagFailureReason::ManifestWrite)
         }
     }
 }
@@ -302,7 +420,7 @@ async fn ingest_one_blob<C, S>(
     target_repo: &RepositoryRecord,
     credential: Option<&super::NexusCredential>,
     counts: &mut TagCounts,
-) -> Result<(), ()>
+) -> Result<(), TagFailureReason>
 where
     C: DockerRegistryClient,
     S: BlobStore,
@@ -310,13 +428,23 @@ where
     // 幂等短路：已按 digest 落库且一致 → 增量跳过，不重复下载
     match registry.blob_exists(target_repo, image, digest).await {
         Ok(true) => {
+            let size = registry
+                .stat_blob(target_repo, image, digest)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|size| u64::try_from(size).ok())
+                .unwrap_or(0);
             counts.skipped_existing += 1;
+            counts.total_bytes = counts.total_bytes.saturating_add(size);
+            counts.done_bytes = counts.done_bytes.saturating_add(size);
+            counts.skipped_bytes = counts.skipped_bytes.saturating_add(size);
             return Ok(());
         }
         Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, 错误 = %e, "查 blob 是否存在失败，跳过");
-            return Err(());
+        Err(_) => {
+            tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, "查 blob 是否存在失败，跳过");
+            return Err(TagFailureReason::BlobWrite);
         }
     }
 
@@ -334,8 +462,8 @@ where
                     backoff(attempt).await;
                     continue;
                 }
-                tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, 错误 = %e, "下载 blob 失败，跳过");
-                return Err(());
+                tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, "下载 blob 失败，跳过");
+                return Err(TagFailureReason::BlobDownload);
             }
         };
 
@@ -343,22 +471,40 @@ where
             .ingest_blob(target_repo, image, digest, reader)
             .await
         {
-            Ok(_) => {
-                // ingest_blob 已在内部对幂等命中返回 false；此处走到必为新写（短路已挡下已存在）
-                counts.migrated += 1;
+            Ok(outcome) => {
+                counts.total_bytes = counts.total_bytes.saturating_add(outcome.size);
+                counts.done_bytes = counts.done_bytes.saturating_add(outcome.size);
+                if outcome.written {
+                    counts.migrated += 1;
+                } else {
+                    counts.skipped_existing += 1;
+                }
+                if outcome.payload_written {
+                    counts.migrated_bytes = counts.migrated_bytes.saturating_add(outcome.size);
+                } else {
+                    counts.skipped_bytes = counts.skipped_bytes.saturating_add(outcome.size);
+                }
                 return Ok(());
             }
             // 内容寻址校验失败为确定性错误（源内容损坏 / digest 错配），不重试
             Err(DockerError::DigestMismatch) => {
                 tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, "blob 内容与声明 digest 不符，回滚并跳过");
-                return Err(());
+                return Err(TagFailureReason::ContentDigest);
             }
-            Err(e) => {
-                tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, 错误 = ?e, "写入 blob 失败，跳过");
-                return Err(());
+            Err(_) => {
+                tracing::warn!(仓库 = %target_repo.name, 镜像 = %image, digest = %digest, "写入 blob 失败，跳过");
+                return Err(TagFailureReason::BlobWrite);
             }
         }
     }
+}
+
+/// manifest 拉取阶段的稳定错误类型。
+enum FetchManifestError {
+    /// 源端读取或传输失败。
+    Read,
+    /// digest 引用与实际内容不一致。
+    DigestMismatch,
 }
 
 /// 已按 digest 校验的 manifest：字节 + 媒体类型（校验通过后携带，供落库与图遍历复用）。
@@ -380,7 +526,7 @@ async fn fetch_manifest_checked<C>(
     image: &str,
     reference: &str,
     credential: Option<&super::NexusCredential>,
-) -> Result<FetchedManifestChecked, MigrateError>
+) -> Result<FetchedManifestChecked, FetchManifestError>
 where
     C: DockerRegistryClient,
 {
@@ -397,7 +543,7 @@ where
                     backoff(attempt).await;
                     continue;
                 }
-                return Err(e);
+                return Err(FetchManifestError::Read);
             }
         }
     };
@@ -407,11 +553,7 @@ where
         let hex = sha256_hex(&fetched.bytes);
         match crate::format::docker::parse_digest(reference) {
             Some(expected) if expected == hex => {}
-            _ => {
-                return Err(MigrateError::Parse(format!(
-                    "manifest 内容与声明 digest 不符: {reference}"
-                )))
-            }
+            _ => return Err(FetchManifestError::DigestMismatch),
         }
     }
 
@@ -464,6 +606,12 @@ mod tests {
 
     fn digest_of(data: &[u8]) -> String {
         format!("sha256:{}", sha256_of(data))
+    }
+
+    fn assert_single_failure(progress: &Mutex<OnlinePullProgress>, reason: &str) {
+        let p = progress.lock().unwrap();
+        assert_eq!(p.asset_failures.len(), 1);
+        assert_eq!(p.asset_failures[0].reason, reason);
     }
 
     /// mock registry v2 源：预置镜像 / tag、manifest（按 reference）、blob（按 digest）。
@@ -539,10 +687,21 @@ mod tests {
         RepositoryRecord,
         tempfile::TempDir,
     ) {
+        新建_with_max(None).await
+    }
+
+    async fn 新建_with_max(
+        max_size: Option<u64>,
+    ) -> (
+        DockerRegistry<LocalFsStore>,
+        MetaStore,
+        RepositoryRecord,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let meta = MetaStore::open_in_memory().await.unwrap();
         let store = LocalFsStore::new(dir.path().join("blobs")).await.unwrap();
-        let reg = DockerRegistry::new(store, meta.clone(), dir.path().join("uploads"), None)
+        let reg = DockerRegistry::new(store, meta.clone(), dir.path().join("uploads"), max_size)
             .await
             .unwrap();
         let id = meta
@@ -665,9 +824,167 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(r2.skipped_existing, 2, "config + layer 增量跳过");
-        assert_eq!(r2.migrated, 1, "manifest tag 指针覆盖写入");
+        assert_eq!(
+            r2.skipped_existing, 3,
+            "config、layer 与 manifest 均增量跳过"
+        );
+        assert_eq!(r2.migrated, 0, "同 tag 状态一致时不重复写入");
         assert_eq!(r2.skipped, 0);
+    }
+
+    #[test]
+    fn manifest_payload_字节区分新写幂等与纯_tag_更新() {
+        let base = DockerWriteOutcome {
+            written: true,
+            payload_written: true,
+            size: 128,
+            digest: "sha256:test".to_string(),
+        };
+        assert_eq!(manifest_payload_size("latest", &base, false), 128);
+        assert_eq!(
+            manifest_payload_size(
+                "latest",
+                &DockerWriteOutcome {
+                    written: false,
+                    payload_written: false,
+                    ..base.clone()
+                },
+                true
+            ),
+            128
+        );
+        assert_eq!(
+            manifest_payload_size(
+                "latest",
+                &DockerWriteOutcome {
+                    written: true,
+                    payload_written: false,
+                    ..base.clone()
+                },
+                true
+            ),
+            0
+        );
+        assert_eq!(
+            manifest_payload_size(
+                &format!("sha256:{}", "a".repeat(64)),
+                &DockerWriteOutcome {
+                    written: true,
+                    payload_written: false,
+                    ..base
+                },
+                true
+            ),
+            128
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_已存在但_tag_缺失时_manifest_字节为零() {
+        let (reg, meta, repo, _d) = 新建().await;
+        let (client, _, _) = 单架构镜像("app");
+        let expected_blob_bytes = client
+            .blobs
+            .values()
+            .fold(0u64, |sum, bytes| sum.saturating_add(bytes.len() as u64));
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &Mutex::new(OnlinePullProgress::default()),
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+        let tag_key = crate::format::docker::tag_key("app", "1.0");
+        sqlx::query("DELETE FROM artifacts WHERE repo_id = ? AND path = ?")
+            .bind(&repo.id)
+            .bind(tag_key)
+            .execute(meta.pool())
+            .await
+            .unwrap();
+
+        let progress = Mutex::new(OnlinePullProgress::default());
+        let result = migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.migrated, 1, "仅补 tag 索引");
+        assert_eq!(result.total_bytes, expected_blob_bytes);
+        assert_eq!(result.done_bytes, expected_blob_bytes);
+        assert_eq!(result.migrated_bytes, 0);
+        assert_eq!(result.skipped_bytes, expected_blob_bytes);
+    }
+
+    #[tokio::test]
+    async fn payload_已存在但_tag_改指向时_manifest_字节为零() {
+        let (reg, _meta, repo, _d) = 新建().await;
+        let (mut client, _, _) = 单架构镜像("app");
+        let expected_blob_bytes = client
+            .blobs
+            .values()
+            .fold(0u64, |sum, bytes| sum.saturating_add(bytes.len() as u64));
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &Mutex::new(OnlinePullProgress::default()),
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+        reg.put_manifest(
+            &repo,
+            "app",
+            "latest",
+            "application/vnd.docker.distribution.manifest.v2+json",
+            br#"{"schemaVersion":2,"config":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"layers":[]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+        client
+            .images
+            .insert("app".to_string(), vec!["latest".to_string()]);
+        let source_manifest = client
+            .manifests
+            .remove(&("app".to_string(), "1.0".to_string()))
+            .unwrap();
+        client
+            .manifests
+            .insert(("app".to_string(), "latest".to_string()), source_manifest);
+
+        let result = migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &Mutex::new(OnlinePullProgress::default()),
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.migrated, 1, "仅更新 tag 指向");
+        assert_eq!(result.total_bytes, expected_blob_bytes);
+        assert_eq!(result.done_bytes, expected_blob_bytes);
+        assert_eq!(result.migrated_bytes, 0);
+        assert_eq!(result.skipped_bytes, expected_blob_bytes);
     }
 
     #[tokio::test]
@@ -793,6 +1110,7 @@ mod tests {
         assert!(reg.get_manifest(&repo, "app", "1.0").await.is_err());
         // 但已成功搬运的 config blob 保留（内容寻址合法），不留半截 = 不留错配索引
         assert!(reg.blob_exists(&repo, "app", &cfg_d).await.unwrap());
+        assert_single_failure(&progress, "Docker blob 下载失败");
     }
 
     #[tokio::test]
@@ -844,6 +1162,210 @@ mod tests {
         // 子 manifest digest 校验失败 → 该 tag 失败跳过
         assert_eq!(result.skipped, 1);
         assert!(reg.get_manifest(&repo, "app", "latest").await.is_err());
+        assert_single_failure(&progress, "Docker 内容摘要不匹配");
+    }
+
+    #[tokio::test]
+    async fn manifest_读取失败记录安全分类() {
+        let (reg, _meta, repo, _d) = 新建().await;
+        let client = MockRegistry {
+            images: HashMap::from([("app".to_string(), vec!["latest".to_string()])]),
+            manifests: HashMap::new(),
+            blobs: HashMap::new(),
+        };
+        let progress = Mutex::new(OnlinePullProgress::default());
+
+        let result = migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.skipped, 1);
+        assert_single_failure(&progress, "Docker manifest 读取失败");
+    }
+
+    #[tokio::test]
+    async fn manifest_解析失败记录安全分类() {
+        let (reg, _meta, repo, _d) = 新建().await;
+        let client = MockRegistry {
+            images: HashMap::from([("app".to_string(), vec!["latest".to_string()])]),
+            manifests: HashMap::from([(
+                ("app".to_string(), "latest".to_string()),
+                (
+                    b"not-json".to_vec(),
+                    "application/vnd.oci.image.manifest.v1+json".to_string(),
+                ),
+            )]),
+            blobs: HashMap::new(),
+        };
+        let progress = Mutex::new(OnlinePullProgress::default());
+
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_single_failure(&progress, "Docker manifest 解析失败");
+    }
+
+    #[tokio::test]
+    async fn blob_摘要不匹配记录内容摘要分类() {
+        let (reg, _meta, repo, _d) = 新建().await;
+        let expected = b"expected";
+        let digest = digest_of(expected);
+        let manifest = format!(r#"{{"config":{{"digest":"{digest}"}},"layers":[]}}"#).into_bytes();
+        let client = MockRegistry {
+            images: HashMap::from([("app".to_string(), vec!["latest".to_string()])]),
+            manifests: HashMap::from([(
+                ("app".to_string(), "latest".to_string()),
+                (
+                    manifest,
+                    "application/vnd.oci.image.manifest.v1+json".to_string(),
+                ),
+            )]),
+            blobs: HashMap::from([(("app".to_string(), digest), b"wrong".to_vec())]),
+        };
+        let progress = Mutex::new(OnlinePullProgress::default());
+
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_single_failure(&progress, "Docker 内容摘要不匹配");
+    }
+
+    #[tokio::test]
+    async fn blob_写入失败记录安全分类() {
+        let (reg, _meta, repo, _d) = 新建_with_max(Some(2)).await;
+        let blob = b"blob";
+        let digest = digest_of(blob);
+        let manifest = format!(r#"{{"config":{{"digest":"{digest}"}},"layers":[]}}"#).into_bytes();
+        let client = MockRegistry {
+            images: HashMap::from([("app".to_string(), vec!["latest".to_string()])]),
+            manifests: HashMap::from([(
+                ("app".to_string(), "latest".to_string()),
+                (
+                    manifest,
+                    "application/vnd.oci.image.manifest.v1+json".to_string(),
+                ),
+            )]),
+            blobs: HashMap::from([(("app".to_string(), digest), blob.to_vec())]),
+        };
+        let progress = Mutex::new(OnlinePullProgress::default());
+
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_single_failure(&progress, "Docker blob 写入失败");
+    }
+
+    #[tokio::test]
+    async fn manifest_写入失败记录安全分类() {
+        let (reg, _meta, repo, _d) = 新建_with_max(Some(64)).await;
+        let (client, _, _) = 单架构镜像("app");
+        let progress = Mutex::new(OnlinePullProgress::default());
+
+        migrate_online_docker_repo(
+            &client,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_single_failure(&progress, "Docker manifest 写入失败");
+    }
+
+    #[tokio::test]
+    async fn 分页枚举后续镜像与_tag_仍进入搬运编排() {
+        let (reg, _meta, repo, _d) = 新建().await;
+        let (mut first, first_manifest, _) = 单架构镜像("first-image");
+        let (mut later, later_manifest, _) = 单架构镜像("later-image");
+        later
+            .images
+            .insert("later-image".to_string(), vec!["later-tag".to_string()]);
+        let later_entry = later
+            .manifests
+            .remove(&("later-image".to_string(), "1.0".to_string()))
+            .unwrap();
+        later.manifests.insert(
+            ("later-image".to_string(), "later-tag".to_string()),
+            later_entry,
+        );
+        first.images.extend(later.images);
+        first.manifests.extend(later.manifests);
+        first.blobs.extend(later.blobs);
+
+        let progress = Mutex::new(OnlinePullProgress::default());
+        let result = migrate_online_docker_repo(
+            &first,
+            &reg,
+            "https://nx",
+            "docker-hosted",
+            &repo,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.migrated, 6);
+        assert_eq!(progress.lock().unwrap().total_assets, 6);
+        assert_eq!(
+            reg.get_manifest(&repo, "first-image", "1.0")
+                .await
+                .unwrap()
+                .bytes,
+            first_manifest
+        );
+        assert_eq!(
+            reg.get_manifest(&repo, "later-image", "later-tag")
+                .await
+                .unwrap()
+                .bytes,
+            later_manifest
+        );
     }
 
     #[tokio::test]

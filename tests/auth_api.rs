@@ -7,6 +7,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::Serialize;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -17,6 +19,8 @@ use jianartifact::format::{ArtifactService, DockerRegistry, FormatRegistry};
 use jianartifact::meta::{MetaStore, Role};
 use jianartifact::proxy::HttpUpstream;
 use jianartifact::storage::{BlobBackend, LocalFsStore};
+
+const JWT_SECRET: &[u8] = b"integration-secret-32-bytes-xxxx";
 
 /// 测试夹具：持有可重复构建路由的状态与临时目录。
 struct Fixture {
@@ -36,7 +40,7 @@ impl Fixture {
         // 集成测试走真实 SQLite 文件（open_in_memory 仅 cfg(test) 内部可见）
         let meta = MetaStore::open(&dir.path().join("test.db")).await.unwrap();
         let store = BlobBackend::Fs(LocalFsStore::new(dir.path().join("blobs")).await.unwrap());
-        let jwt = JwtSigner::from_secret(b"integration-secret-32-bytes-xxxx", ttl_secs);
+        let jwt = JwtSigner::from_secret(JWT_SECRET, ttl_secs);
         let upstream = HttpUpstream::new(std::time::Duration::from_secs(60)).unwrap();
         let artifacts = Arc::new(ArtifactService::new(store.clone(), meta.clone(), upstream));
         let docker = Arc::new(
@@ -160,6 +164,36 @@ async fn login_token(fx: &Fixture, username: &str, password: &str) -> String {
     .await;
     assert_eq!(status, StatusCode::OK, "登录应成功: {body}");
     body["access_token"].as_str().unwrap().to_string()
+}
+
+/// 签发一个不含 jti 的旧版 JWT，验证升级兼容行为。
+fn legacy_jwt(user_id: &str, username: &str, role: Role) -> String {
+    #[derive(Serialize)]
+    struct LegacyClaims<'a> {
+        sub: &'a str,
+        username: &'a str,
+        role: &'static str,
+        iat: u64,
+        exp: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = LegacyClaims {
+        sub: user_id,
+        username,
+        role: role.as_str(),
+        iat: now,
+        exp: now + 3600,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(JWT_SECRET),
+    )
+    .unwrap()
 }
 
 // ---------- FR-01 登录与会话 ----------
@@ -409,7 +443,7 @@ async fn 登出已认证返回_200_匿名_401() {
     fx.seed_user("alice", "pw", Role::User).await;
     let token = login_token(&fx, "alice", "pw").await;
 
-    let (status, _) = send(
+    let (status, body) = send(
         fx.router(),
         empty_req(
             "POST",
@@ -419,8 +453,159 @@ async fn 登出已认证返回_200_匿名_401() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "status": "ok", "session_revoked": true }));
 
     let (status, _) = send(fx.router(), empty_req("POST", "/api/v1/auth/logout", None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn 登出仅即时撤销当前_jwt_其他会话与_api_token_不受影响() {
+    let fx = Fixture::new().await;
+    fx.seed_user("alice", "pw", Role::User).await;
+    let current = login_token(&fx, "alice", "pw").await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let other = login_token(&fx, "alice", "pw").await;
+
+    let (_, body) = send(
+        fx.router(),
+        json_req(
+            "POST",
+            "/api/v1/tokens",
+            Some(&format!("Bearer {other}")),
+            json!({ "name": "cli" }),
+        ),
+    )
+    .await;
+    let api_token = body["token"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {current}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req(
+            "POST",
+            "/api/v1/auth/logout",
+            Some(&format!("Bearer {current}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {current}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req(
+            "POST",
+            "/api/v1/auth/refresh",
+            Some(&format!("Bearer {current}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {other}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {api_token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn basic_与_api_token_调用登出保持成功且不撤销凭据() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let fx = Fixture::new().await;
+    fx.seed_user("alice", "pw", Role::User).await;
+    let session = login_token(&fx, "alice", "pw").await;
+    let (_, body) = send(
+        fx.router(),
+        json_req(
+            "POST",
+            "/api/v1/tokens",
+            Some(&format!("Bearer {session}")),
+            json!({ "name": "cli" }),
+        ),
+    )
+    .await;
+    let api_token = body["token"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        fx.router(),
+        empty_req(
+            "POST",
+            "/api/v1/auth/logout",
+            Some(&format!("Bearer {api_token}")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["session_revoked"], false);
+    assert_eq!(body["reason"], "non_jwt_credential");
+
+    let basic = format!("Basic {}", STANDARD.encode("alice:pw"));
+    let (status, body) = send(
+        fx.router(),
+        empty_req("POST", "/api/v1/auth/logout", Some(&basic)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["session_revoked"], false);
+    assert_eq!(body["reason"], "non_jwt_credential");
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {api_token}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        fx.router(),
+        empty_req("GET", "/api/v1/me", Some(&format!("Bearer {session}"))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn 旧版无_jti_jwt_登出后即时失效() {
+    let fx = Fixture::new().await;
+    let user_id = fx.seed_user("legacy", "pw", Role::User).await;
+    let token = legacy_jwt(&user_id, "legacy", Role::User);
+    let auth = format!("Bearer {token}");
+
+    let (status, _) = send(fx.router(), empty_req("GET", "/api/v1/me", Some(&auth))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        fx.router(),
+        empty_req("POST", "/api/v1/auth/logout", Some(&auth)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "status": "ok", "session_revoked": true }));
+
+    let (status, _) = send(fx.router(), empty_req("GET", "/api/v1/me", Some(&auth))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 

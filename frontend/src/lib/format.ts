@@ -21,6 +21,13 @@ export function formatCount(count: number): string {
   return Math.round(count).toLocaleString('en-US');
 }
 
+/** 把毫秒耗时格式化为稳定的中文短文本。 */
+export function formatDuration(durationMs: number): string {
+  const value = Math.max(0, durationMs);
+  if (value < 1000) return `${Math.round(value)} 毫秒`;
+  return `${(value / 1000).toFixed(1)} 秒`;
+}
+
 /** 把秒数格式化为人类可读的运行时长（如 "3 天 4 小时"、"5 分钟"、"刚刚启动")。 */
 export function formatUptime(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds));

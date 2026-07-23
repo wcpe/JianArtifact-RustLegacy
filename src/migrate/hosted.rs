@@ -30,10 +30,13 @@ use crate::meta::{MetaStore, NewRepository, RepoType, RepositoryRecord, Visibili
 use crate::proxy::Upstream;
 use crate::storage::BlobStore;
 
-use super::online::{await_control, mark_cancelled};
+use super::online::{
+    await_control, mark_cancelled, record_asset_failure, record_fatal_repo_outcome,
+    repo_progress_snapshot,
+};
 use super::{
-    map_nexus_format, normalize_blob_path, JobControl, MigrateError, NexusRepoSummary,
-    OnlinePullPhase, OnlinePullProgress, OnlineRepoMigrationOutcome,
+    map_nexus_format, normalize_blob_path, saturating_millis, JobControl, MigrateError,
+    NexusRepoSummary, OnlinePullPhase, OnlinePullProgress, OnlineRepoMigrationOutcome,
 };
 
 /// 搬运进度计数三态（FR-134）。
@@ -90,6 +93,41 @@ fn bump_progress(progress: &std::sync::Mutex<OnlinePullProgress>, kind: BumpKind
             p.skipped += 1;
             p.skipped_bytes = p.skipped_bytes.saturating_add(bytes);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgressBytes {
+    done: u64,
+    migrated: u64,
+    skipped: u64,
+}
+
+impl ProgressBytes {
+    fn saturating_sub(self, before: Self) -> Self {
+        Self {
+            done: self.done.saturating_sub(before.done),
+            migrated: self.migrated.saturating_sub(before.migrated),
+            skipped: self.skipped.saturating_sub(before.skipped),
+        }
+    }
+}
+
+fn progress_bytes(progress: &std::sync::Mutex<OnlinePullProgress>) -> ProgressBytes {
+    let p = progress.lock().unwrap_or_else(|e| e.into_inner());
+    ProgressBytes {
+        done: p.done_bytes,
+        migrated: p.migrated_bytes,
+        skipped: p.skipped_bytes,
+    }
+}
+
+/// 把 hosted 写入错误收敛为稳定失败分类。
+fn hosted_failure_reason(error: &ServiceError) -> &'static str {
+    match error {
+        ServiceError::OverwriteForbidden => "目标制品不可覆盖",
+        ServiceError::TooLarge => "制品超过大小限制",
+        _ => "目标制品写入失败",
     }
 }
 
@@ -210,6 +248,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
                 tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "制品路径非法，跳过搬运");
                 skipped += 1;
                 bump_progress(progress, BumpKind::SkippedFailed, bytes);
+                record_asset_failure(progress, &repo.name, &entry.blob_name, "制品路径非法");
                 continue;
             }
         };
@@ -221,6 +260,7 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
                 tracing::warn!(仓库 = %repo.name, 路径 = %entry.bytes_path.display(), 错误 = %e, "读取 blob 本体失败，跳过搬运");
                 skipped += 1;
                 bump_progress(progress, BumpKind::SkippedFailed, bytes);
+                record_asset_failure(progress, &repo.name, &entry.blob_name, "源资产读取失败");
                 continue;
             }
         };
@@ -240,16 +280,12 @@ async fn migrate_repo_artifacts<S: BlobStore, U: Upstream>(
                 bump_progress(progress, BumpKind::SkippedExisting, bytes);
                 tracing::debug!(仓库 = %repo.name, blob = %entry.blob_name, "制品已存在且 sha256 一致，增量跳过");
             }
-            // 不可覆盖（如 Maven release 已存在不同内容）：按覆盖 / 不可变策略跳过，不中断整批
-            Err(ServiceError::OverwriteForbidden) => {
-                tracing::info!(仓库 = %repo.name, blob = %entry.blob_name, "同坐标制品已存在且不可覆盖，跳过搬运");
-                skipped += 1;
-                bump_progress(progress, BumpKind::SkippedFailed, bytes);
-            }
             Err(e) => {
-                tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 错误 = %e, "hosted 制品搬运失败，跳过");
+                let reason = hosted_failure_reason(&e);
+                tracing::warn!(仓库 = %repo.name, blob = %entry.blob_name, 分类 = reason, "hosted 制品搬运失败，跳过");
                 skipped += 1;
                 bump_progress(progress, BumpKind::SkippedFailed, bytes);
+                record_asset_failure(progress, &repo.name, &entry.blob_name, reason);
             }
         }
     }
@@ -380,9 +416,28 @@ pub async fn migrate_hosted_repositories_with_progress<S: BlobStore, U: Upstream
             continue;
         };
 
-        let (repo, created) = ensure_hosted_repo(meta, &src.name, format).await?;
-
         let repo_entries = by_repo.remove(src.name.as_str()).unwrap_or_default();
+        let repo_total_bytes = sum_entry_sizes(&repo_entries);
+        let repo_started = std::time::Instant::now();
+        let repo_before = repo_progress_snapshot(progress);
+        let (repo, created) = match ensure_hosted_repo(meta, &src.name, format).await {
+            Ok(result) => result,
+            Err(error) => {
+                record_fatal_repo_outcome(
+                    progress,
+                    &src.name,
+                    &src.name,
+                    format,
+                    false,
+                    repo_total_bytes,
+                    repo_started,
+                    repo_before,
+                );
+                return Err(error);
+            }
+        };
+
+        let before = progress_bytes(progress);
         let (migrated, skipped_existing, skipped, cancelled) = migrate_repo_artifacts(
             artifacts,
             formats,
@@ -393,6 +448,8 @@ pub async fn migrate_hosted_repositories_with_progress<S: BlobStore, U: Upstream
             control,
         )
         .await;
+        let after = progress_bytes(progress);
+        let repo_bytes = after.saturating_sub(before);
 
         tracing::info!(
             仓库 = %src.name,
@@ -424,6 +481,11 @@ pub async fn migrate_hosted_repositories_with_progress<S: BlobStore, U: Upstream
                 migrated_artifacts: migrated,
                 skipped_existing_artifacts: skipped_existing,
                 skipped_artifacts: skipped,
+                total_bytes: repo_total_bytes,
+                done_bytes: repo_bytes.done,
+                migrated_bytes: repo_bytes.migrated,
+                skipped_bytes: repo_bytes.skipped,
+                duration_ms: saturating_millis(repo_started.elapsed().as_millis()),
             });
 
         // 仓库内被取消：标记终态并停止后续仓库（不算失败，已搬运保留）
@@ -622,12 +684,26 @@ mod tests {
         );
 
         let src = vec![src_repo("raw-hosted", "raw", "hosted")];
-        let report = migrate_hosted_repositories(&meta, &svc, &formats, &src, &blob_root, None)
-            .await
-            .unwrap();
-        // 合法 1 条搬运成功、非法 1 条跳过，整批未中断
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        let report = migrate_hosted_repositories_with_progress(
+            &meta,
+            &svc,
+            &formats,
+            &src,
+            &blob_root,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
+        // 合法 1 条搬运成功、非法 1 条跳过，整批未中断且留下稳定明细
         assert_eq!(report.repos[0].migrated_artifacts, 1);
         assert_eq!(report.repos[0].skipped_artifacts, 1);
+        let p = progress.lock().unwrap();
+        assert_eq!(p.asset_failures.len(), 1);
+        assert_eq!(p.asset_failures[0].asset, "/../evil.bin");
+        assert_eq!(p.asset_failures[0].reason, "制品路径非法");
     }
 
     #[tokio::test]
@@ -686,12 +762,25 @@ mod tests {
         );
 
         let src = vec![src_repo("raw-hosted", "raw", "hosted")];
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
         // 上限 5 字节：small（"小" 3 字节）通过、big 超限被跳过
-        let report = migrate_hosted_repositories(&meta, &svc, &formats, &src, &blob_root, Some(5))
-            .await
-            .unwrap();
+        let report = migrate_hosted_repositories_with_progress(
+            &meta,
+            &svc,
+            &formats,
+            &src,
+            &blob_root,
+            Some(5),
+            &progress,
+            &JobControl::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.repos[0].migrated_artifacts, 1);
         assert_eq!(report.repos[0].skipped_artifacts, 1);
+        let p = progress.lock().unwrap();
+        assert_eq!(p.asset_failures.len(), 1);
+        assert_eq!(p.asset_failures[0].reason, "制品超过大小限制");
     }
 
     #[tokio::test]

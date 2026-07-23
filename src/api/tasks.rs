@@ -232,8 +232,11 @@ mod tests {
                 migrated_artifacts: 7,
                 skipped_existing_artifacts: 3,
                 skipped_artifacts: 2,
+                ..Default::default()
             }],
             skipped_repos: vec!["npm-proxy".to_string()],
+            asset_failures: vec![],
+            omitted_asset_failures: 0,
             error: None,
             offline_preview: Some(vec![crate::migrate::OfflineRepoSummary {
                 repo_name: "repo-a".to_string(),

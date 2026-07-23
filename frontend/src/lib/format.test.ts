@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import {
   formatBytes,
   formatCount,
+  formatDuration,
   formatUptime,
   formatRelativeTime,
   parseUtcMs,
@@ -29,6 +30,14 @@ describe('formatBytes', () => {
     // 杜绝原始浮点串泄漏到展示
     expect(out).not.toContain('.333');
     expect(out).not.toMatch(/\d\.\d{3,}/);
+  });
+});
+
+describe('formatDuration', () => {
+  it('按毫秒与秒格式化并钳制负数', () => {
+    expect(formatDuration(-1)).toBe('0 毫秒');
+    expect(formatDuration(999)).toBe('999 毫秒');
+    expect(formatDuration(1250)).toBe('1.3 秒');
   });
 });
 

@@ -67,12 +67,19 @@ const 任务进行中: OnlinePullJob = {
   total_assets: 7,
   done_assets: 3,
   migrated: 3,
+  skipped_existing: 0,
   skipped: 0,
+  total_bytes: 7168,
+  done_bytes: 3072,
+  migrated_bytes: 3072,
+  skipped_bytes: 0,
   current_repo: 'maven-releases',
   current_path: 'com/example/app/1.0/app-1.0.jar',
   paused: false,
   repos: [],
   skipped_repos: [],
+  asset_failures: [],
+  omitted_asset_failures: 0,
   error: null,
 };
 
@@ -83,7 +90,12 @@ const 任务完成: OnlinePullJob = {
   total_assets: 7,
   done_assets: 7,
   migrated: 7,
+  skipped_existing: 0,
   skipped: 0,
+  total_bytes: 7168,
+  done_bytes: 7168,
+  migrated_bytes: 7168,
+  skipped_bytes: 0,
   current_repo: null,
   current_path: null,
   paused: false,
@@ -94,10 +106,18 @@ const 任务完成: OnlinePullJob = {
       format: 'maven',
       created: true,
       migrated_artifacts: 7,
+      skipped_existing_artifacts: 0,
       skipped_artifacts: 0,
+      total_bytes: 7168,
+      done_bytes: 7168,
+      migrated_bytes: 7168,
+      skipped_bytes: 0,
+      duration_ms: 1200,
     },
   ],
   skipped_repos: ['npm-hosted'],
+  asset_failures: [],
+  omitted_asset_failures: 0,
   error: null,
 };
 
@@ -145,6 +165,7 @@ const 历史列表: MigrationTaskDto[] = [
     done_bytes: 4096,
     migrated_bytes: 4096,
     skipped_bytes: 0,
+    omitted_asset_failures: 0,
     error: null,
     started_at: '2026-07-01T00:00:00Z',
     updated_at: '2026-07-01T00:01:00Z',
@@ -165,6 +186,7 @@ const 历史列表: MigrationTaskDto[] = [
     done_bytes: 5120,
     migrated_bytes: 5120,
     skipped_bytes: 0,
+    omitted_asset_failures: 0,
     error: null,
     started_at: '2026-06-30T00:00:00Z',
     updated_at: '2026-06-30T00:01:00Z',
@@ -183,8 +205,21 @@ const 历史详情: MigrationTaskDetailDto = {
       migrated_artifacts: 5,
       skipped_existing_artifacts: 0,
       skipped_artifacts: 0,
+      total_bytes: 5120,
+      done_bytes: 5120,
+      migrated_bytes: 5120,
+      skipped_bytes: 0,
+      duration_ms: 1200,
     },
   ],
+  asset_failures: [
+    {
+      source_repo: 'maven-releases',
+      asset: 'com/example/bad.jar',
+      reason: '源资产下载失败',
+    },
+  ],
+  omitted_asset_failures: 2,
 };
 
 describe('MigrationPage', () => {
@@ -362,7 +397,28 @@ describe('MigrationPage', () => {
     await waitFor(() => expect(screen.getByText('已完成')).toBeInTheDocument(), { timeout: 3000 });
     const reportTable = screen.getByText('maven-releases', { selector: 'td' }).closest('table')!;
     expect(within(reportTable).getByText('maven-mirror')).toBeInTheDocument();
+    expect(screen.getByText('总量 7.00 KB')).toBeInTheDocument();
+    expect(screen.getByText('已处理 7.00 KB')).toBeInTheDocument();
+    expect(screen.getByText('新写 7.00 KB')).toBeInTheDocument();
+    expect(screen.getByText('跳过 0 B')).toBeInTheDocument();
+    expect(screen.getByText('无失败资产。')).toBeInTheDocument();
     expect(localStorage.getItem('jian.migrate.online.jobId')).toBeNull();
+  });
+
+  it('当前任务终态展示 omitted 提示', async () => {
+    localStorage.setItem('jian.migrate.online.jobId', 'job-omitted');
+    vi.spyOn(api, 'getMigrationJob').mockResolvedValue({
+      ...任务完成,
+      job_id: 'job-omitted',
+      omitted_asset_failures: 3,
+    });
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('已完成')).toBeInTheDocument());
+    expect(screen.getByText('失败资产')).toBeInTheDocument();
+    expect(screen.getByText('无失败资产。')).toBeInTheDocument();
+    expect(screen.getByText('另有 3 条失败明细未展示')).toBeInTheDocument();
   });
 
   it('在线拉取：未填目标改名时省略 target（与源同名）', async () => {
@@ -475,6 +531,27 @@ describe('MigrationPage', () => {
     await waitFor(() => expect(detailSpy).toHaveBeenCalledWith('hist-done'));
     await waitFor(() => expect(screen.getByText('分仓库报告')).toBeInTheDocument());
     expect(screen.getByText('maven-mirror')).toBeInTheDocument();
+    expect(screen.getAllByText('5.00 KB').length).toBeGreaterThan(0);
+    expect(screen.getByText('1.2 秒')).toBeInTheDocument();
+    expect(screen.getByText('com/example/bad.jar')).toBeInTheDocument();
+    expect(screen.getByText('另有 2 条失败明细未展示')).toBeInTheDocument();
+  });
+
+  it('迁移历史：失败资产为空时展示空态', async () => {
+    vi.mocked(api.listMigrationTasks).mockResolvedValue(历史列表);
+    vi.spyOn(api, 'getMigrationTask').mockResolvedValue({
+      ...历史详情,
+      asset_failures: [],
+      omitted_asset_failures: 0,
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    const doneRow = await screen.findByText('在线拉取导入队列');
+    await user.click(within(doneRow.closest('tr')!).getByRole('button', { name: '查看报告' }));
+
+    await waitFor(() => expect(screen.getByText('分仓库报告')).toBeInTheDocument());
+    expect(screen.getByText('无失败资产。')).toBeInTheDocument();
   });
 
   it('迁移历史：interrupted 任务可一键重跑并进入进度续看', async () => {

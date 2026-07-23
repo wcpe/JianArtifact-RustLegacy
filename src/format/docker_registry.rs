@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::meta::{MetaError, MetaStore, NewArtifact, RepositoryRecord};
 use crate::storage::{BlobReader, BlobStore, StorageError};
 
+use super::blob_commit::BlobIndexCommitGuard;
 use super::docker::{self, MEDIA_TYPE_MANIFEST_V2};
 
 /// Docker 存储编排错误。
@@ -99,6 +100,19 @@ pub struct StartedUpload {
 pub struct AppendOutcome {
     /// 已累积字节数。
     pub written: u64,
+}
+
+/// Docker 迁移写入的可统计结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerWriteOutcome {
+    /// 本次是否写入或修复了目标索引状态。
+    pub written: bool,
+    /// 本次是否新增写入了 payload；纯索引或 tag 修复为 false。
+    pub payload_written: bool,
+    /// payload 字节数。
+    pub size: u64,
+    /// 最终内容 digest。
+    pub digest: String,
 }
 
 /// Docker Registry v2 存储服务。
@@ -212,14 +226,20 @@ impl<S: BlobStore> DockerRegistry<S> {
         let file = tokio::fs::File::open(&tmp_path)
             .await
             .map_err(StorageError::Io)?;
-        let digests = self.store.put(file).await;
+        let pending = self.store.put_pending(file).await;
         // 无论成败都清理会话临时文件
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        let digests = digests?;
+        let (digests, lease) = pending?;
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
 
         // ② 校验客户端声明 digest 与实际内容一致；不一致即回滚刚落定的 blob（若无其他引用）
         if digests.sha256 != expected_hex {
-            self.rollback_blob(&digests.sha256).await;
+            pending.rollback().await;
             return Err(DockerError::DigestMismatch);
         }
 
@@ -240,9 +260,10 @@ impl<S: BlobStore> DockerRegistry<S> {
             })
             .await;
         if let Err(e) = write {
-            self.rollback_blob(&digests.sha256).await;
+            pending.rollback().await;
             return Err(e.into());
         }
+        pending.commit();
         tracing::info!(仓库 = %repo.name, 镜像 = %image, digest = %expected_digest, "已落定 docker blob");
         Ok(docker::make_digest(&digests.sha256))
     }
@@ -275,7 +296,7 @@ impl<S: BlobStore> DockerRegistry<S> {
         image: &str,
         expected_digest: &str,
         reader: R,
-    ) -> Result<bool, DockerError>
+    ) -> Result<DockerWriteOutcome, DockerError>
     where
         R: AsyncRead + Unpin + Send,
     {
@@ -287,24 +308,35 @@ impl<S: BlobStore> DockerRegistry<S> {
         // 但此处再兜一次，保证即便重复流入也不重复写索引）。
         if let Some(existing) = self.meta.get_artifact(&repo.id, &key).await? {
             if existing.sha256 == expected_hex {
-                // 消费掉 reader 以免调用方误判（迁移侧应在调用前用 blob_exists 短路，避免无谓下载）
-                return Ok(false);
+                return Ok(DockerWriteOutcome {
+                    written: false,
+                    payload_written: false,
+                    size: existing.size.max(0) as u64,
+                    digest: expected_digest.to_string(),
+                });
             }
         }
 
         // ① 流式落定为内容寻址 blob（BlobStore 边写边算 sha256，落定即校验）
+        let payload_written = !self.store.exists(&expected_hex).await?;
         let limited = super::LimitedReader::new(reader, self.max_size);
-        let digests = match self.store.put(limited).await {
-            Ok(d) => d,
+        let (digests, lease) = match self.store.put_pending(limited).await {
+            Ok(pending) => pending,
             Err(StorageError::Io(e)) if super::is_too_large(&e) => {
                 return Err(DockerError::TooLarge)
             }
             Err(e) => return Err(e.into()),
         };
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
 
         // ② 校验落定 sha256 与源报告 digest 一致；不一致即回滚（内容损坏 / 源报告错配）
         if digests.sha256 != expected_hex {
-            self.rollback_blob(&digests.sha256).await;
+            pending.rollback().await;
             return Err(DockerError::DigestMismatch);
         }
 
@@ -324,11 +356,17 @@ impl<S: BlobStore> DockerRegistry<S> {
             })
             .await;
         if let Err(e) = write {
-            self.rollback_blob(&digests.sha256).await;
+            pending.rollback().await;
             return Err(e.into());
         }
+        pending.commit();
         tracing::info!(仓库 = %repo.name, 镜像 = %image, digest = %expected_digest, "已搬运 docker blob");
-        Ok(true)
+        Ok(DockerWriteOutcome {
+            written: true,
+            payload_written,
+            size: digests.size,
+            digest: docker::make_digest(&digests.sha256),
+        })
     }
 
     /// 查某 blob 是否已按 docker 布局落库且 sha256 与声明 digest 一致（供迁移幂等短路，避免无谓下载）。
@@ -400,7 +438,7 @@ impl<S: BlobStore> DockerRegistry<S> {
         reference: &str,
         media_type: &str,
         bytes: Vec<u8>,
-    ) -> Result<String, DockerError> {
+    ) -> Result<DockerWriteOutcome, DockerError> {
         // 仅接受受支持的 manifest 媒体类型（schema2 / OCI image manifest）
         if !is_supported_manifest_media_type(media_type) {
             return Err(DockerError::UnsupportedMediaType);
@@ -410,45 +448,71 @@ impl<S: BlobStore> DockerRegistry<S> {
                 return Err(DockerError::TooLarge);
             }
         }
+        let size = bytes.len() as u64;
+        let sha256 = sha256_bytes(&bytes);
+        let digest = docker::make_digest(&sha256);
+        if self
+            .manifest_indexes_match(repo, image, reference, &sha256, media_type)
+            .await?
+        {
+            return Ok(DockerWriteOutcome {
+                written: false,
+                payload_written: false,
+                size,
+                digest,
+            });
+        }
 
         // ① 内容寻址落 blob（边写边算 sha256，落定即校验）
-        let digests = self.store.put(std::io::Cursor::new(bytes)).await?;
-        let digest = docker::make_digest(&digests.sha256);
+        let payload_written = !self.store.exists(&sha256).await?;
+        let (digests, lease) = self.store.put_pending(std::io::Cursor::new(bytes)).await?;
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
 
         // 若 reference 是 digest，须与算得内容一致，杜绝错配
         if docker::is_digest_reference(reference) {
             match docker::parse_digest(reference) {
                 Some(hex) if hex == digests.sha256 => {}
                 Some(_) => {
-                    self.rollback_blob(&digests.sha256).await;
+                    pending.rollback().await;
                     return Err(DockerError::DigestMismatch);
                 }
                 None => {
-                    self.rollback_blob(&digests.sha256).await;
+                    pending.rollback().await;
                     return Err(DockerError::InvalidDigest);
                 }
             }
         }
 
-        // ② 写 manifest（按 digest）索引
+        // ② 原子写 manifest digest 索引及可选 tag 指针索引
         let manifest_key = docker::manifest_digest_key(image, &digest);
+        let tag_key =
+            (!docker::is_digest_reference(reference)).then(|| docker::tag_key(image, reference));
+        let digest_index = Self::manifest_index(repo, &manifest_key, &digests, media_type);
+        let tag_index = tag_key
+            .as_deref()
+            .map(|key| Self::manifest_index(repo, key, &digests, media_type));
         if let Err(e) = self
-            .write_manifest_index(repo, &manifest_key, &digests, media_type)
+            .meta
+            .upsert_docker_manifest_indexes(digest_index, tag_index)
             .await
         {
-            self.rollback_blob(&digests.sha256).await;
-            return Err(e);
+            pending.rollback().await;
+            return Err(e.into());
         }
-
-        // ③ 若 reference 为 tag，再写 tag 指针索引（指向同一 sha256，覆盖旧 tag）
-        if !docker::is_digest_reference(reference) {
-            let tag_key = docker::tag_key(image, reference);
-            self.write_manifest_index(repo, &tag_key, &digests, media_type)
-                .await?;
-        }
+        pending.commit();
 
         tracing::info!(仓库 = %repo.name, 镜像 = %image, 引用 = %reference, digest = %digest, "已写入 docker manifest");
-        Ok(digest)
+        Ok(DockerWriteOutcome {
+            written: true,
+            payload_written,
+            size: digests.size,
+            digest,
+        })
     }
 
     /// 读取 manifest（GET/HEAD .../manifests/{reference}）：按 tag 或 digest 解析后返回字节、媒体类型与 digest。
@@ -494,42 +558,59 @@ impl<S: BlobStore> DockerRegistry<S> {
 
     // ---------------- 内部工具 ----------------
 
-    /// 写一条 manifest / tag 索引记录（共用同一 sha256，media_type 入 content_type）。
-    async fn write_manifest_index(
+    async fn manifest_indexes_match(
+        &self,
+        repo: &RepositoryRecord,
+        image: &str,
+        reference: &str,
+        sha256: &str,
+        media_type: &str,
+    ) -> Result<bool, DockerError> {
+        let digest = docker::make_digest(sha256);
+        let digest_key = docker::manifest_digest_key(image, &digest);
+        if !self
+            .index_matches(repo, &digest_key, sha256, media_type)
+            .await?
+        {
+            return Ok(false);
+        }
+        if docker::is_digest_reference(reference) {
+            return Ok(true);
+        }
+        let tag_key = docker::tag_key(image, reference);
+        self.index_matches(repo, &tag_key, sha256, media_type).await
+    }
+
+    async fn index_matches(
         &self,
         repo: &RepositoryRecord,
         key: &str,
-        digests: &crate::storage::BlobDigests,
+        sha256: &str,
         media_type: &str,
-    ) -> Result<(), DockerError> {
-        self.meta
-            .upsert_artifact(NewArtifact {
-                repo_id: &repo.id,
-                path: key,
-                size: digests.size as i64,
-                sha256: &digests.sha256,
-                sha1: &digests.sha1,
-                md5: &digests.md5,
-                sha512: &digests.sha512,
-                content_type: Some(media_type),
-                cached: false,
-            })
-            .await?;
-        Ok(())
+    ) -> Result<bool, DockerError> {
+        let record = self.meta.get_artifact(&repo.id, key).await?;
+        Ok(record.is_some_and(|item| {
+            item.sha256 == sha256 && item.content_type.as_deref() == Some(media_type)
+        }))
     }
 
-    /// 回滚 / 清理 blob：仅当该 sha256 不再被任何索引引用时才删本体，避免误删共享 blob。
-    async fn rollback_blob(&self, sha256: &str) {
-        match self.meta.count_artifacts_by_sha256(sha256).await {
-            Ok(0) => {
-                if let Err(e) = self.store.delete(sha256).await {
-                    tracing::warn!(sha256 = %sha256, 错误 = %e, "清理无引用 docker blob 失败");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(sha256 = %sha256, 错误 = %e, "查询 docker blob 引用计数失败，跳过清理");
-            }
+    /// 构造 manifest / tag 索引记录（共用同一 sha256，media_type 入 content_type）。
+    fn manifest_index<'a>(
+        repo: &'a RepositoryRecord,
+        key: &'a str,
+        digests: &'a crate::storage::BlobDigests,
+        media_type: &'a str,
+    ) -> NewArtifact<'a> {
+        NewArtifact {
+            repo_id: &repo.id,
+            path: key,
+            size: digests.size as i64,
+            sha256: &digests.sha256,
+            sha1: &digests.sha1,
+            md5: &digests.md5,
+            sha512: &digests.sha512,
+            content_type: Some(media_type),
+            cached: false,
         }
     }
 
@@ -572,6 +653,14 @@ impl<S: BlobStore> DockerRegistry<S> {
     }
 }
 
+/// 计算内存 payload 的 sha256 hex。
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use digest::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 /// 判断 manifest 媒体类型是否受支持（Docker schema2 与 OCI image manifest / index）。
 fn is_supported_manifest_media_type(media_type: &str) -> bool {
     // 取分号前主类型，忽略可能的参数
@@ -589,10 +678,58 @@ fn is_supported_manifest_media_type(media_type: &str) -> bool {
 mod tests {
     use super::*;
     use crate::meta::{NewRepository, RepoType, Visibility};
-    use crate::storage::LocalFsStore;
+    use crate::storage::{BlobDigests, BlobWriteLease, LocalFsStore};
 
     use digest::Digest;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    /// 测试存储：指定一次 pending 落定后暂停，稳定制造跨 registry 清理交错。
+    #[derive(Clone)]
+    struct PausingStore {
+        inner: LocalFsStore,
+        pause_once: Arc<AtomicBool>,
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlobStore for PausingStore {
+        async fn put_pending<R>(
+            &self,
+            reader: R,
+        ) -> Result<(BlobDigests, BlobWriteLease), StorageError>
+        where
+            R: AsyncRead + Unpin + Send,
+        {
+            let pending = self.inner.put_pending(reader).await?;
+            if self.pause_once.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(pending)
+        }
+
+        async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError> {
+            self.inner.get(sha256).await
+        }
+
+        fn delete_if<F, Fut>(
+            &self,
+            sha256: &str,
+            should_delete: F,
+        ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future<Output = bool> + Send,
+        {
+            self.inner.delete_if(sha256, should_delete)
+        }
+
+        async fn exists(&self, sha256: &str) -> Result<bool, StorageError> {
+            self.inner.exists(sha256).await
+        }
+    }
 
     /// 算一段内容的 sha256 hex。
     fn sha256_hex(data: &[u8]) -> String {
@@ -615,9 +752,13 @@ mod tests {
     }
 
     async fn 建_docker_仓库(meta: &MetaStore) -> RepositoryRecord {
+        建命名_docker_仓库(meta, "hub").await
+    }
+
+    async fn 建命名_docker_仓库(meta: &MetaStore, name: &str) -> RepositoryRecord {
         let id = meta
             .create_repository(NewRepository {
-                name: "hub",
+                name,
                 format: "docker",
                 r#type: RepoType::Hosted,
                 visibility: Visibility::Public,
@@ -759,7 +900,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(digest, expected_digest);
+        assert_eq!(digest.digest, expected_digest);
 
         // 按 tag 读回
         let by_tag = reg.get_manifest(&repo, "app", "1.0").await.unwrap();
@@ -773,6 +914,48 @@ mod tests {
             .unwrap();
         assert_eq!(by_digest.bytes, manifest);
         assert_eq!(by_digest.digest, expected_digest);
+    }
+
+    #[tokio::test]
+    async fn manifest_tag_索引事务失败不留索引与_blob() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let manifest = br#"{"schemaVersion":2,"atomic":true}"#;
+        let sha256 = sha256_hex(manifest);
+        let digest = docker::make_digest(&sha256);
+        let digest_key = docker::manifest_digest_key("app", &digest);
+        let tag_key = docker::tag_key("app", "latest");
+        sqlx::query(
+            "CREATE TRIGGER fail_docker_tag BEFORE INSERT ON artifacts \
+             WHEN NEW.path LIKE '%/tags/%' \
+             BEGIN SELECT RAISE(FAIL, '模拟 tag 索引写入失败'); END",
+        )
+        .execute(meta.pool())
+        .await
+        .unwrap();
+
+        let error = reg
+            .put_manifest(
+                &repo,
+                "app",
+                "latest",
+                MEDIA_TYPE_MANIFEST_V2,
+                manifest.to_vec(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DockerError::Meta(_)));
+        assert!(meta
+            .get_artifact(&repo.id, &digest_key)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(meta
+            .get_artifact(&repo.id, &tag_key)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!reg.store.exists(&sha256).await.unwrap());
     }
 
     #[tokio::test]
@@ -795,9 +978,9 @@ mod tests {
         // 同 tag 覆盖：latest 现在指向 m2
         let now = reg.get_manifest(&repo, "app", "latest").await.unwrap();
         assert_eq!(now.bytes, m2);
-        assert_eq!(now.digest, d2);
+        assert_eq!(now.digest, d2.digest);
         // 旧 manifest 仍可按 digest 取得（按 digest 不可变）
-        let old = reg.get_manifest(&repo, "app", &d1).await.unwrap();
+        let old = reg.get_manifest(&repo, "app", &d1.digest).await.unwrap();
         assert_eq!(old.bytes, m1);
     }
 
@@ -845,6 +1028,87 @@ mod tests {
         reg.cancel_upload(&started.upload_id).await;
     }
 
+    #[tokio::test]
+    async fn 跨仓库共享_store_clone_同_sha_pending_与失败清理交错保持_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open_in_memory().await.unwrap();
+        let store = PausingStore {
+            inner: LocalFsStore::new(dir.path().join("blobs")).await.unwrap(),
+            pause_once: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Notify::new()),
+        };
+        let first = Arc::new(
+            DockerRegistry::new(
+                store.clone(),
+                meta.clone(),
+                dir.path().join("uploads-first"),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let second = Arc::new(
+            DockerRegistry::new(
+                store.clone(),
+                meta.clone(),
+                dir.path().join("uploads-second"),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let first_repo = 建命名_docker_仓库(&meta, "first").await;
+        let second_repo = 建命名_docker_仓库(&meta, "second").await;
+        let content = b"docker-shared-pending";
+        let digest = docker::make_digest(&sha256_hex(content));
+        let wrong_digest = docker::make_digest(&"0".repeat(64));
+
+        store.pause_once.store(true, Ordering::SeqCst);
+        let valid_registry = first.clone();
+        let valid_repo = first_repo.clone();
+        let valid_digest = digest.clone();
+        let valid = tokio::spawn(async move {
+            valid_registry
+                .ingest_blob(&valid_repo, "image-a", &valid_digest, &content[..])
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), store.entered.notified())
+            .await
+            .expect("有效 writer 应持租约暂停");
+
+        let failed_registry = second.clone();
+        let failed_repo = second_repo.clone();
+        let mut failed = tokio::spawn(async move {
+            failed_registry
+                .ingest_blob(&failed_repo, "image-b", &wrong_digest, &content[..])
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut failed)
+                .await
+                .is_err(),
+            "失败清理应等待另一 registry 的 pending writer"
+        );
+        store.resume.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), valid)
+            .await
+            .expect("有效写入应有界完成")
+            .unwrap()
+            .unwrap();
+        let failed_error = tokio::time::timeout(std::time::Duration::from_secs(2), failed)
+            .await
+            .expect("失败清理应有界完成")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(failed_error, DockerError::DigestMismatch));
+        assert!(store.exists(&sha256_hex(content)).await.unwrap());
+        assert!(first
+            .blob_exists(&first_repo, "image-a", &digest)
+            .await
+            .unwrap());
+    }
+
     // ---------------- 迁移搬运 ingest_blob（FR-144）----------------
 
     #[tokio::test]
@@ -859,7 +1123,7 @@ mod tests {
             .ingest_blob(&repo, "app", &digest, &content[..])
             .await
             .unwrap();
-        assert!(written, "首次搬运应为新写入");
+        assert!(written.written, "首次搬运应为新写入");
 
         // 按 docker 布局落库，可经 get_blob 读回、内容一致
         let mut h = reg.get_blob(&repo, "app", &digest).await.unwrap();
@@ -880,13 +1144,13 @@ mod tests {
             .ingest_blob(&repo, "app", &digest, &content[..])
             .await
             .unwrap();
-        assert!(first, "首次为新写入");
+        assert!(first.written, "首次为新写入");
         // 二次同 digest：幂等命中、增量跳过（不新写）
         let second = reg
             .ingest_blob(&repo, "app", &digest, &content[..])
             .await
             .unwrap();
-        assert!(!second, "二次搬运应增量跳过");
+        assert!(!second.written, "二次搬运应增量跳过");
         // 索引仍只一条
         let key = docker::blob_key("app", &digest);
         assert!(meta.get_artifact(&repo.id, &key).await.unwrap().is_some());
@@ -952,6 +1216,66 @@ mod tests {
             .unwrap();
         // 搬运后存在
         assert!(reg.blob_exists(&repo, "app", &digest).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 迁移写入_outcome_区分新写幂等与_tag_更新() {
+        let (reg, meta, _d) = 新建(None).await;
+        let repo = 建_docker_仓库(&meta).await;
+        let content = b"outcome-blob";
+        let digest = docker::make_digest(&sha256_hex(content));
+        let first = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        assert!(first.written);
+        assert_eq!(first.size, content.len() as u64);
+        assert_eq!(first.digest, digest);
+        let second = reg
+            .ingest_blob(&repo, "app", &digest, &content[..])
+            .await
+            .unwrap();
+        assert!(!second.written);
+
+        let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}"#;
+        let first_manifest = reg
+            .put_manifest(
+                &repo,
+                "app",
+                "latest",
+                MEDIA_TYPE_MANIFEST_V2,
+                manifest.to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(first_manifest.written);
+        let same_manifest = reg
+            .put_manifest(
+                &repo,
+                "app",
+                "latest",
+                MEDIA_TYPE_MANIFEST_V2,
+                manifest.to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(!same_manifest.written);
+        sqlx::query("DELETE FROM artifacts WHERE repo_id = ? AND path LIKE '%/manifests/%'")
+            .bind(&repo.id)
+            .execute(meta.pool())
+            .await
+            .unwrap();
+        let repaired = reg
+            .put_manifest(
+                &repo,
+                "app",
+                "latest",
+                MEDIA_TYPE_MANIFEST_V2,
+                manifest.to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(repaired.written);
     }
 
     #[tokio::test]

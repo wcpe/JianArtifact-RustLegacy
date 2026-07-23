@@ -15,12 +15,21 @@ use axum::{
 use std::sync::Arc;
 
 use crate::auth::{self, AuthIdentity, AuthUser, LdapProvider};
-use crate::meta::{MetaStore, Role};
+use crate::meta::{MetaStore, Role, SessionKeyHash};
 
 use super::AppState;
 
 /// NuGet 规范 api-key 请求头名：`dotnet nuget push` 经此头携带 API Token（不发 `Authorization`）。
 const NUGET_API_KEY_HEADER: &str = "X-NuGet-ApiKey";
+
+/// 当前请求携带的 JWT 会话上下文；仅 JWT 请求注入，Basic / API Token 请求不注入。
+#[derive(Clone)]
+pub(crate) struct CurrentJwtSession {
+    /// 已域分隔并哈希的安全撤销键，不持有原 token / jti。
+    pub session_key: SessionKeyHash,
+    /// 会话过期时间（Unix 秒）。
+    pub exp: u64,
+}
 
 /// LDAP 登录上下文：Basic Auth 口令通道本地校验失败后委托 LDAP bind 校验所需的最小依赖。
 ///
@@ -63,9 +72,11 @@ pub async fn identity_layer(
         .map(str::to_owned);
 
     let ldap = LdapAuthContext::from_state(&state);
-    let mut identity = match header {
-        Some(value) => resolve_identity(&state.meta, &state.jwt, &value, ldap.as_ref()).await,
-        None => AuthIdentity::Anonymous,
+    let (mut identity, jwt_session) = match header {
+        Some(value) => {
+            resolve_identity_with_session(&state.meta, &state.jwt, &value, ldap.as_ref()).await
+        }
+        None => (AuthIdentity::Anonymous, None),
     };
 
     // NuGet 规范 api-key 头：`dotnet nuget push -k <token>` 仅经 `X-NuGet-ApiKey` 头携带凭据、
@@ -83,6 +94,9 @@ pub async fn identity_layer(
         }
     }
 
+    if let Some(session) = jwt_session {
+        request.extensions_mut().insert(session);
+    }
     request.extensions_mut().insert(identity);
     next.run(request).await
 }
@@ -98,38 +112,77 @@ pub async fn resolve_identity(
     header_value: &str,
     ldap: Option<&LdapAuthContext>,
 ) -> AuthIdentity {
+    resolve_identity_with_session(meta, jwt, header_value, ldap)
+        .await
+        .0
+}
+
+/// 解析身份并仅为 JWT 请求返回当前会话上下文。
+async fn resolve_identity_with_session(
+    meta: &MetaStore,
+    jwt: &auth::JwtSigner,
+    header_value: &str,
+    ldap: Option<&LdapAuthContext>,
+) -> (AuthIdentity, Option<CurrentJwtSession>) {
     if let Some(rest) = auth::basic::strip_scheme_prefix(header_value, "Bearer ") {
         return resolve_bearer(meta, jwt, rest.trim()).await;
     }
     if auth::basic::strip_scheme_prefix(header_value, "Basic ").is_some() {
-        if let Some(creds) = auth::parse_basic_auth(header_value) {
-            return resolve_basic(meta, &creds.username, &creds.secret, ldap).await;
-        }
-        return AuthIdentity::Anonymous;
+        let identity = match auth::parse_basic_auth(header_value) {
+            Some(creds) => resolve_basic(meta, &creds.username, &creds.secret, ldap).await,
+            None => AuthIdentity::Anonymous,
+        };
+        return (identity, None);
     }
     // 无 Bearer / Basic scheme：Cargo registry 客户端把 API Token 裸放进 Authorization 头
     // （`Authorization: <token>`，无 scheme 前缀），按 API Token 校验；非法则回退匿名。
     let raw = header_value.trim();
     if raw.is_empty() {
-        return AuthIdentity::Anonymous;
+        return (AuthIdentity::Anonymous, None);
     }
-    resolve_api_token(meta, raw).await
+    (resolve_api_token(meta, raw).await, None)
 }
 
 /// 解析 Bearer：先试 JWT（会话），失败再试 API Token。
-async fn resolve_bearer(meta: &MetaStore, jwt: &auth::JwtSigner, raw: &str) -> AuthIdentity {
+async fn resolve_bearer(
+    meta: &MetaStore,
+    jwt: &auth::JwtSigner,
+    raw: &str,
+) -> (AuthIdentity, Option<CurrentJwtSession>) {
     // 路径一：JWT 会话凭据
     if let Ok(claims) = jwt.verify(raw) {
-        // JWT 内含角色，但仍需确认用户存在且未禁用（吊销 / 禁用即时生效）
+        let session_key = match claims.jti.as_deref() {
+            Some(jti) => SessionKeyHash::from_jti(jti),
+            None => SessionKeyHash::from_legacy_token(raw),
+        };
+        // JWT 内含角色，但仍需确认用户存在且未禁用，再检查当前会话撤销态。
         if let Ok(Some(user)) = meta.get_user_by_id(&claims.sub).await {
-            if user.disabled == 0 {
-                return authenticated(user.id, user.username, &user.role);
+            if user.disabled == 0 && !session_is_revoked(meta, &session_key).await {
+                let session = CurrentJwtSession {
+                    session_key,
+                    exp: claims.exp,
+                };
+                return (
+                    authenticated(user.id, user.username, &user.role),
+                    Some(session),
+                );
             }
         }
-        return AuthIdentity::Anonymous;
+        return (AuthIdentity::Anonymous, None);
     }
     // 路径二：API Token（哈希比对）
-    resolve_api_token(meta, raw).await
+    (resolve_api_token(meta, raw).await, None)
+}
+
+/// 检查 JWT 会话撤销态；查询失败按已撤销安全拒绝。
+async fn session_is_revoked(meta: &MetaStore, session_key: &SessionKeyHash) -> bool {
+    match meta.is_jwt_session_revoked(session_key).await {
+        Ok(revoked) => revoked,
+        Err(error) => {
+            tracing::error!(错误 = %error, "查询 JWT 会话撤销状态失败，已按撤销处理");
+            true
+        }
+    }
 }
 
 /// 解析 API Token：按哈希查未吊销 Token 的所属身份。
@@ -359,5 +412,26 @@ mod tests {
             resolve_identity(&meta, &jwt, &format!("Bearer {token}"), None).await,
             AuthIdentity::Anonymous
         );
+    }
+
+    #[tokio::test]
+    async fn 已撤销但可验签的_jwt_不回退_api_token() {
+        let meta = 新建库().await;
+        let jwt = 测试签名器();
+        let uid = meta
+            .create_user("dev", &hash_password("pw").unwrap(), Role::User)
+            .await
+            .unwrap();
+        let token = jwt.issue(&uid, "dev", Role::User).unwrap();
+        meta.create_token(&uid, "同值令牌", &hash_api_token(&token))
+            .await
+            .unwrap();
+        let claims = jwt.verify(&token).unwrap();
+        let key = SessionKeyHash::from_jti(claims.jti.as_deref().unwrap());
+        meta.revoke_jwt_session(&key, claims.exp).await.unwrap();
+
+        let (identity, session) = resolve_bearer(&meta, &jwt, &token).await;
+        assert_eq!(identity, AuthIdentity::Anonymous);
+        assert!(session.is_none());
     }
 }

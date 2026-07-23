@@ -83,6 +83,7 @@ function cloneMigrationJob(job: OnlinePullJob): OnlinePullJob {
     ...job,
     repos: job.repos.map((repo) => ({ ...repo })),
     skipped_repos: [...job.skipped_repos],
+    asset_failures: job.asset_failures?.map((failure) => ({ ...failure })),
     offline_preview: job.offline_preview?.map((repo) => ({
       ...repo,
       blobs: repo.blobs.map((blob) => ({ ...blob })),
@@ -128,6 +129,7 @@ function createMigrationJob(
     total_assets: totalAssets,
     done_assets: doneAssets,
     migrated: doneAssets,
+    skipped_existing: 0,
     skipped: 0,
     total_bytes: totalBytes,
     done_bytes: doneBytes,
@@ -143,10 +145,18 @@ function createMigrationJob(
         format: 'maven',
         created: false,
         migrated_artifacts: totalAssets,
+        skipped_existing_artifacts: 0,
         skipped_artifacts: 0,
+        total_bytes: totalBytes,
+        done_bytes: doneBytes,
+        migrated_bytes: doneBytes,
+        skipped_bytes: 0,
+        duration_ms: options.running ? 0 : 1200,
       },
     ],
     skipped_repos: [],
+    asset_failures: [],
+    omitted_asset_failures: 0,
     error: null,
   };
   migrationJobLabels.set(jobId, label);
@@ -216,6 +226,7 @@ function migrationHistoryDto(job: OnlinePullJob): MigrationTaskDto {
     done_bytes: job.done_bytes ?? 0,
     migrated_bytes: job.migrated_bytes ?? 0,
     skipped_bytes: job.skipped_bytes ?? 0,
+    omitted_asset_failures: job.omitted_asset_failures,
     error: job.error,
     started_at: '2026-07-01T00:00:00Z',
     updated_at: '2026-07-01T00:01:00Z',
@@ -233,6 +244,11 @@ function migrationRepoReports(job: OnlinePullJob): MigrationRepoReportDto[] {
     migrated_artifacts: repo.migrated_artifacts,
     skipped_existing_artifacts: repo.skipped_existing_artifacts ?? 0,
     skipped_artifacts: repo.skipped_artifacts,
+    total_bytes: repo.total_bytes ?? 0,
+    done_bytes: repo.done_bytes ?? 0,
+    migrated_bytes: repo.migrated_bytes ?? 0,
+    skipped_bytes: repo.skipped_bytes ?? 0,
+    duration_ms: repo.duration_ms ?? 0,
   }));
 }
 
@@ -1080,6 +1096,7 @@ export const handlers = [
     return HttpResponse.json({
       ...migrationHistoryDto(snapshot),
       repos: migrationRepoReports(snapshot),
+      asset_failures: snapshot.asset_failures ?? [],
     });
   }),
 

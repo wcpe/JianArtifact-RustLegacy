@@ -21,12 +21,18 @@ use crate::storage::BlobStore;
 use super::hosted::ensure_hosted_repo;
 use super::online_docker::migrate_online_docker_repo;
 use super::{
-    map_nexus_format, parse_components, DockerRegistryClient, MigrateError, NexusAsset,
-    NexusClient, NexusCredential, NexusRepoSummary,
+    map_nexus_format, parse_components, saturating_millis, DockerRegistryClient, MigrateError,
+    NexusAsset, NexusClient, NexusCredential, NexusRepoSummary,
 };
 
 /// 单个 asset 下载 / 写入的最大尝试次数（含首次）：网络中断 / 流式解码失败等瞬时错误自动重试。
 const MAX_ASSET_ATTEMPTS: u32 = 3;
+/// 每个任务保留的最早失败资产明细上限。
+const MAX_ASSET_FAILURES: usize = 1_000;
+/// 失败资产标识最大 Unicode 字符数。
+const MAX_FAILURE_ASSET_CHARS: usize = 1_024;
+/// 稳定失败原因最大 Unicode 字符数。
+const MAX_FAILURE_REASON_CHARS: usize = 512;
 
 /// 在线拉取当前支持搬运的 hosted 格式集合（FR-82 Maven + FR-143 Raw / npm + FR-144 Docker）。
 ///
@@ -76,8 +82,19 @@ pub struct OnlinePullSelection {
     pub target_repo: String,
 }
 
-/// 单个仓库的在线拉取结果明细。
+/// 单个失败资产的安全明细。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MigrationAssetFailure {
+    /// 源仓库名。
+    pub source_repo: String,
+    /// 资产路径或镜像 tag 标识。
+    pub asset: String,
+    /// 稳定、脱敏的中文失败分类。
+    pub reason: String,
+}
+
+/// 单个仓库的在线拉取结果明细。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct OnlineRepoMigrationOutcome {
     /// 源仓库名。
     pub source_repo: String,
@@ -93,6 +110,16 @@ pub struct OnlineRepoMigrationOutcome {
     pub skipped_existing_artifacts: usize,
     /// 失败跳过数（路径非法、下载失败、sha256 不符、不可覆盖、写入失败等，均不中断整批）。
     pub skipped_artifacts: usize,
+    /// 源枚举可知的逻辑总字节数。
+    pub total_bytes: u64,
+    /// 已处理完成的逻辑字节数。
+    pub done_bytes: u64,
+    /// 本次新写入目标存储的落定字节数。
+    pub migrated_bytes: u64,
+    /// 幂等命中或失败跳过的逻辑字节数。
+    pub skipped_bytes: u64,
+    /// 本仓库处理耗时。
+    pub duration_ms: u64,
 }
 
 /// 整批在线拉取报告。
@@ -207,6 +234,10 @@ pub struct OnlinePullProgress {
     pub repos: Vec<OnlineRepoMigrationOutcome>,
     /// 因非 hosted / 格式不在在线搬运白名单整体跳过的源仓库名。
     pub skipped_repos: Vec<String>,
+    /// 最早发生的有界失败资产明细。
+    pub asset_failures: Vec<MigrationAssetFailure>,
+    /// 超出失败明细容量而省略的条数。
+    pub omitted_asset_failures: usize,
     /// 失败原因（`phase == failed` 时）。
     pub error: Option<String>,
     /// 离线 blob store 预览枚举结果（FR-124）：仅离线预览任务在 `phase == done` 时填充；
@@ -224,6 +255,93 @@ fn lock_progress(
     p: &std::sync::Mutex<OnlinePullProgress>,
 ) -> std::sync::MutexGuard<'_, OnlinePullProgress> {
     p.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 按 Unicode 字符边界安全截断文本。
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+/// 记录一条有界失败明细；锁内只更新内存，不执行 IO。
+pub(crate) fn record_asset_failure(
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    source_repo: &str,
+    asset: &str,
+    reason: &str,
+) {
+    let mut p = lock_progress(progress);
+    if p.asset_failures.len() >= MAX_ASSET_FAILURES {
+        p.omitted_asset_failures = p.omitted_asset_failures.saturating_add(1);
+        return;
+    }
+    p.asset_failures.push(MigrationAssetFailure {
+        source_repo: source_repo.to_string(),
+        asset: truncate_chars(asset, MAX_FAILURE_ASSET_CHARS),
+        reason: truncate_chars(reason, MAX_FAILURE_REASON_CHARS),
+    });
+}
+
+/// 仓库开始处理时的任务累计计数快照。
+#[derive(Clone, Copy)]
+pub(crate) struct RepoProgressSnapshot {
+    migrated: usize,
+    skipped_existing: usize,
+    skipped: usize,
+    total_bytes: u64,
+    done_bytes: u64,
+    migrated_bytes: u64,
+    skipped_bytes: u64,
+}
+
+pub(crate) fn repo_progress_snapshot(
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+) -> RepoProgressSnapshot {
+    let p = lock_progress(progress);
+    RepoProgressSnapshot {
+        migrated: p.migrated,
+        skipped_existing: p.skipped_existing,
+        skipped: p.skipped,
+        total_bytes: p.total_bytes,
+        done_bytes: p.done_bytes,
+        migrated_bytes: p.migrated_bytes,
+        skipped_bytes: p.skipped_bytes,
+    }
+}
+
+/// 仓库处理发生致命错误时，先保留耗时与截至失败点的仓库增量计数。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_fatal_repo_outcome(
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    source_repo: &str,
+    target_repo: &str,
+    format: &str,
+    created: bool,
+    known_total_bytes: u64,
+    started: std::time::Instant,
+    before: RepoProgressSnapshot,
+) {
+    let after = repo_progress_snapshot(progress);
+    lock_progress(progress)
+        .repos
+        .push(OnlineRepoMigrationOutcome {
+            source_repo: source_repo.to_string(),
+            target_repo: target_repo.to_string(),
+            format: format.to_string(),
+            created,
+            migrated_artifacts: after.migrated.saturating_sub(before.migrated),
+            skipped_existing_artifacts: after
+                .skipped_existing
+                .saturating_sub(before.skipped_existing),
+            skipped_artifacts: after.skipped.saturating_sub(before.skipped),
+            total_bytes: after
+                .total_bytes
+                .saturating_sub(before.total_bytes)
+                .max(known_total_bytes),
+            done_bytes: after.done_bytes.saturating_sub(before.done_bytes),
+            migrated_bytes: after.migrated_bytes.saturating_sub(before.migrated_bytes),
+            skipped_bytes: after.skipped_bytes.saturating_sub(before.skipped_bytes),
+            duration_ms: saturating_millis(started.elapsed().as_millis()),
+        });
 }
 
 /// （无进度上报的便捷入口）执行在线拉取迁移——内部用一次性进度委托
@@ -336,30 +454,58 @@ where
             p.current_path = None;
         }
 
-        // 建 / 复用目标 hosted 仓库（名取 target_repo，允许与源不同名；格式取映射后的白名单格式）
-        let (repo, created) = ensure_hosted_repo(meta, &sel.target_repo, target_format).await?;
+        let repo_started = std::time::Instant::now();
+        let repo_before = repo_progress_snapshot(progress);
+        // 建 / 复用目标 hosted 仓库；致命错误也先留下本仓库耗时明细。
+        let (repo, created) = match ensure_hosted_repo(meta, &sel.target_repo, target_format).await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                record_fatal_repo_outcome(
+                    progress,
+                    &src.name,
+                    &sel.target_repo,
+                    target_format,
+                    false,
+                    0,
+                    repo_started,
+                    repo_before,
+                );
+                return Err(error);
+            }
+        };
 
         // 分派：docker 走 registry v2 manifest + layer 图搬运（FR-144），其余走普通文件路径。
         // docker 特有逻辑单独封装于 online_docker，不塞进普通文件路径。
         let pulled = if target_format == "docker" {
-            // 前置守卫已保证 docker.is_some()
             let registry = docker.expect("docker registry 已在前置守卫确认装配");
-            let docker_pulled = migrate_online_docker_repo(
+            migrate_online_docker_repo(
                 client, registry, base, &src.name, &repo, credential, progress, control,
             )
-            .await?;
-            RepoPullResult {
-                migrated: docker_pulled.migrated,
-                skipped_existing: docker_pulled.skipped_existing,
-                skipped: docker_pulled.skipped,
-                cancelled: docker_pulled.cancelled,
-            }
+            .await
+            .map(RepoPullResult::from)
         } else {
             pull_repo_assets(
                 client, artifacts, formats, base, &src.name, &repo, credential, max_size, progress,
                 control,
             )
-            .await?
+            .await
+        };
+        let pulled = match pulled {
+            Ok(result) => result,
+            Err(error) => {
+                record_fatal_repo_outcome(
+                    progress,
+                    &src.name,
+                    &sel.target_repo,
+                    target_format,
+                    created,
+                    0,
+                    repo_started,
+                    repo_before,
+                );
+                return Err(error);
+            }
         };
 
         tracing::info!(
@@ -376,6 +522,11 @@ where
             migrated_artifacts: pulled.migrated,
             skipped_existing_artifacts: pulled.skipped_existing,
             skipped_artifacts: pulled.skipped,
+            total_bytes: pulled.total_bytes,
+            done_bytes: pulled.done_bytes,
+            migrated_bytes: pulled.migrated_bytes,
+            skipped_bytes: pulled.skipped_bytes,
+            duration_ms: saturating_millis(repo_started.elapsed().as_millis()),
         };
         lock_progress(progress).repos.push(outcome.clone());
         report.repos.push(outcome);
@@ -402,6 +553,7 @@ pub(crate) fn mark_cancelled(progress: &std::sync::Mutex<OnlinePullProgress>) {
 }
 
 /// 单仓库在线拉取的结果：成功 / 跳过计数 + 是否在搬运中途被取消（FR-91）。
+#[derive(Default)]
 struct RepoPullResult {
     /// 成功新写入的 asset 数。
     migrated: usize,
@@ -409,14 +561,37 @@ struct RepoPullResult {
     skipped_existing: usize,
     /// 跳过 / 失败的 asset 数。
     skipped: usize,
+    /// 源枚举逻辑总字节数。
+    total_bytes: u64,
+    /// 已处理逻辑字节数。
+    done_bytes: u64,
+    /// 新写入落定字节数。
+    migrated_bytes: u64,
+    /// 幂等或失败跳过逻辑字节数。
+    skipped_bytes: u64,
     /// 是否在 asset 边界被取消（取消则提前结束本仓库、未搬完）。
     cancelled: bool,
 }
 
+impl From<super::online_docker::DockerRepoPullResult> for RepoPullResult {
+    fn from(result: super::online_docker::DockerRepoPullResult) -> Self {
+        Self {
+            migrated: result.migrated,
+            skipped_existing: result.skipped_existing,
+            skipped: result.skipped,
+            total_bytes: result.total_bytes,
+            done_bytes: result.done_bytes,
+            migrated_bytes: result.migrated_bytes,
+            skipped_bytes: result.skipped_bytes,
+            cancelled: result.cancelled,
+        }
+    }
+}
+
 /// 单个在线 asset 的落定结果。
 enum PullOneOutcome {
-    /// 成功新写入。
-    Migrated,
+    /// 成功新写入及落定字节数。
+    Migrated(u64),
     /// 目标已存在且 sha256 一致，增量跳过。
     SkippedExisting,
 }
@@ -444,54 +619,30 @@ where
     U: Upstream,
 {
     let Some(format) = formats.get(&target_repo.format) else {
-        // 防御：目标仓库已按 maven 建成，注册表理应有处理器
         tracing::warn!(仓库 = %target_repo.name, 格式 = %target_repo.format, "格式处理器未注册，跳过在线拉取");
-        return Ok(RepoPullResult {
-            migrated: 0,
-            skipped_existing: 0,
-            skipped: 0,
-            cancelled: false,
-        });
+        return Ok(RepoPullResult::default());
     };
-
-    // 阶段1：枚举该仓库全部 asset（仅元数据，得知总数，便于进度条）
-    let mut assets: Vec<NexusAsset> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let body = client
-            .fetch_components(base_url, source_repo, token.as_deref(), credential)
-            .await?;
-        let page = parse_components(&body)?;
-        assets.extend(page.assets);
-        match page.continuation_token {
-            Some(t) => token = Some(t),
-            None => break,
-        }
-    }
-
+    let assets = enumerate_assets(client, base_url, source_repo, credential).await?;
+    let total_bytes = assets.iter().fold(0u64, |sum, asset| {
+        sum.saturating_add(asset.size.unwrap_or(0))
+    });
     {
         let mut p = lock_progress(progress);
         p.total_assets += assets.len();
+        p.total_bytes = p.total_bytes.saturating_add(total_bytes);
         p.phase = OnlinePullPhase::Downloading;
     }
 
-    // 阶段2：逐 asset 下载 + 落地，边搬边更新进度（下载 / 落盘在锁外）
-    let mut migrated = 0usize;
-    let mut skipped_existing = 0usize;
-    let mut skipped = 0usize;
+    let mut result = RepoPullResult {
+        total_bytes,
+        ..Default::default()
+    };
     for asset in &assets {
-        // 每个 asset 边界先响应控制信号（FR-91）：取消则提前结束；暂停则挂起等待
         if await_control(control, progress).await {
-            return Ok(RepoPullResult {
-                migrated,
-                skipped_existing,
-                skipped,
-                cancelled: true,
-            });
+            result.cancelled = true;
+            return Ok(result);
         }
-
         lock_progress(progress).current_path = Some(asset.path.clone());
-
         let outcome = pull_one_asset(
             client,
             artifacts,
@@ -502,31 +653,72 @@ where
             max_size,
         )
         .await;
-
-        let mut p = lock_progress(progress);
-        match outcome {
-            Ok(PullOneOutcome::Migrated) => {
-                migrated += 1;
-                p.migrated += 1;
-            }
-            Ok(PullOneOutcome::SkippedExisting) => {
-                skipped_existing += 1;
-                p.skipped_existing += 1;
-            }
-            Err(()) => {
-                skipped += 1;
-                p.skipped += 1;
-            }
-        }
-        p.done_assets += 1;
+        apply_asset_outcome(progress, source_repo, asset, outcome, &mut result);
     }
+    Ok(result)
+}
 
-    Ok(RepoPullResult {
-        migrated,
-        skipped_existing,
-        skipped,
-        cancelled: false,
-    })
+/// 分页枚举一个仓库的全部资产。
+async fn enumerate_assets<C: NexusClient>(
+    client: &C,
+    base_url: &str,
+    source_repo: &str,
+    credential: Option<&NexusCredential>,
+) -> Result<Vec<NexusAsset>, MigrateError> {
+    let mut assets = Vec::new();
+    let mut token = None;
+    loop {
+        let body = client
+            .fetch_components(base_url, source_repo, token.as_deref(), credential)
+            .await?;
+        let page = parse_components(&body)?;
+        assets.extend(page.assets);
+        match page.continuation_token {
+            Some(next) => token = Some(next),
+            None => return Ok(assets),
+        }
+    }
+}
+
+/// 把单资产三态结果同时推进任务级与仓库级计数。
+fn apply_asset_outcome(
+    progress: &std::sync::Mutex<OnlinePullProgress>,
+    source_repo: &str,
+    asset: &NexusAsset,
+    outcome: Result<PullOneOutcome, &'static str>,
+    result: &mut RepoPullResult,
+) {
+    let logical = asset.size.unwrap_or(0);
+    let mut failure = None;
+    let mut p = lock_progress(progress);
+    p.done_assets += 1;
+    p.done_bytes = p.done_bytes.saturating_add(logical);
+    result.done_bytes = result.done_bytes.saturating_add(logical);
+    match outcome {
+        Ok(PullOneOutcome::Migrated(written)) => {
+            result.migrated += 1;
+            result.migrated_bytes = result.migrated_bytes.saturating_add(written);
+            p.migrated += 1;
+            p.migrated_bytes = p.migrated_bytes.saturating_add(written);
+        }
+        Ok(PullOneOutcome::SkippedExisting) => {
+            result.skipped_existing += 1;
+            result.skipped_bytes = result.skipped_bytes.saturating_add(logical);
+            p.skipped_existing += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(logical);
+        }
+        Err(reason) => {
+            result.skipped += 1;
+            result.skipped_bytes = result.skipped_bytes.saturating_add(logical);
+            p.skipped += 1;
+            p.skipped_bytes = p.skipped_bytes.saturating_add(logical);
+            failure = Some(reason);
+        }
+    }
+    drop(p);
+    if let Some(reason) = failure {
+        record_asset_failure(progress, source_repo, &asset.path, reason);
+    }
 }
 
 /// 在 asset 边界响应控制信号（FR-91）。返回 `true` 表示应取消（提前结束本仓库）。
@@ -584,7 +776,7 @@ async fn pull_one_asset<C, S, U>(
     asset: &NexusAsset,
     credential: Option<&NexusCredential>,
     max_size: Option<u64>,
-) -> Result<PullOneOutcome, ()>
+) -> Result<PullOneOutcome, &'static str>
 where
     C: NexusClient,
     S: BlobStore,
@@ -595,7 +787,7 @@ where
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(仓库 = %repo.name, 路径 = %asset.path, 错误 = %e, "asset 路径非法，跳过");
-            return Err(());
+            return Err("制品路径非法");
         }
     };
 
@@ -614,7 +806,7 @@ where
                     continue;
                 }
                 tracing::warn!(仓库 = %repo.name, 路径 = %asset.path, 错误 = %e, "asset 下载失败，跳过");
-                return Err(());
+                return Err("源资产下载失败");
             }
         };
 
@@ -624,10 +816,14 @@ where
             .await
         {
             Ok(outcome) => break outcome,
-            // 不可覆盖为确定性失败，不重试
+            // 确定性策略错误不重试。
             Err(ServiceError::OverwriteForbidden) => {
                 tracing::info!(仓库 = %repo.name, 路径 = %asset.path, "同坐标制品已存在且不可覆盖，跳过");
-                return Err(());
+                return Err("目标制品不可覆盖");
+            }
+            Err(ServiceError::TooLarge) => {
+                tracing::warn!(仓库 = %repo.name, 路径 = %asset.path, "制品超过大小限制，跳过");
+                return Err("制品超过大小限制");
             }
             Err(e) => {
                 if is_transient_service(&e) && attempt < MAX_ASSET_ATTEMPTS {
@@ -635,7 +831,7 @@ where
                     continue;
                 }
                 tracing::warn!(仓库 = %repo.name, 路径 = %asset.path, 错误 = %e, "asset 写入失败，跳过");
-                return Err(());
+                return Err("目标制品写入失败");
             }
         }
     };
@@ -648,12 +844,14 @@ where
         if !record.sha256.eq_ignore_ascii_case(expected) {
             tracing::warn!(仓库 = %repo.name, 路径 = %asset.path, "下载内容 sha256 与源报告不符，回滚该制品并跳过");
             let _ = artifacts.delete(repo, &coords).await;
-            return Err(());
+            return Err("资产校验失败");
         }
     }
 
     if written {
-        Ok(PullOneOutcome::Migrated)
+        Ok(PullOneOutcome::Migrated(
+            u64::try_from(record.size).unwrap_or(0),
+        ))
     } else {
         Ok(PullOneOutcome::SkippedExisting)
     }
@@ -1299,6 +1497,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 仓库枚举致命错误先保留_repo_outcome() {
+        let (meta, svc, formats, _d) = 新建().await;
+        let client = MockOnline {
+            pages: vec![],
+            assets: HashMap::new(),
+        };
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        let selection = [sel(src("r3d", "maven2", "hosted"), "r3d")];
+
+        let error = migrate_online_with_progress(
+            &client,
+            &meta,
+            &svc,
+            &formats,
+            None,
+            "https://nx",
+            None,
+            &selection,
+            None,
+            &progress,
+            &JobControl::default(),
+        )
+        .await;
+
+        assert!(error.is_err());
+        let p = progress.lock().unwrap();
+        assert_eq!(p.repos.len(), 1);
+        assert_eq!(p.repos[0].source_repo, "r3d");
+        assert_eq!(p.repos[0].target_repo, "r3d");
+        assert_eq!(p.repos[0].done_bytes, 0);
+    }
+
+    #[tokio::test]
     async fn 空_base_url_被拒() {
         let (meta, svc, formats, _d) = 新建().await;
         let client = MockOnline {
@@ -1713,6 +1944,25 @@ mod tests {
             // 设超时兜底，避免用例在回归失败时永久挂起
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), n).await;
         }
+    }
+
+    #[test]
+    fn 失败明细容量截断与省略计数() {
+        let progress = std::sync::Mutex::new(OnlinePullProgress::default());
+        for i in 0..1002 {
+            record_asset_failure(
+                &progress,
+                "源仓库",
+                &format!("{}尾", "资".repeat(1024 + i % 2)),
+                &format!("{}尾", "原".repeat(512 + i % 2)),
+            );
+        }
+        let p = progress.lock().unwrap();
+        assert_eq!(p.asset_failures.len(), 1000);
+        assert_eq!(p.omitted_asset_failures, 2);
+        assert!(p.asset_failures[0].asset.chars().count() <= 1024);
+        assert!(p.asset_failures[0].reason.chars().count() <= 512);
+        assert_eq!(p.asset_failures[0].source_repo, "源仓库");
     }
 
     /// 轮询直至进度进入暂停态。

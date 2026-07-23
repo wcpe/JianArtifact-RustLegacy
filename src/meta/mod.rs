@@ -14,6 +14,7 @@ mod groups;
 mod metrics;
 mod migrate;
 mod repo;
+mod session;
 mod settings;
 mod usage;
 mod vuln;
@@ -23,13 +24,15 @@ pub use audit::{AuditEntry, AuditQuery, NewAuditEntry};
 pub use groups::{GroupAclRecord, GroupMemberRecord, GroupRecord};
 pub use metrics::{MetricSample, NewMetricSample};
 pub use migrate::{
-    MigrationProgressSnapshot, MigrationRepoReport, MigrationTaskKind, MigrationTaskRecord,
+    MigrationAssetFailureReport, MigrationProgressSnapshot, MigrationRepoReport,
+    MigrationTaskAssetFailureRow, MigrationTaskDetail, MigrationTaskKind, MigrationTaskRecord,
     MigrationTaskRepoRow, MigrationTaskState, NewMigrationTask,
 };
 pub use repo::{
     AclRecord, ArtifactRecord, ArtifactSearchHit, NewArtifact, NewRepository, Permission, RepoType,
     RepositoryRecord, Visibility,
 };
+pub use session::SessionKeyHash;
 pub use usage::{NewUsageEvent, RepoUsageRow, UsageAction, UsageStatRow};
 pub use vuln::{AdvisoryAffectedMatch, MirrorStateRecord, NewAdvisory, NewAffected};
 
@@ -123,6 +126,9 @@ pub enum MetaError {
     /// 数据库迁移失败。
     #[error("数据库迁移失败: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// JWT 会话过期时间无法安全转换为 SQLite INTEGER。
+    #[error("JWT 会话过期时间超出 SQLite INTEGER 范围: {0}")]
+    SessionExpirationOutOfRange(u64),
 }
 
 /// 元数据存储：持有 SQLite 连接池。
@@ -447,6 +453,10 @@ mod tests {
             (
                 "0014_migration_tasks.sql",
                 include_bytes!("../../migrations/0014_migration_tasks.sql").as_slice(),
+            ),
+            (
+                "0015_revoked_jwt_sessions.sql",
+                include_bytes!("../../migrations/0015_revoked_jwt_sessions.sql").as_slice(),
             ),
         ] {
             assert!(

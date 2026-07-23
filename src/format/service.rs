@@ -7,15 +7,18 @@
 //! - 覆盖策略经 [`Format::can_overwrite`] 判定（Raw 允许覆盖；其余格式各自语义）。
 //! - proxy cache-miss 经**单飞合并**一次回源，上游失败不缓存损坏内容；**锁外做 IO**。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::io::AsyncRead;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::meta::{ArtifactRecord, MetaError, MetaStore, NewArtifact, RepoType, RepositoryRecord};
 use crate::metrics_keys as keys;
 use crate::proxy::{SingleFlight, Upstream};
 use crate::storage::{BlobReader, BlobStore, StorageError};
 
+use super::blob_commit::BlobIndexCommitGuard;
 use super::{is_too_large, ArtifactCoordinates, Format, LimitedReader};
 
 /// 通用制品机理错误。
@@ -105,6 +108,91 @@ pub enum ArtifactKind {
     FetchedFromUpstream,
 }
 
+/// 同路径写协调器：登记锁只维护内存映射，等待与后续 blob / SQLite IO 均在登记锁外。
+#[derive(Default)]
+struct PathWriteCoordinator {
+    locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+}
+
+impl PathWriteCoordinator {
+    async fn acquire(&self, repo_id: &str, path: &str) -> PathWriteGuard<'_> {
+        let key = format!("{repo_id}\u{0}{path}");
+        let lock = {
+            let mut locks = self.locks.lock().expect("同路径写登记锁未中毒");
+            match locks.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(key.clone(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        // 等待期间由登记守卫持有强引用；future 取消时析构并清理悬空弱 key。
+        let mut registration = PathWriteRegistration {
+            coordinator: self,
+            key: key.clone(),
+            lock: lock.clone(),
+        };
+        drop(lock);
+        let guard = registration.lock.clone().lock_owned().await;
+        let lock = registration.lock.clone();
+        registration.disarm();
+        PathWriteGuard {
+            coordinator: self,
+            key,
+            lock,
+            guard: Some(guard),
+        }
+    }
+
+    fn remove_if_unused(&self, key: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.locks.lock().expect("同路径写登记锁未中毒");
+        let unused = locks.get(key).is_some_and(|current| {
+            current.ptr_eq(&Arc::downgrade(lock)) && current.strong_count() <= 2
+        });
+        if unused {
+            locks.remove(key);
+        }
+    }
+}
+
+/// 等待同路径写权时的登记守卫，取消等待会清理无使用者的弱引用。
+struct PathWriteRegistration<'a> {
+    coordinator: &'a PathWriteCoordinator,
+    key: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl PathWriteRegistration<'_> {
+    fn disarm(&mut self) {
+        self.key.clear();
+    }
+}
+
+impl Drop for PathWriteRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.key.is_empty() {
+            self.coordinator.remove_if_unused(&self.key, &self.lock);
+        }
+    }
+}
+
+/// 同路径写权守卫：先释放异步锁，再短持登记锁清理无等待者的弱引用。
+struct PathWriteGuard<'a> {
+    coordinator: &'a PathWriteCoordinator,
+    key: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for PathWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.guard.take();
+        self.coordinator.remove_if_unused(&self.key, &self.lock);
+    }
+}
+
 /// 通用制品机理服务：编排写入 / 读取 / 删除，与格式无关。
 ///
 /// 持有 blob 存储、元数据存储与 proxy 单飞合并器；具体格式经 [`Format`] trait 多态传入，
@@ -118,6 +206,8 @@ pub struct ArtifactService<S: BlobStore, U: Upstream> {
     upstream: U,
     /// 单飞合并器：键为 (仓库 id + 路径)，合并同一制品的并发回源。
     single_flight: Arc<SingleFlight<String>>,
+    /// 同路径写协调器：只串行同一 (仓库 id, 路径) 的索引判定与更新。
+    path_writes: PathWriteCoordinator,
 }
 
 impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
@@ -128,6 +218,7 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             meta,
             upstream,
             single_flight: Arc::new(SingleFlight::new()),
+            path_writes: PathWriteCoordinator::default(),
         }
     }
 
@@ -152,29 +243,49 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             ));
         }
 
-        // ① 覆盖策略：同坐标已存在且格式不允许覆盖 → 拒绝（不读 / 不写 blob）
-        let existing = self.meta.get_artifact(&repo.id, &coords.path).await?;
-        let overwritten = existing.is_some();
-        if let Some(ref e) = existing {
-            if !format.can_overwrite(e) {
+        // 快速拒绝已存在的不可变制品，避免无谓读取上传流；并发正确性由获得写权后的复查保证。
+        if let Some(existing) = self.meta.get_artifact(&repo.id, &coords.path).await? {
+            if !format.can_overwrite(&existing) {
                 return Err(ServiceError::OverwriteForbidden);
             }
         }
 
-        // ② 流式落 blob：用限长读包裹，超限在写入途中即报错（BlobStore 会清理半截临时文件）
+        // 流式落 blob：用限长读包裹，超限在写入途中即报错（BlobStore 会清理半截临时文件）。
         let limited = LimitedReader::new(reader, max_size);
-        let digests = match self.store.put(limited).await {
-            Ok(d) => d,
-            // 限长读触发的超限错误以专属 sentinel 标记，映射 413
+        let (digests, lease) = match self.store.put_pending(limited).await {
+            Ok(pending) => pending,
             Err(StorageError::Io(e)) if is_too_large(&e) => {
                 return Err(ServiceError::TooLarge);
             }
             Err(e) => return Err(e.into()),
         };
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
 
-        // ③ 写元数据索引（blob 已落盘且 sha256 由 BlobStore 边写边算）
+        // blob IO 完成后再竞争同路径写权；获得写权后以 SQLite 最新索引重新应用覆盖策略。
+        let write_guard = self.path_writes.acquire(&repo.id, &coords.path).await;
+        let existing = match self.meta.get_artifact(&repo.id, &coords.path).await {
+            Ok(existing) => existing,
+            Err(e) => {
+                drop(write_guard);
+                pending.rollback().await;
+                return Err(e.into());
+            }
+        };
+        if existing.as_ref().is_some_and(|e| !format.can_overwrite(e)) {
+            drop(write_guard);
+            pending.rollback().await;
+            return Err(ServiceError::OverwriteForbidden);
+        }
+        let overwritten = existing.is_some();
+        let old_sha256 = existing.as_ref().map(|record| record.sha256.clone());
+
         let content_type = format.content_type(coords);
-        let write_index = self
+        if let Err(e) = self
             .meta
             .upsert_artifact(NewArtifact {
                 repo_id: &repo.id,
@@ -187,14 +298,18 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
                 content_type: content_type.as_deref(),
                 cached: false,
             })
-            .await;
-
-        if let Err(e) = write_index {
-            // ④ 写索引失败 → 回滚 blob（仅当无其他索引引用同 sha256），不留孤儿 blob
-            self.rollback_blob(&digests.sha256).await;
+            .await
+        {
+            drop(write_guard);
+            pending.rollback().await;
             return Err(e.into());
         }
+        pending.commit();
+        drop(write_guard);
 
+        if let Some(old_sha256) = old_sha256.filter(|old| old != &digests.sha256) {
+            self.rollback_blob(&old_sha256).await;
+        }
         let record = self
             .meta
             .get_artifact(&repo.id, &coords.path)
@@ -221,6 +336,7 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
         format: &dyn Format,
         coords: &ArtifactCoordinates,
         reader: R,
+        max_size: Option<u64>,
     ) -> Result<IngestOutcome, ServiceError>
     where
         R: AsyncRead + Unpin + Send,
@@ -231,18 +347,37 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             ));
         }
 
-        // ① 流式落 blob：边写边算四摘要，落定即等于 sha256 校验通过（内容寻址）
-        let digests = self.store.put(reader).await?;
-
-        // 幂等：同坐标已存在同 sha256 缓存，则本次搬运为重入——清理本次多余落盘后复用既有记录（FR-134）
-        if let Some(existing) = self.meta.get_artifact(&repo.id, &coords.path).await? {
+        let limited = LimitedReader::new(reader, max_size);
+        let (digests, lease) = match self.store.put_pending(limited).await {
+            Ok(pending) => pending,
+            Err(StorageError::Io(e)) if is_too_large(&e) => return Err(ServiceError::TooLarge),
+            Err(e) => return Err(e.into()),
+        };
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
+        let write_guard = self.path_writes.acquire(&repo.id, &coords.path).await;
+        let existing = match self.meta.get_artifact(&repo.id, &coords.path).await {
+            Ok(existing) => existing,
+            Err(e) => {
+                drop(write_guard);
+                pending.rollback().await;
+                return Err(e.into());
+            }
+        };
+        if let Some(existing) = existing.as_ref() {
             if existing.sha256 == digests.sha256 {
-                self.rollback_blob(&digests.sha256).await;
-                return Ok(IngestOutcome::AlreadyExists(existing));
+                let record = existing.clone();
+                drop(write_guard);
+                pending.rollback().await;
+                return Ok(IngestOutcome::AlreadyExists(record));
             }
         }
+        let old_sha256 = existing.as_ref().map(|record| record.sha256.clone());
 
-        // ② 写缓存索引（cached = true）；失败回滚 blob，不留孤儿
         let content_type = format.content_type(coords);
         if let Err(e) = self
             .meta
@@ -259,10 +394,16 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             })
             .await
         {
-            self.rollback_blob(&digests.sha256).await;
+            drop(write_guard);
+            pending.rollback().await;
             return Err(e.into());
         }
+        pending.commit();
+        drop(write_guard);
 
+        if let Some(old_sha256) = old_sha256.filter(|old| old != &digests.sha256) {
+            self.rollback_blob(&old_sha256).await;
+        }
         let record = self
             .meta
             .get_artifact(&repo.id, &coords.path)
@@ -301,29 +442,46 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
 
         // ① 流式落 blob：边写边算四摘要，超限在写入途中即拒（BlobStore 清理半截临时文件）
         let limited = LimitedReader::new(reader, max_size);
-        let digests = match self.store.put(limited).await {
-            Ok(d) => d,
+        let (digests, lease) = match self.store.put_pending(limited).await {
+            Ok(pending) => pending,
             Err(StorageError::Io(e)) if is_too_large(&e) => {
                 return Err(ServiceError::TooLarge);
             }
             Err(e) => return Err(e.into()),
         };
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
 
-        // 幂等 / 覆盖判定：先按既有制品决定是复用、覆盖还是拒绝，再决定是否写索引
-        if let Some(existing) = self.meta.get_artifact(&repo.id, &coords.path).await? {
-            // 同坐标同内容：本次搬运为重入，清理多余落盘后复用既有记录（FR-134 增量跳过）
-            if existing.sha256 == digests.sha256 {
-                self.rollback_blob(&digests.sha256).await;
-                return Ok(IngestOutcome::AlreadyExists(existing));
+        // blob IO 完成后再竞争同路径写权；获得写权后据最新索引判定幂等、覆盖或拒绝。
+        let write_guard = self.path_writes.acquire(&repo.id, &coords.path).await;
+        let existing = match self.meta.get_artifact(&repo.id, &coords.path).await {
+            Ok(existing) => existing,
+            Err(e) => {
+                drop(write_guard);
+                pending.rollback().await;
+                return Err(e.into());
             }
-            // 同坐标不同内容：按格式覆盖策略判定；不可覆盖则回滚本次落盘并报错（交编排跳过）
-            if !format.can_overwrite(&existing) {
-                self.rollback_blob(&digests.sha256).await;
+        };
+        if let Some(existing) = existing.as_ref() {
+            if existing.sha256 == digests.sha256 {
+                let record = existing.clone();
+                drop(write_guard);
+                pending.rollback().await;
+                return Ok(IngestOutcome::AlreadyExists(record));
+            }
+            if !format.can_overwrite(existing) {
+                drop(write_guard);
+                pending.rollback().await;
                 return Err(ServiceError::OverwriteForbidden);
             }
         }
+        let old_sha256 = existing.as_ref().map(|record| record.sha256.clone());
 
-        // ② 写元数据索引（cached = false，hosted 正常制品）；失败回滚 blob，不留孤儿
+        // 写元数据索引（cached = false，hosted 正常制品）；失败回滚 blob，不留孤儿。
         let content_type = format.content_type(coords);
         if let Err(e) = self
             .meta
@@ -340,10 +498,16 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             })
             .await
         {
-            self.rollback_blob(&digests.sha256).await;
+            drop(write_guard);
+            pending.rollback().await;
             return Err(e.into());
         }
+        pending.commit();
+        drop(write_guard);
 
+        if let Some(old_sha256) = old_sha256.filter(|old| old != &digests.sha256) {
+            self.rollback_blob(&old_sha256).await;
+        }
         let record = self
             .meta
             .get_artifact(&repo.id, &coords.path)
@@ -503,8 +667,33 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             }
         };
 
-        // 流式落 blob：边写边算 sha256，BlobStore 落定即等于校验通过（内容寻址）
-        let digests = self.store.put(body).await.map_err(|e| e.to_string())?;
+        let (digests, lease) = self
+            .store
+            .put_pending(body)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pending = BlobIndexCommitGuard::new(
+            self.store.clone(),
+            self.meta.clone(),
+            digests.sha256.clone(),
+            lease,
+        );
+
+        // blob IO 完成后再竞争同路径写权；若等待期间已有索引落定，则复用并清理本次 blob。
+        let write_guard = self.path_writes.acquire(&repo.id, &coords.path).await;
+        match self.meta.get_artifact(&repo.id, &coords.path).await {
+            Ok(Some(existing)) => {
+                drop(write_guard);
+                pending.rollback().await;
+                return Ok(existing.sha256);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                drop(write_guard);
+                pending.rollback().await;
+                return Err(e.to_string());
+            }
+        }
 
         // 写缓存索引（cached = true）
         let content_type = format.content_type(coords);
@@ -523,10 +712,12 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
             })
             .await
         {
-            // 写索引失败 → 回滚 blob，不留孤儿
-            self.rollback_blob(&digests.sha256).await;
+            drop(write_guard);
+            pending.rollback().await;
             return Err(e.to_string());
         }
+        pending.commit();
+        drop(write_guard);
         tracing::info!(仓库 = %repo.name, 路径 = %coords.path, "proxy 已回源并缓存制品");
         Ok(digests.sha256)
     }
@@ -578,14 +769,16 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
         repo: &RepositoryRecord,
         coords: &ArtifactCoordinates,
     ) -> Result<(), ServiceError> {
+        let write_guard = self.path_writes.acquire(&repo.id, &coords.path).await;
         let record = self
             .meta
             .get_artifact(&repo.id, &coords.path)
             .await?
             .ok_or(ServiceError::NotFound)?;
 
-        // 先删索引（元数据唯一真源），再按引用计数清 blob
+        // 检查与删除索引保持同路径原子互斥，blob cleanup 移到路径锁外。
         self.meta.delete_artifact(&repo.id, &coords.path).await?;
+        drop(write_guard);
         self.rollback_blob(&record.sha256).await;
         tracing::info!(仓库 = %repo.name, 路径 = %coords.path, "已删除制品");
         Ok(())
@@ -593,18 +786,23 @@ impl<S: BlobStore, U: Upstream> ArtifactService<S, U> {
 
     /// 回滚 / 清理 blob：仅当该 sha256 不再被任何索引引用时才删本体，避免误删共享 blob。
     async fn rollback_blob(&self, sha256: &str) {
-        match self.meta.count_artifacts_by_sha256(sha256).await {
-            Ok(0) => {
-                if let Err(e) = self.store.delete(sha256).await {
-                    tracing::warn!(sha256 = %sha256, 错误 = %e, "清理无引用 blob 失败");
+        let meta = self.meta.clone();
+        let count_sha256 = sha256.to_string();
+        let result = self
+            .store
+            .delete_if(sha256, move || async move {
+                match meta.count_artifacts_by_sha256(&count_sha256).await {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(e) => {
+                        tracing::warn!(sha256 = %count_sha256, 错误 = %e, "查询 blob 引用计数失败，跳过清理");
+                        false
+                    }
                 }
-            }
-            // 仍有引用：保留 blob
-            Ok(_) => {}
-            Err(e) => {
-                // 计数失败时保守起见不删 blob（宁可暂留也不误删被引用的本体）
-                tracing::warn!(sha256 = %sha256, 错误 = %e, "查询 blob 引用计数失败，跳过清理");
-            }
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(sha256 = %sha256, 错误 = %e, "清理无引用 blob 失败");
         }
     }
 }
@@ -653,14 +851,103 @@ fn record_upstream_failure(repo: &RepositoryRecord) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::io::AsyncReadExt;
 
     use crate::format::RawFormat;
     use crate::meta::{NewRepository, Visibility};
     use crate::proxy::UpstreamError;
-    use crate::storage::LocalFsStore;
+    use crate::storage::{BlobDigests, BlobReader, BlobWriteLease, LocalFsStore};
+
+    /// 测试存储：让前两次 blob 写入同时落定，稳定复现索引写入竞争。
+    #[derive(Clone)]
+    struct BarrierStore {
+        inner: LocalFsStore,
+        barrier: Arc<tokio::sync::Barrier>,
+        puts: Arc<AtomicUsize>,
+    }
+
+    impl BlobStore for BarrierStore {
+        async fn put_pending<R>(
+            &self,
+            reader: R,
+        ) -> Result<(BlobDigests, BlobWriteLease), StorageError>
+        where
+            R: AsyncRead + Unpin + Send,
+        {
+            if self.puts.fetch_add(1, Ordering::SeqCst) < 2 {
+                self.barrier.wait().await;
+            }
+            self.inner.put_pending(reader).await
+        }
+
+        async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError> {
+            self.inner.get(sha256).await
+        }
+
+        fn delete_if<F, Fut>(
+            &self,
+            sha256: &str,
+            should_delete: F,
+        ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future<Output = bool> + Send,
+        {
+            self.inner.delete_if(sha256, should_delete)
+        }
+
+        async fn exists(&self, sha256: &str) -> Result<bool, StorageError> {
+            self.inner.exists(sha256).await
+        }
+    }
+
+    /// 测试存储：首次 pending 落定后暂停，稳定取消等待 path / 索引的 future。
+    #[derive(Clone)]
+    struct PausingStore {
+        inner: LocalFsStore,
+        pause_once: Arc<AtomicBool>,
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlobStore for PausingStore {
+        async fn put_pending<R>(
+            &self,
+            reader: R,
+        ) -> Result<(BlobDigests, BlobWriteLease), StorageError>
+        where
+            R: AsyncRead + Unpin + Send,
+        {
+            let pending = self.inner.put_pending(reader).await?;
+            if self.pause_once.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(pending)
+        }
+
+        async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError> {
+            self.inner.get(sha256).await
+        }
+
+        fn delete_if<F, Fut>(
+            &self,
+            sha256: &str,
+            should_delete: F,
+        ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+        where
+            F: FnOnce() -> Fut + Send,
+            Fut: std::future::Future<Output = bool> + Send,
+        {
+            self.inner.delete_if(sha256, should_delete)
+        }
+
+        async fn exists(&self, sha256: &str) -> Result<bool, StorageError> {
+            self.inner.exists(sha256).await
+        }
+    }
 
     /// 计数型 mock 上游：记录被拉取次数，可配置内容、延迟与失败，用于穷举单飞 / 回退竞态。
     struct MockUpstream {
@@ -729,6 +1016,25 @@ mod tests {
         (svc, meta, dir)
     }
 
+    /// 构造会同步前两次 blob 落盘的测试服务。
+    async fn 新建并发写服务() -> (
+        ArtifactService<BarrierStore, MockUpstream>,
+        MetaStore,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open_in_memory().await.unwrap();
+        let inner = LocalFsStore::new(dir.path().join("blobs")).await.unwrap();
+        let store = BarrierStore {
+            inner,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            puts: Arc::new(AtomicUsize::new(0)),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let svc = ArtifactService::new(store, meta.clone(), MockUpstream::new(b"", calls));
+        (svc, meta, dir)
+    }
+
     /// 建一个仓库记录并返回。
     async fn 建仓库(
         meta: &MetaStore,
@@ -754,6 +1060,51 @@ mod tests {
         ArtifactCoordinates {
             path: p.to_string(),
         }
+    }
+
+    fn sha256(content: &[u8]) -> String {
+        use digest::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(content);
+        format!("{:x}", h.finalize())
+    }
+
+    #[tokio::test]
+    async fn path_写等待取消后清理弱_key() {
+        let coordinator = Arc::new(PathWriteCoordinator::default());
+        let held = coordinator.acquire("repo", "path").await;
+        let waiting_coordinator = coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            let _guard = waiting_coordinator.acquire("repo", "path").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let waiter_registered = coordinator
+                    .locks
+                    .lock()
+                    .expect("同路径写登记锁未中毒")
+                    .values()
+                    .any(|lock| lock.strong_count() >= 4);
+                if waiter_registered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("等待者应有界登记");
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(
+            coordinator
+                .locks
+                .lock()
+                .expect("同路径写登记锁未中毒")
+                .is_empty(),
+            "取消等待与现有写权释放后不应留下弱 key"
+        );
     }
 
     // ---------- 写入：blob 先落盘再写索引、四校验和正确、覆盖 ----------
@@ -815,6 +1166,200 @@ mod tests {
         let mut buf = Vec::new();
         h.blob.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"v2-longer");
+    }
+
+    #[tokio::test]
+    async fn maven_release_同路径并发不同内容仅一次成功且失败内容无_blob() {
+        use crate::format::MavenFormat;
+
+        let (svc, meta, _dir) = 新建并发写服务().await;
+        let repo = 建仓库(&meta, "maven", RepoType::Hosted, None).await;
+        let path = "com/example/lib/1.0/lib-1.0.jar";
+        let svc = Arc::new(svc);
+
+        let first_svc = svc.clone();
+        let first_repo = repo.clone();
+        let first = tokio::spawn(async move {
+            first_svc
+                .put_hosted(
+                    &first_repo,
+                    &MavenFormat,
+                    &坐标(path),
+                    &b"release-one"[..],
+                    None,
+                )
+                .await
+        });
+        let second_svc = svc.clone();
+        let second_repo = repo.clone();
+        let second = tokio::spawn(async move {
+            second_svc
+                .put_hosted(
+                    &second_repo,
+                    &MavenFormat,
+                    &坐标(path),
+                    &b"release-two"[..],
+                    None,
+                )
+                .await
+        });
+
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(ServiceError::OverwriteForbidden)))
+                .count(),
+            1
+        );
+        let record = meta.get_artifact(&repo.id, path).await.unwrap().unwrap();
+        let first_sha = sha256(b"release-one");
+        let second_sha = sha256(b"release-two");
+        assert!(svc.store.exists(&record.sha256).await.unwrap());
+        let unused_sha = if record.sha256 == first_sha {
+            second_sha
+        } else {
+            first_sha
+        };
+        assert!(!svc.store.exists(&unused_sha).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn raw_同路径并发覆盖后索引_blob_自洽且未引用_blob_已清理() {
+        let (svc, meta, _dir) = 新建并发写服务().await;
+        let repo = 建仓库(&meta, "raw", RepoType::Hosted, None).await;
+        let path = "same/path.bin";
+        let svc = Arc::new(svc);
+
+        let first_svc = svc.clone();
+        let first_repo = repo.clone();
+        let first = tokio::spawn(async move {
+            first_svc
+                .put_hosted(
+                    &first_repo,
+                    &RawFormat,
+                    &坐标(path),
+                    &b"raw-first"[..],
+                    None,
+                )
+                .await
+        });
+        let second_svc = svc.clone();
+        let second_repo = repo.clone();
+        let second = tokio::spawn(async move {
+            second_svc
+                .put_hosted(
+                    &second_repo,
+                    &RawFormat,
+                    &坐标(path),
+                    &b"raw-second"[..],
+                    None,
+                )
+                .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        let record = meta.get_artifact(&repo.id, path).await.unwrap().unwrap();
+        let first_sha = sha256(b"raw-first");
+        let second_sha = sha256(b"raw-second");
+        let expected = if record.sha256 == first_sha {
+            b"raw-first".as_slice()
+        } else {
+            assert_eq!(record.sha256, second_sha);
+            b"raw-second".as_slice()
+        };
+        let mut blob = svc.store.get(&record.sha256).await.unwrap();
+        let mut content = Vec::new();
+        blob.read_to_end(&mut content).await.unwrap();
+        assert_eq!(content, expected);
+        let unused_sha = if record.sha256 == first_sha {
+            second_sha
+        } else {
+            first_sha
+        };
+        assert!(!svc.store.exists(&unused_sha).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 写等待_path_时_abort_不留悬空状态或无引用_blob() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (svc, meta, _dir) = 新建服务(MockUpstream::new(b"", calls)).await;
+        let repo = 建仓库(&meta, "abort", RepoType::Hosted, None).await;
+        let coords = 坐标("waiting/path.bin");
+        let sha = sha256(b"abort-content");
+        let svc = Arc::new(svc);
+        let held = svc.path_writes.acquire(&repo.id, &coords.path).await;
+
+        let writing_svc = svc.clone();
+        let writing_repo = repo.clone();
+        let writing_coords = coords.clone();
+        let writing = tokio::spawn(async move {
+            writing_svc
+                .put_hosted(
+                    &writing_repo,
+                    &RawFormat,
+                    &writing_coords,
+                    &b"abort-content"[..],
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blob_exists = svc.store.exists(&sha).await.unwrap();
+                let waiter_registered = svc
+                    .path_writes
+                    .locks
+                    .lock()
+                    .expect("同路径写登记锁未中毒")
+                    .values()
+                    .any(|lock| lock.strong_count() >= 4);
+                if blob_exists && waiter_registered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blob 落定后写入任务应等待 path 写权");
+
+        writing.abort();
+        assert!(writing.await.unwrap_err().is_cancelled());
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while svc.store.exists(&sha).await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("取消清理应有界删除无引用 blob");
+        assert!(meta
+            .get_artifact(&repo.id, &coords.path)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_顺序覆盖后清理旧_sha_blob() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (svc, meta, _dir) = 新建服务(MockUpstream::new(b"", calls)).await;
+        let repo = 建仓库(&meta, "raw", RepoType::Hosted, None).await;
+        let coords = 坐标("replace.bin");
+
+        let first = svc
+            .put_hosted(&repo, &RawFormat, &coords, &b"old"[..], None)
+            .await
+            .unwrap();
+        let second = svc
+            .put_hosted(&repo, &RawFormat, &coords, &b"new"[..], None)
+            .await
+            .unwrap();
+
+        assert!(!svc.store.exists(&first.record.sha256).await.unwrap());
+        assert!(svc.store.exists(&second.record.sha256).await.unwrap());
     }
 
     // ---------- §2.4 流式：超限 413 且不留半截 blob ----------
@@ -886,6 +1431,7 @@ mod tests {
             format!("{:x}", h.finalize())
         };
         assert_eq!(meta.count_artifacts_by_sha256(&sha).await.unwrap(), 0);
+        assert!(!svc.store.exists(&sha).await.unwrap());
     }
 
     // ---------- §2.3 代理缓存：单飞合并、回退不缓存损坏 ----------
@@ -983,7 +1529,7 @@ mod tests {
         let coords = 坐标("a/b.bin");
 
         let rec = svc
-            .ingest_cached(&repo, &RawFormat, &coords, &b"migrated"[..])
+            .ingest_cached(&repo, &RawFormat, &coords, &b"migrated"[..], None)
             .await
             .unwrap()
             .into_record();
@@ -1004,7 +1550,7 @@ mod tests {
         let (svc, meta, _dir) = 新建服务(MockUpstream::new(b"", calls)).await;
         let repo = 建仓库(&meta, "h", RepoType::Hosted, None).await;
         let err = svc
-            .ingest_cached(&repo, &RawFormat, &坐标("x"), &b"y"[..])
+            .ingest_cached(&repo, &RawFormat, &坐标("x"), &b"y"[..], None)
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidOperation(_)));
@@ -1018,13 +1564,13 @@ mod tests {
         let coords = 坐标("dup.bin");
 
         let r1 = svc
-            .ingest_cached(&repo, &RawFormat, &coords, &b"same"[..])
+            .ingest_cached(&repo, &RawFormat, &coords, &b"same"[..], None)
             .await
             .unwrap()
             .into_record();
         // 重入：同坐标同内容，应复用既有记录、索引仍只有一条
         let r2 = svc
-            .ingest_cached(&repo, &RawFormat, &coords, &b"same"[..])
+            .ingest_cached(&repo, &RawFormat, &coords, &b"same"[..], None)
             .await
             .unwrap()
             .into_record();
@@ -1046,14 +1592,14 @@ mod tests {
 
         // 首次：应返回 Written
         let outcome1 = svc
-            .ingest_cached(&repo, &RawFormat, &coords, &b"hello"[..])
+            .ingest_cached(&repo, &RawFormat, &coords, &b"hello"[..], None)
             .await
             .unwrap();
         assert!(outcome1.is_written(), "首次搬运应为 Written");
 
         // 重入（同内容）：应返回 AlreadyExists
         let outcome2 = svc
-            .ingest_cached(&repo, &RawFormat, &coords, &b"hello"[..])
+            .ingest_cached(&repo, &RawFormat, &coords, &b"hello"[..], None)
             .await
             .unwrap();
         assert!(
@@ -1103,7 +1649,13 @@ mod tests {
             created_at: "now".to_string(),
         };
         let err = svc
-            .ingest_cached(&ghost, &RawFormat, &坐标("p.bin"), &b"orphan-migrate"[..])
+            .ingest_cached(
+                &ghost,
+                &RawFormat,
+                &坐标("p.bin"),
+                &b"orphan-migrate"[..],
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::Meta(_)));
@@ -1353,6 +1905,82 @@ mod tests {
         // 再取应重新回源（计数 +1）
         svc.get(&repo, &RawFormat, &coords).await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2, "删缓存后应可重新拉取");
+    }
+
+    #[tokio::test]
+    async fn 跨仓库共享_store_clone_同_sha_pending_与_delete_交错保持_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open_in_memory().await.unwrap();
+        let store = PausingStore {
+            inner: LocalFsStore::new(dir.path().join("blobs")).await.unwrap(),
+            pause_once: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Notify::new()),
+        };
+        let first = Arc::new(ArtifactService::new(
+            store.clone(),
+            meta.clone(),
+            MockUpstream::new(b"", Arc::new(AtomicUsize::new(0))),
+        ));
+        let second = Arc::new(ArtifactService::new(
+            store.clone(),
+            meta.clone(),
+            MockUpstream::new(b"", Arc::new(AtomicUsize::new(0))),
+        ));
+        let first_repo = 建仓库(&meta, "first", RepoType::Hosted, None).await;
+        let second_repo = 建仓库(&meta, "second", RepoType::Hosted, None).await;
+        let content = b"cross-repo-shared";
+        let sha = sha256(content);
+        first
+            .put_hosted(&first_repo, &RawFormat, &坐标("a"), &content[..], None)
+            .await
+            .unwrap();
+
+        store.pause_once.store(true, Ordering::SeqCst);
+        let writing_service = second.clone();
+        let writing_repo = second_repo.clone();
+        let writing = tokio::spawn(async move {
+            writing_service
+                .put_hosted(
+                    &writing_repo,
+                    &RawFormat,
+                    &坐标("different/path"),
+                    &content[..],
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), store.entered.notified())
+            .await
+            .expect("第二个 writer 应持租约暂停");
+
+        let deleting_service = first.clone();
+        let deleting_repo = first_repo.clone();
+        let mut deleting =
+            tokio::spawn(async move { deleting_service.delete(&deleting_repo, &坐标("a")).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut deleting)
+                .await
+                .is_err(),
+            "删除应等待跨仓库 pending writer"
+        );
+        store.resume.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), writing)
+            .await
+            .expect("写入应有界完成")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), deleting)
+            .await
+            .expect("删除应有界完成")
+            .unwrap()
+            .unwrap();
+        assert!(store.exists(&sha).await.unwrap());
+        assert!(meta
+            .get_artifact(&second_repo.id, "different/path")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

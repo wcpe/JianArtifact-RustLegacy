@@ -526,9 +526,14 @@ export interface OnlineRepoMigrationOutcome {
   created: boolean;
   migrated_artifacts: number;
   /** 已存在且 sha256 一致，本次幂等跳过的制品数。 */
-  skipped_existing_artifacts?: number;
+  skipped_existing_artifacts: number;
   /** 失败跳过的制品数。 */
   skipped_artifacts: number;
+  total_bytes: number;
+  done_bytes: number;
+  migrated_bytes: number;
+  skipped_bytes: number;
+  duration_ms: number;
 }
 
 /**
@@ -580,23 +585,25 @@ export interface OnlinePullJob {
   done_assets: number;
   migrated: number;
   /** 已存在且 sha256 一致，本次幂等跳过的资产数。 */
-  skipped_existing?: number;
+  skipped_existing: number;
   /** 失败跳过的资产数。 */
   skipped: number;
   /** 字节级总量（新后端提供；旧快照缺省时前端退回资产数进度）。 */
-  total_bytes?: number;
+  total_bytes: number;
   /** 已处理字节数。 */
-  done_bytes?: number;
+  done_bytes: number;
   /** 已成功迁移字节数。 */
-  migrated_bytes?: number;
+  migrated_bytes: number;
   /** 已跳过字节数。 */
-  skipped_bytes?: number;
+  skipped_bytes: number;
   current_repo: string | null;
   current_path: string | null;
   /** 是否处于暂停态（FR-91）：暂停期间为真，继续后置假。 */
   paused: boolean;
   repos: OnlineRepoMigrationOutcome[];
   skipped_repos: string[];
+  asset_failures: MigrationAssetFailureDto[];
+  omitted_asset_failures: number;
   error: string | null;
   /**
    * 离线 blob store 预览枚举结果（FR-124）：仅离线预览任务在 `phase === 'done'` 时填充；
@@ -1016,6 +1023,7 @@ export interface MigrationTaskDto {
   done_bytes: number;
   migrated_bytes: number;
   skipped_bytes: number;
+  omitted_asset_failures: number;
   error: string | null;
   started_at: string;
   updated_at: string;
@@ -1035,12 +1043,24 @@ export interface MigrationRepoReportDto {
   migrated_artifacts: number;
   skipped_existing_artifacts: number;
   skipped_artifacts: number;
+  total_bytes: number;
+  done_bytes: number;
+  migrated_bytes: number;
+  skipped_bytes: number;
+  duration_ms: number;
 }
 
 /**
  * 迁移历史任务详情（GET /migrate/tasks/{id}）：任务记录展平 + 分仓库报告。
  * 严格对齐后端 MigrationTaskDetailDto（task 字段 flatten）。
  */
+export interface MigrationAssetFailureDto {
+  source_repo: string;
+  asset: string;
+  reason: string;
+}
+
 export interface MigrationTaskDetailDto extends MigrationTaskDto {
   repos: MigrationRepoReportDto[];
+  asset_failures: MigrationAssetFailureDto[];
 }

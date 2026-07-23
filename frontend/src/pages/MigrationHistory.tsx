@@ -25,7 +25,7 @@ import type {
   MigrationTaskKind,
   MigrationTaskDetailDto,
 } from '../api/types';
-import { errorMessage } from '../lib/format';
+import { errorMessage, formatBytes, formatDuration } from '../lib/format';
 import { ErrorAlert } from '../components/ErrorAlert';
 
 /** 历史任务类别 → 中文标签。 */
@@ -246,6 +246,18 @@ function HistoryDetail({
       <Text fw={600} size="sm">
         {t('history.detailTitle')}
       </Text>
+      <Group gap="md">
+        <Text size="sm">
+          {t('history.summaryTotal', { value: formatBytes(detail.total_bytes) })}
+        </Text>
+        <Text size="sm">{t('history.summaryDone', { value: formatBytes(detail.done_bytes) })}</Text>
+        <Text size="sm">
+          {t('history.summaryMigrated', { value: formatBytes(detail.migrated_bytes) })}
+        </Text>
+        <Text size="sm">
+          {t('history.summarySkipped', { value: formatBytes(detail.skipped_bytes) })}
+        </Text>
+      </Group>
       {detail.repos.length === 0 ? (
         <Text c="dimmed" size="sm">
           {t('report.noRepos')}
@@ -262,6 +274,11 @@ function HistoryDetail({
                 <Table.Th ta="right">{t('job.thMigrated')}</Table.Th>
                 <Table.Th ta="right">{t('job.thSkippedExisting')}</Table.Th>
                 <Table.Th ta="right">{t('job.thSkippedFailed')}</Table.Th>
+                <Table.Th ta="right">{t('history.thTotalBytes')}</Table.Th>
+                <Table.Th ta="right">{t('history.thDoneBytes')}</Table.Th>
+                <Table.Th ta="right">{t('history.thMigratedBytes')}</Table.Th>
+                <Table.Th ta="right">{t('history.thSkippedBytes')}</Table.Th>
+                <Table.Th ta="right">{t('history.thDuration')}</Table.Th>
               </Table.Tr>
             </Table.Thead>
             <Table.Tbody>
@@ -278,11 +295,52 @@ function HistoryDetail({
                   <Table.Td ta="right">{r.migrated_artifacts}</Table.Td>
                   <Table.Td ta="right">{r.skipped_existing_artifacts}</Table.Td>
                   <Table.Td ta="right">{r.skipped_artifacts}</Table.Td>
+                  <Table.Td ta="right">{formatBytes(r.total_bytes)}</Table.Td>
+                  <Table.Td ta="right">{formatBytes(r.done_bytes)}</Table.Td>
+                  <Table.Td ta="right">{formatBytes(r.migrated_bytes)}</Table.Td>
+                  <Table.Td ta="right">{formatBytes(r.skipped_bytes)}</Table.Td>
+                  <Table.Td ta="right">{formatDuration(r.duration_ms)}</Table.Td>
                 </Table.Tr>
               ))}
             </Table.Tbody>
           </Table>
         </Table.ScrollContainer>
+      )}
+      <Stack gap="xs" mt="sm">
+        <Text fw={600} size="sm">
+          {t('history.failureTitle')}
+        </Text>
+        {detail.asset_failures.length === 0 ? (
+          <Text c="dimmed" size="sm">
+            {t('history.failureEmpty')}
+          </Text>
+        ) : (
+          <Table.ScrollContainer minWidth={560}>
+            <Table striped>
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>{t('history.thFailureRepo')}</Table.Th>
+                  <Table.Th>{t('history.thFailureAsset')}</Table.Th>
+                  <Table.Th>{t('history.thFailureReason')}</Table.Th>
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {detail.asset_failures.map((failure, index) => (
+                  <Table.Tr key={`${failure.source_repo}-${index}`}>
+                    <Table.Td>{failure.source_repo}</Table.Td>
+                    <Table.Td>{failure.asset}</Table.Td>
+                    <Table.Td>{failure.reason}</Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          </Table.ScrollContainer>
+        )}
+      </Stack>
+      {detail.omitted_asset_failures > 0 && (
+        <Text c="orange" size="sm">
+          {t('history.failuresOmitted', { count: detail.omitted_asset_failures })}
+        </Text>
       )}
     </Stack>
   );

@@ -21,6 +21,7 @@ config blob 与各 layer blob（均按 digest 内容寻址）构成一张图，t
   （校验 digest）→ 解析 manifest 图取出 config + 各 layer 的 digest → 逐个拉取 blob（按 digest 内容
   寻址、校验 sha256）→ 按本系统 docker 布局（`{image}/blobs/sha256:...`、`{image}/manifests/sha256:...`、
   `{image}/tags/{tag}`）**blob 先落盘校验再写索引、失败回滚**落库 → 建 / 复用目标 docker hosted 仓库。
+- `_catalog` 与 `/tags/list` 必须完整跟随 Registry v2 `Link: <...>; rel="next"` 分页；续页 URL 作为服务端游标整体跟随，兼容 Nexus 的 `last` 参数，不得只搬首屏。分页只允许同源且仍在目标仓库 v2 前缀内，重复 URL / 循环 / 超过 10,000 页必须失败，跨页重复 image/tag 去重并保留首次顺序。
 - 支持 manifest list / OCI image index（多架构）：index 引用的子 manifest 按 digest 递归搬运，index 自身
   按 digest + tag 落库。
 - 幂等重跑：目标已存在且 digest 一致的 blob / manifest 跳过（复用既有内容寻址去重），进度区分「新搬 vs 跳过」。
@@ -70,7 +71,7 @@ config blob 与各 layer blob（均按 digest 内容寻址）构成一张图，t
 - [ ] `DockerRegistryClient` trait + `parse_manifest_refs` 纯函数 + 单测（含 schema2 / OCI / manifest list / 缺字段）。
 - [ ] `DockerRegistry::ingest_blob` + 单测（幂等 / digest 不符回滚 / 超限）。
 - [ ] `online_docker.rs` 编排 + 单测（枚举 → 图遍历 → 落库 → 进度 → 取消）。
-- [ ] `HttpNexusClient` 实现 `DockerRegistryClient`（registry v2 URL 拼接 + Basic Auth + 流式）。
+- [x] `HttpNexusClient` 实现 `DockerRegistryClient`（registry v2 URL 拼接 + Basic Auth + 流式），并完整处理 catalog/tags 的 `Link rel=next` 分页、同源前缀校验、去重与循环上限。
 - [ ] 分派接入 `migrate_online_with_progress` + API 传 `state.docker`。
 - [ ] 文档同步：PRD 状态、ARCHITECTURE（若机制变化）、API（端点无新增、说明覆盖格式扩到 docker）、CHANGELOG。
 
@@ -84,6 +85,7 @@ config blob 与各 layer blob（均按 digest 内容寻址）构成一张图，t
   - tag → manifest 映射正确；manifest list 递归搬运子 manifest。
   - 幂等重跑：二次跑同源 `migrated=0`、增量跳过=N。
   - 取消 / 暂停在 asset 边界生效（复用 FR-91）。
+  - catalog 与 tags 至少两页时，后续页的 image/tag 也进入搬运；`last` 编码原样跟随，坏 Link、跨域、越前缀、循环和页数上限均有自动化测试。
 - **真机验收（待真机验）**：对真实 Nexus docker hosted 仓库在线迁移后，配置本系统为 registry，
   `docker pull {本系统}/{目标仓库}/{image}:{tag}` 成功、拉下镜像各层 digest 与源一致。用 mock 覆盖 OCI
   搬运逻辑，真机维度标「待真机验」，需用户提供真实 Nexus + docker 环境确认。

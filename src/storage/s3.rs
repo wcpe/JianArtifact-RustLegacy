@@ -13,7 +13,10 @@ use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::Length;
 use tokio::io::AsyncRead;
 
-use super::{content_key, BlobDigests, BlobReader, BlobStore, StorageError};
+use super::{
+    content_key, BlobDigests, BlobLifecycles, BlobReader, BlobStore, BlobWriteLease, StorageError,
+    TempFileGuard,
+};
 
 /// 分段上传的分片大小（8 MiB）：大于该阈值的对象走 multipart，逐段从临时文件读出（ADR-0014 §5）。
 const MULTIPART_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
@@ -60,6 +63,8 @@ pub struct S3Store {
     prefix: String,
     /// 本地临时文件中转目录。
     tmp_dir: PathBuf,
+    /// 克隆间共享的 sha256 生命周期协调器。
+    lifecycles: BlobLifecycles,
 }
 
 impl S3Store {
@@ -96,6 +101,7 @@ impl S3Store {
             bucket: cfg.bucket,
             prefix: cfg.prefix,
             tmp_dir: cfg.tmp_dir,
+            lifecycles: BlobLifecycles::default(),
         })
     }
 
@@ -254,28 +260,30 @@ impl S3Store {
 }
 
 impl BlobStore for S3Store {
-    async fn put<R>(&self, reader: R) -> Result<BlobDigests, StorageError>
+    async fn put_pending<R>(&self, reader: R) -> Result<(BlobDigests, BlobWriteLease), StorageError>
     where
         R: AsyncRead + Unpin + Send,
     {
         // ① 先把入站流写本地临时文件并边写边算四种摘要（失败已在内部清理临时文件）
         let tmp_path = self.tmp_dir.join(uuid::Uuid::new_v4().to_string());
         let digests = super::stream_to_temp_file(reader, &tmp_path).await?;
+        let mut cleanup = TempFileGuard::new(tmp_path.clone());
+        // ② 算出 sha256 后先登记 writer，再检查并上传最终对象。
+        let lease = self.lifecycles.acquire_writer(&digests.sha256).await;
         let key = self.object_key(&digests.sha256);
 
-        // ② 幂等：同 sha256 即同内容，已存在则跳过上传并删临时文件
         let result = async {
             if self.head_exists(&key).await? {
                 return Ok(());
             }
-            // ③ 内容寻址流式上传到 S3（小对象单次 PUT / 大对象 multipart）
             self.upload_temp_file(&tmp_path, &key, digests.size).await
         }
         .await;
 
         // 无论成功与否都删本地临时文件，不留中转垃圾
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        result.map(|()| digests)
+        cleanup.disarm();
+        result.map(|()| (digests, lease))
     }
 
     async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError> {
@@ -303,17 +311,34 @@ impl BlobStore for S3Store {
         Ok(Box::new(reader))
     }
 
-    async fn delete(&self, sha256: &str) -> Result<(), StorageError> {
-        let key = self.object_key(sha256);
-        // S3 删除对不存在的对象亦返回成功，天然幂等
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .map_err(|e| StorageError::Backend(e.into_service_error().to_string()))?;
-        Ok(())
+    fn delete_if<F, Fut>(
+        &self,
+        sha256: &str,
+        should_delete: F,
+    ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let store = self.clone();
+        let sha256 = sha256.to_string();
+        async move {
+            let _cleanup = store.lifecycles.acquire_cleanup(&sha256).await;
+            if !should_delete().await {
+                return Ok(false);
+            }
+            let key = store.object_key(&sha256);
+            // S3 删除对不存在的对象亦返回成功，天然幂等
+            store
+                .client
+                .delete_object()
+                .bucket(&store.bucket)
+                .key(&key)
+                .send()
+                .await
+                .map_err(|e| StorageError::Backend(e.into_service_error().to_string()))?;
+            Ok(true)
+        }
     }
 
     async fn exists(&self, sha256: &str) -> Result<bool, StorageError> {
@@ -340,6 +365,7 @@ mod tests {
             bucket: "b".to_string(),
             prefix: prefix.to_string(),
             tmp_dir: std::env::temp_dir(),
+            lifecycles: BlobLifecycles::default(),
         }
     }
 

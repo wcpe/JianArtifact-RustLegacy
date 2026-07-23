@@ -3,7 +3,9 @@
 //! 写入语义：先写临时文件并边写边算四种摘要，校验通过后再原子落定到以 sha256
 //! 寻址的最终路径；任何中断都不会留下半截正式 blob（FR-69 多校验和、流式处理）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, Weak};
 
 use digest::Digest;
 use md5::Md5;
@@ -37,6 +39,88 @@ pub struct BlobDigests {
     pub sha512: String,
 }
 
+/// 已落定 blob 在写索引前持有的写入租约。
+///
+/// 同一 sha256 的清理会等待全部租约释放；清理等待期间的新写入也会被阻塞，避免删除与落定交错。
+pub struct BlobWriteLease {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+    _registration: BlobLifecycleRegistration,
+}
+
+/// cleanup 排他锁与生命周期登记绑定的租约。
+struct BlobCleanupLease {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    _registration: BlobLifecycleRegistration,
+}
+
+/// 单个 sha256 的协调实例，登记与底层锁共享同一 allocation。
+struct BlobLifecycle {
+    lock: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// 一次 sha256 生命周期实例在共享表中的登记。
+struct BlobLifecycleRegistration {
+    sha256: String,
+    lifecycle: Arc<BlobLifecycle>,
+    entries: Arc<Mutex<HashMap<String, Weak<BlobLifecycle>>>>,
+}
+
+impl Drop for BlobLifecycleRegistration {
+    fn drop(&mut self) {
+        let mut entries = self.entries.lock().expect("blob 生命周期表锁未中毒");
+        let current = entries.get(&self.sha256);
+        let same = current.is_some_and(|weak| weak.ptr_eq(&Arc::downgrade(&self.lifecycle)));
+        if same && Arc::strong_count(&self.lifecycle) == 1 {
+            entries.remove(&self.sha256);
+        }
+    }
+}
+
+/// 各存储克隆之间共享的 sha256 生命周期协调表。
+#[derive(Debug, Clone, Default)]
+struct BlobLifecycles {
+    entries: Arc<Mutex<HashMap<String, Weak<BlobLifecycle>>>>,
+}
+
+impl BlobLifecycles {
+    async fn acquire_writer(&self, sha256: &str) -> BlobWriteLease {
+        let registration = self.register(sha256);
+        let guard = registration.lifecycle.lock.clone().read_owned().await;
+        BlobWriteLease {
+            _guard: guard,
+            _registration: registration,
+        }
+    }
+
+    async fn acquire_cleanup(&self, sha256: &str) -> BlobCleanupLease {
+        let registration = self.register(sha256);
+        let guard = registration.lifecycle.lock.clone().write_owned().await;
+        BlobCleanupLease {
+            _guard: guard,
+            _registration: registration,
+        }
+    }
+
+    fn register(&self, sha256: &str) -> BlobLifecycleRegistration {
+        let mut entries = self.entries.lock().expect("blob 生命周期表锁未中毒");
+        let lifecycle = entries
+            .get(sha256)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let lifecycle = Arc::new(BlobLifecycle {
+                    lock: Arc::new(tokio::sync::RwLock::new(())),
+                });
+                entries.insert(sha256.to_string(), Arc::downgrade(&lifecycle));
+                lifecycle
+            });
+        BlobLifecycleRegistration {
+            sha256: sha256.to_string(),
+            lifecycle,
+            entries: self.entries.clone(),
+        }
+    }
+}
+
 /// 存储层错误。
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -54,18 +138,45 @@ pub enum StorageError {
 
 /// blob 存储抽象。本地文件系统为默认实现，S3 兼容对象存储为可选 opt-in 实现（ADR-0014）。
 #[allow(async_fn_in_trait)]
-pub trait BlobStore {
-    /// 流式写入：从 `reader` 读取全部内容，边写边算四种摘要，
-    /// 校验后落定为以 sha256 寻址的 blob，返回摘要信息。
-    async fn put<R>(&self, reader: R) -> Result<BlobDigests, StorageError>
+pub trait BlobStore: Clone + Send + Sync + 'static {
+    /// 流式写入并保留写入租约，供随后建立索引的调用方防止并发清理。
+    async fn put_pending<R>(
+        &self,
+        reader: R,
+    ) -> Result<(BlobDigests, BlobWriteLease), StorageError>
     where
         R: AsyncRead + Unpin + Send;
+
+    /// 兼容写入：落定后立即释放 pending 租约。
+    async fn put<R>(&self, reader: R) -> Result<BlobDigests, StorageError>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let (digests, lease) = self.put_pending(reader).await?;
+        drop(lease);
+        Ok(digests)
+    }
 
     /// 按 sha256 流式打开 blob 读取句柄；不存在时返回 NotFound。
     async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError>;
 
+    /// 在同一 sha256 的 cleanup 排他期内复查条件并删除。
+    ///
+    /// 排他期会等待既有 writer 并阻止新 writer；条件返回 false 时不删除。
+    fn delete_if<F, Fut>(
+        &self,
+        sha256: &str,
+        should_delete: F,
+    ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = bool> + Send;
+
     /// 按 sha256 删除 blob；不存在时视为成功（幂等）。
-    async fn delete(&self, sha256: &str) -> Result<(), StorageError>;
+    async fn delete(&self, sha256: &str) -> Result<(), StorageError> {
+        self.delete_if(sha256, || async { true }).await?;
+        Ok(())
+    }
 
     /// 判断 blob 是否存在。
     async fn exists(&self, sha256: &str) -> Result<bool, StorageError>;
@@ -82,11 +193,41 @@ pub fn content_key(sha256: &str) -> String {
 /// 一次读取的缓冲区大小（64 KiB），保证大文件不整体载入内存。
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 
+/// 临时文件析构守卫：写入 future 被取消时在当前 runtime 异步清理半截文件。
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = tokio::fs::remove_file(path).await;
+            });
+        }
+    }
+}
+
 /// 本地文件系统 blob 存储。
 #[derive(Debug, Clone)]
 pub struct LocalFsStore {
     /// blob 存储根目录。
     root: PathBuf,
+    /// 克隆间共享的 sha256 生命周期协调器。
+    lifecycles: BlobLifecycles,
 }
 
 impl LocalFsStore {
@@ -95,7 +236,10 @@ impl LocalFsStore {
         let root = root.into();
         tokio::fs::create_dir_all(&root).await?;
         tokio::fs::create_dir_all(root.join("tmp")).await?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            lifecycles: BlobLifecycles::default(),
+        })
     }
 
     /// 计算 blob 的最终落定路径：按 sha256 前两位分桶，避免单目录文件过多。
@@ -121,6 +265,7 @@ async fn stream_to_temp_file<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
+    let mut cleanup = TempFileGuard::new(tmp_path.to_path_buf());
     let mut tmp_file = tokio::fs::File::create(tmp_path).await?;
 
     let mut sha256 = Sha256::new();
@@ -154,8 +299,10 @@ where
     if let Err(e) = write_result {
         // 清理半截临时文件，不留垃圾
         let _ = tokio::fs::remove_file(tmp_path).await;
+        cleanup.disarm();
         return Err(StorageError::Io(e));
     }
+    cleanup.disarm();
 
     Ok(BlobDigests {
         size,
@@ -167,7 +314,7 @@ where
 }
 
 impl BlobStore for LocalFsStore {
-    async fn put<R>(&self, reader: R) -> Result<BlobDigests, StorageError>
+    async fn put_pending<R>(&self, reader: R) -> Result<(BlobDigests, BlobWriteLease), StorageError>
     where
         R: AsyncRead + Unpin + Send,
     {
@@ -175,20 +322,31 @@ impl BlobStore for LocalFsStore {
         let tmp_path = self.tmp_dir().join(uuid::Uuid::new_v4().to_string());
         // 流式写临时文件并算四种摘要（失败已在内部清理临时文件）
         let digests = stream_to_temp_file(reader, &tmp_path).await?;
+        let mut cleanup = TempFileGuard::new(tmp_path.clone());
+        // 算出 sha256 后先登记 writer，再检查并落定最终文件。
+        let lease = self.lifecycles.acquire_writer(&digests.sha256).await;
 
-        // 原子落定：先建分桶目录，再 rename 临时文件到最终路径
         let final_path = self.blob_path(&digests.sha256);
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let finalize = async {
+            if let Some(parent) = final_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            if tokio::fs::try_exists(&final_path).await? {
+                tokio::fs::remove_file(&tmp_path).await?;
+            } else {
+                tokio::fs::rename(&tmp_path, &final_path).await?;
+            }
+            Ok::<(), std::io::Error>(())
         }
-        // 若内容已存在（同 sha256），直接复用并删除临时文件，幂等
-        if tokio::fs::try_exists(&final_path).await? {
+        .await;
+        if let Err(error) = finalize {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-        } else {
-            tokio::fs::rename(&tmp_path, &final_path).await?;
+            cleanup.disarm();
+            return Err(StorageError::Io(error));
         }
+        cleanup.disarm();
 
-        Ok(digests)
+        Ok((digests, lease))
     }
 
     async fn get(&self, sha256: &str) -> Result<BlobReader, StorageError> {
@@ -203,13 +361,30 @@ impl BlobStore for LocalFsStore {
         }
     }
 
-    async fn delete(&self, sha256: &str) -> Result<(), StorageError> {
-        let path = self.blob_path(sha256);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            // 不存在视为成功，保证删除幂等
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StorageError::Io(e)),
+    fn delete_if<F, Fut>(
+        &self,
+        sha256: &str,
+        should_delete: F,
+    ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let store = self.clone();
+        let sha256 = sha256.to_string();
+        async move {
+            // cleanup 独占同一 sha256 生命周期：等待既有 writer，并阻止新 writer 进入最终落定。
+            let _cleanup = store.lifecycles.acquire_cleanup(&sha256).await;
+            if !should_delete().await {
+                return Ok(false);
+            }
+            let path = store.blob_path(&sha256);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(true),
+                // 不存在视为已完成清理，保证删除幂等
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(e) => Err(StorageError::Io(e)),
+            }
         }
     }
 
@@ -285,14 +460,14 @@ impl BlobBackend {
 }
 
 impl BlobStore for BlobBackend {
-    async fn put<R>(&self, reader: R) -> Result<BlobDigests, StorageError>
+    async fn put_pending<R>(&self, reader: R) -> Result<(BlobDigests, BlobWriteLease), StorageError>
     where
         R: AsyncRead + Unpin + Send,
     {
         match self {
-            BlobBackend::Fs(s) => s.put(reader).await,
+            BlobBackend::Fs(s) => s.put_pending(reader).await,
             #[cfg(feature = "s3")]
-            BlobBackend::S3(s) => s.put(reader).await,
+            BlobBackend::S3(s) => s.put_pending(reader).await,
         }
     }
 
@@ -304,11 +479,23 @@ impl BlobStore for BlobBackend {
         }
     }
 
-    async fn delete(&self, sha256: &str) -> Result<(), StorageError> {
-        match self {
-            BlobBackend::Fs(s) => s.delete(sha256).await,
-            #[cfg(feature = "s3")]
-            BlobBackend::S3(s) => s.delete(sha256).await,
+    fn delete_if<F, Fut>(
+        &self,
+        sha256: &str,
+        should_delete: F,
+    ) -> impl std::future::Future<Output = Result<bool, StorageError>> + Send
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let store = self.clone();
+        let sha256 = sha256.to_string();
+        async move {
+            match store {
+                BlobBackend::Fs(s) => s.delete_if(&sha256, should_delete).await,
+                #[cfg(feature = "s3")]
+                BlobBackend::S3(s) => s.delete_if(&sha256, should_delete).await,
+            }
         }
     }
 
@@ -335,6 +522,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
     /// 空内容的四种摘要标准向量。
@@ -424,6 +612,112 @@ mod tests {
         let d2 = store.put(&b"same"[..]).await.unwrap();
         assert_eq!(d1, d2);
         assert!(store.exists(&d1.sha256).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 克隆间_pending_writer_阻塞_delete_直至租约释放() {
+        let (store, _dir) = 新建临时存储().await;
+        let (digests, lease) = store.put_pending(&b"shared"[..]).await.unwrap();
+        let deleting_store = store.clone();
+        let sha256 = digests.sha256.clone();
+        let mut deleting = tokio::spawn(async move { deleting_store.delete(&sha256).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut deleting)
+                .await
+                .is_err(),
+            "pending writer 未释放前 delete 不应完成"
+        );
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(2), deleting)
+            .await
+            .expect("释放 writer 后 delete 应有界完成")
+            .unwrap()
+            .unwrap();
+        assert!(!store.exists(&digests.sha256).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_排他期间阻止新_writer_删除后可重新落定() {
+        let (store, _dir) = 新建临时存储().await;
+        let digests = store.put(&b"shared"[..]).await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let deleting_store = store.clone();
+        let deleting_sha = digests.sha256.clone();
+        let deleting = tokio::spawn(async move {
+            deleting_store
+                .delete_if(&deleting_sha, || async move {
+                    let _ = entered_tx.send(());
+                    let _ = resume_rx.await;
+                    true
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .expect("cleanup 应进入排他期")
+            .unwrap();
+
+        let writing_store = store.clone();
+        let mut writing =
+            tokio::spawn(async move { writing_store.put_pending(&b"shared"[..]).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writing)
+                .await
+                .is_err(),
+            "cleanup 排他期间新 writer 不应落定"
+        );
+        resume_tx.send(()).unwrap();
+        deleting.await.unwrap().unwrap();
+        let (_, lease) = tokio::time::timeout(Duration::from_secs(2), writing)
+            .await
+            .expect("cleanup 释放后 writer 应有界完成")
+            .unwrap()
+            .unwrap();
+        drop(lease);
+        assert!(store.exists(&digests.sha256).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn 生命周期表在大量不同_sha_租约释放后为空() {
+        let lifecycles = BlobLifecycles::default();
+        for index in 0..1_000 {
+            let sha256 = format!("writer-{index:04}");
+            drop(lifecycles.acquire_writer(&sha256).await);
+        }
+        for index in 0..1_000 {
+            let sha256 = format!("cleanup-{index:04}");
+            drop(lifecycles.acquire_cleanup(&sha256).await);
+        }
+        assert!(lifecycles
+            .entries
+            .lock()
+            .expect("blob 生命周期表锁未中毒")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn 生命周期表仅在同一实例最后登记释放后移除_key() {
+        let lifecycles = BlobLifecycles::default();
+        let first = lifecycles.register("shared");
+        let second = lifecycles.register("shared");
+        assert!(Arc::ptr_eq(&first.lifecycle, &second.lifecycle));
+        drop(first);
+        assert_eq!(
+            lifecycles
+                .entries
+                .lock()
+                .expect("blob 生命周期表锁未中毒")
+                .len(),
+            1
+        );
+        drop(second);
+        assert!(lifecycles
+            .entries
+            .lock()
+            .expect("blob 生命周期表锁未中毒")
+            .is_empty());
     }
 
     #[test]

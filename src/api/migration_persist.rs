@@ -11,15 +11,22 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::meta::{
-    MetaStore, MigrationProgressSnapshot, MigrationRepoReport, MigrationTaskKind,
-    MigrationTaskState, NewMigrationTask,
+    MetaStore, MigrationAssetFailureReport, MigrationProgressSnapshot, MigrationRepoReport,
+    MigrationTaskKind, MigrationTaskState, NewMigrationTask,
 };
-use crate::migrate::{OnlinePullPhase, OnlinePullProgress};
+use crate::migrate::{
+    saturating_millis, u64_to_i64_saturating, OnlinePullPhase, OnlinePullProgress,
+};
 
 use super::TaskState;
 
 /// 运行中进度的最小落库间隔（毫秒）：距上次落库不足此值的进度更新被节流跳过，避免逐 asset 写放大。
 const MIN_PERSIST_INTERVAL_MS: i64 = 2_000;
+
+/// 把平台计数饱和转换为 SQLite `i64`。
+fn usize_to_i64_saturating(value: usize) -> i64 {
+    u64_to_i64_saturating(u64::try_from(value).unwrap_or(u64::MAX))
+}
 
 /// 单个迁移任务的节流落库协调器：绑定一个 `task_id`，随后台搬运任务共享。
 ///
@@ -36,7 +43,7 @@ pub struct MigrationPersister {
 fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| u64_to_i64_saturating(saturating_millis(d.as_millis())))
         .unwrap_or(0)
 }
 
@@ -56,15 +63,15 @@ fn phase_str(phase: OnlinePullPhase) -> &'static str {
 fn to_progress_snapshot(p: &OnlinePullProgress) -> MigrationProgressSnapshot {
     MigrationProgressSnapshot {
         phase: phase_str(p.phase).to_string(),
-        total_assets: p.total_assets as i64,
-        done_assets: p.done_assets as i64,
-        migrated: p.migrated as i64,
-        skipped_existing: p.skipped_existing as i64,
-        skipped: p.skipped as i64,
-        total_bytes: p.total_bytes as i64,
-        done_bytes: p.done_bytes as i64,
-        migrated_bytes: p.migrated_bytes as i64,
-        skipped_bytes: p.skipped_bytes as i64,
+        total_assets: usize_to_i64_saturating(p.total_assets),
+        done_assets: usize_to_i64_saturating(p.done_assets),
+        migrated: usize_to_i64_saturating(p.migrated),
+        skipped_existing: usize_to_i64_saturating(p.skipped_existing),
+        skipped: usize_to_i64_saturating(p.skipped),
+        total_bytes: u64_to_i64_saturating(p.total_bytes),
+        done_bytes: u64_to_i64_saturating(p.done_bytes),
+        migrated_bytes: u64_to_i64_saturating(p.migrated_bytes),
+        skipped_bytes: u64_to_i64_saturating(p.skipped_bytes),
     }
 }
 
@@ -77,9 +84,26 @@ fn to_repo_reports(p: &OnlinePullProgress) -> Vec<MigrationRepoReport> {
             target_repo: r.target_repo.clone(),
             format: r.format.clone(),
             created: r.created,
-            migrated_artifacts: r.migrated_artifacts as i64,
-            skipped_existing_artifacts: r.skipped_existing_artifacts as i64,
-            skipped_artifacts: r.skipped_artifacts as i64,
+            migrated_artifacts: usize_to_i64_saturating(r.migrated_artifacts),
+            skipped_existing_artifacts: usize_to_i64_saturating(r.skipped_existing_artifacts),
+            skipped_artifacts: usize_to_i64_saturating(r.skipped_artifacts),
+            total_bytes: u64_to_i64_saturating(r.total_bytes),
+            done_bytes: u64_to_i64_saturating(r.done_bytes),
+            migrated_bytes: u64_to_i64_saturating(r.migrated_bytes),
+            skipped_bytes: u64_to_i64_saturating(r.skipped_bytes),
+            duration_ms: u64_to_i64_saturating(r.duration_ms),
+        })
+        .collect()
+}
+
+/// 把进度中的失败资产明细映射为终态持久化模型。
+fn to_asset_failures(p: &OnlinePullProgress) -> Vec<MigrationAssetFailureReport> {
+    p.asset_failures
+        .iter()
+        .map(|failure| MigrationAssetFailureReport {
+            source_repo: failure.source_repo.clone(),
+            asset: failure.asset.clone(),
+            reason: failure.reason.clone(),
         })
         .collect()
 }
@@ -163,10 +187,20 @@ impl MigrationPersister {
         };
         let progress = to_progress_snapshot(snapshot);
         let repos = to_repo_reports(snapshot);
+        let failures = to_asset_failures(snapshot);
+        let omitted = usize_to_i64_saturating(snapshot.omitted_asset_failures);
         let error = snapshot.error.as_deref();
         if let Err(e) = self
             .meta
-            .finish_migration_task(&self.task_id, state, &progress, &repos, error)
+            .finish_migration_task(
+                &self.task_id,
+                state,
+                &progress,
+                &repos,
+                &failures,
+                omitted,
+                error,
+            )
             .await
         {
             tracing::warn!(任务 = %self.task_id, 原因 = %e, "迁移任务终态落库失败，历史报告将缺失");
@@ -221,6 +255,7 @@ mod tests {
                 migrated_artifacts: 4,
                 skipped_existing_artifacts: 2,
                 skipped_artifacts: 0,
+                ..Default::default()
             }],
             ..Default::default()
         }

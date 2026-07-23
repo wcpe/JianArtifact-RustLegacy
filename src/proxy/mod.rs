@@ -45,20 +45,66 @@ pub trait Upstream: Send + Sync {
 /// 单飞合并器：把同一 key 的并发拉取合并为一次实际执行。
 ///
 /// 内部用 `Mutex<HashMap<Key, Weak<Shared>>>`——临界区只做"找到 / 建立归属"这一步内存判定，
-/// 实际的拉取 + 落盘 + 写索引在锁外、由唯一的 leader 跑一次，followers 等其结果。
-/// 用 `Weak` 持有 in-flight 项：所有等待者 drop 后自动从表中过期，无需手动清理竞态。
+/// 实际的拉取 + 落盘 + 写索引在锁外、由唯一的主执行者跑一次，其余请求等待结果。
+/// 主执行者提前退出时由析构守卫发布错误并移除登记，正常完成则先发布结果再移除登记。
 #[derive(Default)]
 pub struct SingleFlight<T> {
     /// in-flight 表：key → 共享单元的弱引用。
     in_flight: Mutex<HashMap<String, Weak<Shared<T>>>>,
+    #[cfg(test)]
+    /// 测试专用：在移除登记后暂停，以稳定检查发布顺序。
+    after_remove: Mutex<Option<Arc<RemoveHook>>>,
+}
+
+#[cfg(test)]
+struct RemoveHook {
+    removed: std::sync::Barrier,
+    resume: std::sync::Barrier,
 }
 
 /// 单飞共享单元：承载一次执行的最终结果（成功值或错误信息）。
 struct Shared<T> {
-    /// 仅执行一次的结果槽：leader 写入，followers 读取。
+    /// 仅执行一次的结果槽：主执行者写入，其余请求读取。
     cell: OnceCell<Result<T, String>>,
-    /// 结果就绪通知：leader 写入 `cell` 后唤醒所有等待的 follower。
+    /// 结果就绪通知：主执行者写入 `cell` 后唤醒所有等待请求。
     ready: Notify,
+}
+
+const LEADER_DROPPED_ERROR: &str = "单飞 leader 未正常完成";
+
+/// 主执行者异常退出守卫：取消或 panic 时发布错误、唤醒等待者并清理登记。
+struct LeaderGuard<'a, T: Clone + Send + Sync + 'static> {
+    single_flight: &'a SingleFlight<T>,
+    key: &'a str,
+    shared: &'a Arc<Shared<T>>,
+    armed: bool,
+}
+
+impl<'a, T: Clone + Send + Sync + 'static> LeaderGuard<'a, T> {
+    fn new(single_flight: &'a SingleFlight<T>, key: &'a str, shared: &'a Arc<Shared<T>>) -> Self {
+        Self {
+            single_flight,
+            key,
+            shared,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) {
+        self.armed = false;
+        self.single_flight.remove(self.key, &self.shared);
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for LeaderGuard<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.shared.cell.set(Err(LEADER_DROPPED_ERROR.to_string()));
+        self.shared.ready.notify_waiters();
+        self.single_flight.remove(self.key, &self.shared);
+    }
 }
 
 impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
@@ -66,6 +112,8 @@ impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
     pub fn new() -> Self {
         Self {
             in_flight: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            after_remove: Mutex::new(None),
         }
     }
 
@@ -97,13 +145,13 @@ impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
         };
 
         if is_leader {
+            let guard = LeaderGuard::new(self, key, &shared);
             // ② 锁外执行：leader 真正跑一次 f（拉取 / 落盘 / 写索引都在此，均在锁外）
             let result = f().await;
-            // 先摘除 in-flight 登记，再写结果槽并唤醒——确保此后新请求重新执行而非并入本次
-            self.remove(key, &shared);
             let _ = shared.cell.set(result);
-            // 唤醒所有已在等待的 follower
+            // 先发布结果并唤醒等待者，再移除登记，避免正常完成时出现重复 leader 窗口
             shared.ready.notify_waiters();
+            guard.complete();
             // 读回结果返回（set 之后 get 必有值）
             shared.cell.get().expect("leader 已写入结果").clone()
         } else {
@@ -121,11 +169,18 @@ impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
 
     /// 摘除 in-flight 登记：仅当表中该 key 仍指向同一 Shared 时才移除，避免误删后继请求。
     fn remove(&self, key: &str, shared: &Arc<Shared<T>>) {
-        let mut map = self.in_flight.lock().expect("单飞表锁未中毒");
-        if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
-            if Arc::ptr_eq(&existing, shared) {
-                map.remove(key);
+        {
+            let mut map = self.in_flight.lock().expect("单飞表锁未中毒");
+            if let Some(existing) = map.get(key).and_then(Weak::upgrade) {
+                if Arc::ptr_eq(&existing, shared) {
+                    map.remove(key);
+                }
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.after_remove.lock().expect("测试钩子锁未中毒").take() {
+            hook.removed.wait();
+            hook.resume.wait();
         }
     }
 }
@@ -134,6 +189,42 @@ impl<T: Clone + Send + Sync + 'static> SingleFlight<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    async fn 等待_follower_登记<T>(sf: &SingleFlight<T>, key: &str)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let strong_count = sf
+                    .in_flight
+                    .lock()
+                    .expect("单飞表锁未中毒")
+                    .get(key)
+                    .map_or(0, Weak::strong_count);
+                if strong_count >= 2 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower 应在时限内登记");
+    }
+
+    async fn 有界收集_follower(
+        follower: &mut tokio::task::JoinHandle<Result<usize, String>>,
+    ) -> Option<Result<usize, String>> {
+        match tokio::time::timeout(Duration::from_secs(1), &mut *follower).await {
+            Ok(joined) => Some(joined.expect("follower 任务不应异常退出")),
+            Err(_) => {
+                follower.abort();
+                let _ = follower.await;
+                None
+            }
+        }
+    }
 
     #[tokio::test]
     async fn 并发同_key_只执行一次() {
@@ -201,5 +292,137 @@ mod tests {
         // 第二次（已非并发）应重新执行并成功，而非复用上次的失败
         let r2 = sf.run("k", || async { Ok::<usize, String>(7) }).await;
         assert_eq!(r2.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn leader_abort_时_follower_有界报错且后续可重试() {
+        let sf: Arc<SingleFlight<usize>> = Arc::new(SingleFlight::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let leader_sf = sf.clone();
+        let leader = tokio::spawn(async move {
+            leader_sf
+                .run("k", || async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<Result<usize, String>>().await
+                })
+                .await
+        });
+        started_rx.await.expect("leader 应开始执行");
+
+        let follower_sf = sf.clone();
+        let mut follower = tokio::spawn(async move {
+            follower_sf
+                .run("k", || async { panic!("follower 不应成为 leader") })
+                .await
+        });
+        等待_follower_登记(&sf, "k").await;
+
+        leader.abort();
+        assert!(leader.await.expect_err("leader 应被取消").is_cancelled());
+        let follower_result = 有界收集_follower(&mut follower).await;
+        let retry = tokio::time::timeout(
+            Duration::from_secs(1),
+            sf.run("k", || async { Ok::<usize, String>(7) }),
+        )
+        .await
+        .expect("取消后重试不应阻塞");
+
+        assert!(
+            matches!(
+                follower_result,
+                Some(Err(ref error)) if error == LEADER_DROPPED_ERROR
+            ),
+            "leader 取消后 follower 应在时限内返回错误"
+        );
+        assert_eq!(retry.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn leader_panic_时_follower_有界报错且后续可重试() {
+        let sf: Arc<SingleFlight<usize>> = Arc::new(SingleFlight::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        let leader_sf = sf.clone();
+        let leader = tokio::spawn(async move {
+            leader_sf
+                .run("k", || async move {
+                    let _ = started_tx.send(());
+                    let _ = panic_rx.await;
+                    panic!("模拟 leader panic");
+                })
+                .await
+        });
+        started_rx.await.expect("leader 应开始执行");
+
+        let follower_sf = sf.clone();
+        let mut follower = tokio::spawn(async move {
+            follower_sf
+                .run("k", || async { panic!("follower 不应成为 leader") })
+                .await
+        });
+        等待_follower_登记(&sf, "k").await;
+
+        panic_tx.send(()).expect("应触发 leader panic");
+        assert!(leader.await.expect_err("leader 应 panic").is_panic());
+        let follower_result = 有界收集_follower(&mut follower).await;
+        let retry = tokio::time::timeout(
+            Duration::from_secs(1),
+            sf.run("k", || async { Ok::<usize, String>(7) }),
+        )
+        .await
+        .expect("panic 后重试不应阻塞");
+
+        assert!(
+            matches!(
+                follower_result,
+                Some(Err(ref error)) if error == LEADER_DROPPED_ERROR
+            ),
+            "leader panic 后 follower 应在时限内返回错误"
+        );
+        assert_eq!(retry.unwrap(), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn 正常完成先发布结果再移除登记() {
+        let sf: Arc<SingleFlight<usize>> = Arc::new(SingleFlight::new());
+        let hook = Arc::new(RemoveHook {
+            removed: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        *sf.after_remove.lock().expect("测试钩子锁未中毒") = Some(hook.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+        let leader_sf = sf.clone();
+        let leader = tokio::spawn(async move {
+            leader_sf
+                .run("k", || async move {
+                    let _ = started_tx.send(());
+                    complete_rx.await.expect("应允许 leader 完成");
+                    Ok::<usize, String>(42)
+                })
+                .await
+        });
+        started_rx.await.expect("leader 应开始执行");
+        let shared = sf
+            .in_flight
+            .lock()
+            .expect("单飞表锁未中毒")
+            .get("k")
+            .and_then(Weak::upgrade)
+            .expect("应存在在途共享单元");
+
+        complete_tx.send(()).expect("应允许 leader 完成");
+        let removed_hook = hook.clone();
+        tokio::task::spawn_blocking(move || removed_hook.removed.wait())
+            .await
+            .expect("移除同步任务不应失败");
+        let published_before_remove = shared.cell.get().is_some();
+        let resume_hook = hook.clone();
+        tokio::task::spawn_blocking(move || resume_hook.resume.wait())
+            .await
+            .expect("恢复同步任务不应失败");
+
+        assert_eq!(leader.await.unwrap().unwrap(), 42);
+        assert!(published_before_remove, "移除登记前必须先发布结果");
     }
 }

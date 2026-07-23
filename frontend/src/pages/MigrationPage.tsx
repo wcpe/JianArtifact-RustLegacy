@@ -46,7 +46,7 @@ import type {
   TaskDetailDto,
   TaskRecord,
 } from '../api/types';
-import { errorMessage, formatBytes } from '../lib/format';
+import { errorMessage, formatBytes, formatDuration } from '../lib/format';
 import { ErrorAlert } from '../components/ErrorAlert';
 import { notifySuccess } from '../lib/notify';
 import { MigrationHistoryPanel } from './MigrationHistory';
@@ -1228,6 +1228,20 @@ function OnlineJobPanel({
               {t('job.summarySkippedFailed', { count: summary.skippedFailed })}
             </Text>
           </Group>
+          <Group gap="md" mt="xs">
+            <Text size="sm">
+              {t('history.summaryTotal', { value: formatBytes(job.total_bytes) })}
+            </Text>
+            <Text size="sm">
+              {t('history.summaryDone', { value: formatBytes(job.done_bytes) })}
+            </Text>
+            <Text size="sm">
+              {t('history.summaryMigrated', { value: formatBytes(job.migrated_bytes) })}
+            </Text>
+            <Text size="sm">
+              {t('history.summarySkipped', { value: formatBytes(job.skipped_bytes) })}
+            </Text>
+          </Group>
 
           {job.repos.length === 0 ? (
             <Text c="dimmed" size="sm" mt="sm">
@@ -1245,6 +1259,11 @@ function OnlineJobPanel({
                     <Table.Th ta="right">{t('job.thMigrated')}</Table.Th>
                     <Table.Th ta="right">{t('job.thSkippedExisting')}</Table.Th>
                     <Table.Th ta="right">{t('job.thSkippedFailed')}</Table.Th>
+                    <Table.Th ta="right">{t('history.thTotalBytes')}</Table.Th>
+                    <Table.Th ta="right">{t('history.thDoneBytes')}</Table.Th>
+                    <Table.Th ta="right">{t('history.thMigratedBytes')}</Table.Th>
+                    <Table.Th ta="right">{t('history.thSkippedBytes')}</Table.Th>
+                    <Table.Th ta="right">{t('history.thDuration')}</Table.Th>
                   </Table.Tr>
                 </Table.Thead>
                 <Table.Tbody>
@@ -1261,11 +1280,38 @@ function OnlineJobPanel({
                       <Table.Td ta="right">{r.migrated_artifacts}</Table.Td>
                       <Table.Td ta="right">{r.skipped_existing_artifacts ?? 0}</Table.Td>
                       <Table.Td ta="right">{r.skipped_artifacts}</Table.Td>
+                      <Table.Td ta="right">{formatBytes(r.total_bytes)}</Table.Td>
+                      <Table.Td ta="right">{formatBytes(r.done_bytes)}</Table.Td>
+                      <Table.Td ta="right">{formatBytes(r.migrated_bytes)}</Table.Td>
+                      <Table.Td ta="right">{formatBytes(r.skipped_bytes)}</Table.Td>
+                      <Table.Td ta="right">{formatDuration(r.duration_ms ?? 0)}</Table.Td>
                     </Table.Tr>
                   ))}
                 </Table.Tbody>
               </Table>
             </Table.ScrollContainer>
+          )}
+
+          <Stack gap="xs" mt="sm">
+            <Text fw={600} size="sm">
+              {t('history.failureTitle')}
+            </Text>
+            {job.asset_failures.length === 0 ? (
+              <Text c="dimmed" size="sm">
+                {t('history.failureEmpty')}
+              </Text>
+            ) : (
+              job.asset_failures.map((failure, index) => (
+                <Text key={`${failure.source_repo}-${index}`} size="sm">
+                  {failure.source_repo} · {failure.asset} · {failure.reason}
+                </Text>
+              ))
+            )}
+          </Stack>
+          {job.omitted_asset_failures > 0 && (
+            <Text c="orange" size="sm" mt="xs">
+              {t('history.failuresOmitted', { count: job.omitted_asset_failures })}
+            </Text>
           )}
 
           {job.skipped_repos.length > 0 && (

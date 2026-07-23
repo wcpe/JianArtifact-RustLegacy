@@ -3,9 +3,41 @@
 //! 与 `meta/mod.rs` 同属元数据访问层，仅在 `MetaStore` 上扩展仓库相关读写；
 //! SQLite 仍是元数据唯一真源，其他模块经此读写，不绕过直连 DB。
 
+use sqlx::query::Query;
+use sqlx::sqlite::SqliteArguments;
+use sqlx::Sqlite;
 use uuid::Uuid;
 
 use super::{MetaError, MetaStore};
+
+const ARTIFACT_UPSERT_SQL: &str = "INSERT INTO artifacts \
+        (id, repo_id, path, size, sha256, sha1, md5, sha512, content_type, cached) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT (repo_id, path) DO UPDATE SET \
+        size = excluded.size, \
+        sha256 = excluded.sha256, \
+        sha1 = excluded.sha1, \
+        md5 = excluded.md5, \
+        sha512 = excluded.sha512, \
+        content_type = excluded.content_type, \
+        cached = excluded.cached";
+
+fn bind_artifact_upsert<'a>(
+    id: &'a str,
+    art: NewArtifact<'a>,
+) -> Query<'a, Sqlite, SqliteArguments<'a>> {
+    sqlx::query(ARTIFACT_UPSERT_SQL)
+        .bind(id)
+        .bind(art.repo_id)
+        .bind(art.path)
+        .bind(art.size)
+        .bind(art.sha256)
+        .bind(art.sha1)
+        .bind(art.md5)
+        .bind(art.sha512)
+        .bind(art.content_type)
+        .bind(art.cached as i64)
+}
 
 /// 仓库可见性。以小写字符串存储于 DB，避免魔法字符串散落各处。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -532,33 +564,32 @@ impl MetaStore {
     /// 此处仅负责落库）。本层不接触 blob 本体，仅写索引与多校验和。
     pub async fn upsert_artifact(&self, art: NewArtifact<'_>) -> Result<String, MetaError> {
         let id = Uuid::new_v4().to_string();
-        // ON CONFLICT 命中 (repo_id, path) 唯一索引时覆盖；id 与 created_at 保持原值
-        sqlx::query(
-            "INSERT INTO artifacts \
-                (id, repo_id, path, size, sha256, sha1, md5, sha512, content_type, cached) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (repo_id, path) DO UPDATE SET \
-                size = excluded.size, \
-                sha256 = excluded.sha256, \
-                sha1 = excluded.sha1, \
-                md5 = excluded.md5, \
-                sha512 = excluded.sha512, \
-                content_type = excluded.content_type, \
-                cached = excluded.cached",
-        )
-        .bind(&id)
-        .bind(art.repo_id)
-        .bind(art.path)
-        .bind(art.size)
-        .bind(art.sha256)
-        .bind(art.sha1)
-        .bind(art.md5)
-        .bind(art.sha512)
-        .bind(art.content_type)
-        .bind(art.cached as i64)
-        .execute(self.pool())
-        .await?;
+        bind_artifact_upsert(&id, art).execute(self.pool()).await?;
         Ok(id)
+    }
+
+    /// 原子落定 Docker manifest 索引。
+    ///
+    /// digest 引用只写 digest 索引；tag 引用同时传入 tag 索引，两行在同一事务内 upsert。
+    pub async fn upsert_docker_manifest_indexes(
+        &self,
+        digest: NewArtifact<'_>,
+        tag: Option<NewArtifact<'_>>,
+    ) -> Result<(), MetaError> {
+        let Some(tag) = tag else {
+            self.upsert_artifact(digest).await?;
+            return Ok(());
+        };
+
+        let digest_id = Uuid::new_v4().to_string();
+        let tag_id = Uuid::new_v4().to_string();
+        let mut tx = self.pool().begin().await?;
+        bind_artifact_upsert(&digest_id, digest)
+            .execute(&mut *tx)
+            .await?;
+        bind_artifact_upsert(&tag_id, tag).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// 删除一条制品索引（按仓库 + 路径）。返回是否命中记录。
@@ -997,6 +1028,73 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_tag_双索引失败时事务不留部分提交() {
+        let store = MetaStore::open_in_memory().await.unwrap();
+        let old_repo = 建仓库(&store, "old", Visibility::Public).await;
+        let atomic_repo = 建仓库(&store, "atomic", Visibility::Public).await;
+        sqlx::query(
+            "CREATE TRIGGER fail_docker_tag BEFORE INSERT ON artifacts \
+             WHEN NEW.path LIKE '%/tags/%' \
+             BEGIN SELECT RAISE(FAIL, '模拟 tag 索引写入失败'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+        let digest_path = "app/manifests/sha256:abc";
+        let tag_path = "app/tags/latest";
+        store
+            .upsert_artifact(制品(&old_repo, digest_path, "abc"))
+            .await
+            .unwrap();
+        assert!(store
+            .upsert_artifact(制品(&old_repo, tag_path, "abc"))
+            .await
+            .is_err());
+        assert!(store
+            .get_artifact(&old_repo, digest_path)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_artifact(&old_repo, tag_path)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(store
+            .upsert_docker_manifest_indexes(
+                制品(&atomic_repo, digest_path, "abc"),
+                Some(制品(&atomic_repo, tag_path, "abc")),
+            )
+            .await
+            .is_err());
+        assert!(store
+            .get_artifact(&atomic_repo, digest_path)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_artifact(&atomic_repo, tag_path)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn docker_digest_引用只写_digest_索引() {
+        let store = MetaStore::open_in_memory().await.unwrap();
+        let repo = 建仓库(&store, "docker", Visibility::Public).await;
+        store
+            .upsert_docker_manifest_indexes(制品(&repo, "app/manifests/sha256:abc", "abc"), None)
+            .await
+            .unwrap();
+        let artifacts = store.list_artifacts_by_repo(&repo).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].path, "app/manifests/sha256:abc");
     }
 
     #[tokio::test]

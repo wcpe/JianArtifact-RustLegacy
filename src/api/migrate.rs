@@ -147,11 +147,11 @@ pub async fn preview_nexus_offline(
                 }
                 Ok(Err(e)) => {
                     p.phase = OnlinePullPhase::Failed;
-                    p.error = Some(e.to_string());
+                    p.error = Some(safe_migration_error(&e));
                 }
-                Err(e) => {
+                Err(_) => {
                     p.phase = OnlinePullPhase::Failed;
-                    p.error = Some(format!("离线枚举任务异常: {e}"));
+                    p.error = Some("离线枚举任务执行失败".to_string());
                 }
             }
             p.phase
@@ -254,13 +254,13 @@ pub async fn index_nexus_offline(
             Ok(Err(e)) => {
                 let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
                 p.phase = OnlinePullPhase::Failed;
-                p.error = Some(e.to_string());
+                p.error = Some(safe_migration_error(&e));
                 p.phase
             }
-            Err(e) => {
+            Err(_) => {
                 let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
                 p.phase = OnlinePullPhase::Failed;
-                p.error = Some(format!("离线索引任务异常: {e}"));
+                p.error = Some("离线索引任务执行失败".to_string());
                 p.phase
             }
         };
@@ -335,6 +335,7 @@ pub async fn migrate_nexus_proxy(
     let artifacts = state.artifacts.clone();
     let formats = state.formats.clone();
     let tasks = state.tasks.clone();
+    let max_size = state.config.limits.max_artifact_size;
     let task_job_id = job_id.clone();
     tokio::spawn(async move {
         let ticker = persister.clone().spawn_progress_ticker(progress.clone());
@@ -344,6 +345,7 @@ pub async fn migrate_nexus_proxy(
             &formats,
             std::path::Path::new(&offline_path),
             selected_repositories,
+            max_size,
             &progress,
             &control,
         )
@@ -360,7 +362,7 @@ pub async fn migrate_nexus_proxy(
                 }
                 Err(e) => {
                     p.phase = OnlinePullPhase::Failed;
-                    p.error = Some(e.to_string());
+                    p.error = Some(safe_migration_error(&e));
                 }
             }
             p.phase
@@ -500,7 +502,7 @@ pub async fn migrate_nexus_hosted(
                 }
                 Err(e) => {
                     p.phase = OnlinePullPhase::Failed;
-                    p.error = Some(e.to_string());
+                    p.error = Some(safe_migration_error(&e));
                 }
             }
             p.phase
@@ -700,7 +702,7 @@ pub async fn migrate_nexus_online(
                 }
                 Err(e) => {
                     p.phase = OnlinePullPhase::Failed;
-                    p.error = Some(e.to_string());
+                    p.error = Some(safe_migration_error(&e));
                 }
             }
             p.phase
@@ -984,6 +986,19 @@ pub struct MigrationRepoReportDto {
     pub skipped_existing_artifacts: i64,
     /// 失败跳过数。
     pub skipped_artifacts: i64,
+    pub total_bytes: i64,
+    pub done_bytes: i64,
+    pub migrated_bytes: i64,
+    pub skipped_bytes: i64,
+    pub duration_ms: i64,
+}
+
+/// 迁移历史中的失败资产明细。
+#[derive(Debug, Serialize)]
+pub struct MigrationAssetFailureDto {
+    pub source_repo: String,
+    pub asset: String,
+    pub reason: String,
 }
 
 /// 迁移历史任务记录（对外 DTO）：列表项与详情共用的任务元数据 + 进度快照。
@@ -1017,6 +1032,8 @@ pub struct MigrationTaskDto {
     pub migrated_bytes: i64,
     /// 跳过 / 失败逻辑字节数。
     pub skipped_bytes: i64,
+    /// 因容量限制省略的失败资产明细数。
+    pub omitted_asset_failures: i64,
     /// 失败原因（失败时非空）。
     pub error: Option<String>,
     /// 起始时刻。
@@ -1044,6 +1061,7 @@ impl From<crate::meta::MigrationTaskRecord> for MigrationTaskDto {
             done_bytes: r.done_bytes,
             migrated_bytes: r.migrated_bytes,
             skipped_bytes: r.skipped_bytes,
+            omitted_asset_failures: r.omitted_asset_failures,
             error: r.error,
             started_at: r.started_at,
             updated_at: r.updated_at,
@@ -1060,6 +1078,8 @@ pub struct MigrationTaskDetailDto {
     pub task: MigrationTaskDto,
     /// 分仓库明细报告。
     pub repos: Vec<MigrationRepoReportDto>,
+    /// 最早发生的失败资产明细。
+    pub asset_failures: Vec<MigrationAssetFailureDto>,
 }
 
 /// 列出迁移历史（库中持久记录，仅 Admin，FR-140）。
@@ -1082,9 +1102,22 @@ pub async fn list_migration_tasks(
 }
 
 /// 把 meta 层错误映射为 500，并记 WARN（不向调用方泄露 DB 内部细节）。
-fn db_internal(e: crate::meta::MetaError) -> ApiError {
-    tracing::warn!(错误 = %e, "迁移历史查询 / 落库失败");
+fn db_internal(_: crate::meta::MetaError) -> ApiError {
+    tracing::warn!("迁移历史查询或落库失败");
     ApiError::Internal
+}
+
+/// 把内部迁移错误映射为稳定白名单文案，避免 URL、路径或配置值进入持久化/API。
+fn safe_migration_error(error: &migrate::MigrateError) -> String {
+    match error {
+        migrate::MigrateError::Invalid(_) => "迁移参数或源数据无效",
+        migrate::MigrateError::MissingCredential(_) => "迁移凭据未配置",
+        migrate::MigrateError::Status(401 | 403) => "源系统鉴权失败",
+        migrate::MigrateError::Status(_) => "源系统返回错误状态",
+        migrate::MigrateError::Transport(_) => "源系统请求失败",
+        migrate::MigrateError::Parse(_) => "源系统响应解析失败",
+    }
+    .to_string()
 }
 
 /// 查单个迁移历史任务详情 + 分仓库报告（仅 Admin，FR-140）。未知 id 返回 404。
@@ -1094,20 +1127,16 @@ pub async fn get_migration_task(
     Path(task_id): Path<String>,
 ) -> Result<Json<MigrationTaskDetailDto>, ApiError> {
     identity.require_admin()?;
-    let task = state
+    let detail = state
         .meta
-        .get_migration_task(&task_id)
+        .get_migration_task_detail(&task_id)
         .await
         .map_err(db_internal)?
         .ok_or(ApiError::NotFound)?;
-    let repos = state
-        .meta
-        .get_migration_task_repos(&task_id)
-        .await
-        .map_err(db_internal)?;
     Ok(Json(MigrationTaskDetailDto {
-        task: MigrationTaskDto::from(task),
-        repos: repos
+        task: MigrationTaskDto::from(detail.task),
+        repos: detail
+            .repos
             .into_iter()
             .map(|r| MigrationRepoReportDto {
                 source_repo: r.source_repo,
@@ -1117,6 +1146,20 @@ pub async fn get_migration_task(
                 migrated_artifacts: r.migrated_artifacts,
                 skipped_existing_artifacts: r.skipped_existing_artifacts,
                 skipped_artifacts: r.skipped_artifacts,
+                total_bytes: r.total_bytes,
+                done_bytes: r.done_bytes,
+                migrated_bytes: r.migrated_bytes,
+                skipped_bytes: r.skipped_bytes,
+                duration_ms: r.duration_ms,
+            })
+            .collect(),
+        asset_failures: detail
+            .asset_failures
+            .into_iter()
+            .map(|failure| MigrationAssetFailureDto {
+                source_repo: failure.source_repo,
+                asset: failure.asset,
+                reason: failure.reason,
             })
             .collect(),
     }))
@@ -1371,6 +1414,56 @@ mod tests {
         .unwrap();
         let names: Vec<String> = filtered.into_iter().map(|repo| repo.name).collect();
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn 迁移详情_dto_包含字节耗时失败明细与省略数() {
+        let detail = MigrationTaskDetailDto {
+            task: MigrationTaskDto {
+                id: "t1".to_string(),
+                kind: "online".to_string(),
+                state: "failed".to_string(),
+                label: None,
+                phase: "failed".to_string(),
+                total_assets: 1,
+                done_assets: 1,
+                migrated: 0,
+                skipped_existing: 0,
+                skipped: 1,
+                total_bytes: 12,
+                done_bytes: 12,
+                migrated_bytes: 0,
+                skipped_bytes: 12,
+                omitted_asset_failures: 2,
+                error: Some("迁移失败".to_string()),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:01Z".to_string(),
+                finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+            },
+            repos: vec![MigrationRepoReportDto {
+                source_repo: "r1".to_string(),
+                target_repo: "r1".to_string(),
+                format: "maven".to_string(),
+                created: true,
+                migrated_artifacts: 0,
+                skipped_existing_artifacts: 0,
+                skipped_artifacts: 1,
+                total_bytes: 12,
+                done_bytes: 12,
+                migrated_bytes: 0,
+                skipped_bytes: 12,
+                duration_ms: 34,
+            }],
+            asset_failures: vec![MigrationAssetFailureDto {
+                source_repo: "r1".to_string(),
+                asset: "a.jar".to_string(),
+                reason: "源资产下载失败".to_string(),
+            }],
+        };
+        let value = serde_json::to_value(detail).unwrap();
+        assert_eq!(value["repos"][0]["duration_ms"], 34);
+        assert_eq!(value["asset_failures"][0]["asset"], "a.jar");
+        assert_eq!(value["omitted_asset_failures"], 2);
     }
 
     #[test]

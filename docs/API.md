@@ -14,7 +14,7 @@
   - **NuGet api-key 头**：兼容 NuGet 规范的 `X-NuGet-ApiKey: <API Token>`（`dotnet nuget push` 原生方式）；仅在无 `Authorization` 头时回退按 API Token 校验该头值，非法值仍按匿名处理。
 - **匿名访问**：未携带任何凭据即视为匿名访客，仅能读取 public 仓库；对 private 仓库一律拒绝。
 - **身份解析**：认证中间件解析出身份（注册用户 / 管理员）或匿名；鉴权中间件按目标仓库与操作（读 / 写）综合 public/private、全局角色、每仓库 ACL 三者判定。
-- **会话生命周期**：Web 会话 / JWT 有有限有效期（TTL，默认约 1 小时，可配置）；临近过期可经刷新端点续期，过期或吊销后须重新登录。API Token 不设过期（除非吊销），与会话相互独立。
+- **会话生命周期**：Web 会话 / JWT 有有限有效期（TTL，默认约 1 小时，可配置）；logout 仅即时撤销当前 JWT 会话，撤销后同一 JWT 访问 `/me` 或 `/auth/refresh` 均返回 `401`，同用户其他 JWT 与 API Token 不受影响。新 JWT 的撤销键基于带域前缀的 `jti`，升级前缺少 `jti` 的旧 JWT 撤销键基于带域前缀的完整 token；两者均在构造时立即做 sha256，服务端扩展、数据库与日志均不保存或输出原 JWT / `jti`。API Token 不设过期（除非吊销），与会话相互独立。
 - **分页与搜索约定**：所有返回列表的管理 API 统一支持分页与过滤参数，并返回统一的分页响应结构。
   - 请求参数：`offset`（默认 0）、`limit`（默认 50，上限如 1000）、可选 `sort`（如 `name:asc` / `created_at:desc`）、可选 `q`（按名称 / 路径关键字过滤）。
   - 响应结构：`{ "items": [...], "total": <总数>, "offset": <本页起点>, "limit": <本页容量>, "has_more": <是否还有更多> }`。
@@ -61,8 +61,10 @@
 ### 登出
 
 - **方法 / 路径**：`POST /api/v1/auth/logout`
-- **请求**：无请求体，凭当前会话凭据调用。
-- **响应**：清除当前会话，返回成功状态。
+- **请求**：无请求体，凭当前已认证凭据调用。
+- **JWT 响应**：所有服务器仍接受的 JWT（含升级前缺少 `jti` 的旧 JWT）均即时撤销当前单一会话，返回 `{ "status": "ok", "session_revoked": true }`；该 JWT 此后访问 `/me` 与 `/auth/refresh` 均返回 `401`，同用户其他 JWT 与 API Token 不受影响。
+- **旧 JWT 兼容**：升级前签发且缺少 `jti` 的 JWT 继续可用，并以带域前缀的完整 token 做 sha256 后作为撤销键；原 token 不进入请求扩展、数据库或日志。
+- **Basic / API Token 兼容**：保持既有已认证调用成功语义，但 logout 不吊销口令或 API Token，返回 `{ "status": "ok", "session_revoked": false, "reason": "non_jwt_credential" }`；API Token 吊销仍使用 `DELETE /api/v1/tokens/{id}`。
 - **错误**：`401` 未认证。
 
 ### 刷新会话
@@ -356,7 +358,7 @@
 
 - **方法 / 路径**：`POST /api/v1/migrate/nexus/online/migrate`
 - **请求**：JSON 体 `{ "base_url", "auth_ref"?, "repositories": [{ "source", "target"? }] }`。`base_url` 为源 Nexus 基址；`auth_ref` 为在线访问凭据引用（仅引用，真值走环境变量 `JIANARTIFACT_MIGRATE_<NAME>_USERNAME` / `PASSWORD`，不入库、不回显，匿名源可省略）；`repositories` 为选中的源仓库，`source` 为源仓库名、`target` 为本系统目标仓库名（省略 / 空则与源同名，允许改名）。仅管理员可调用。**与 `hosted/migrate` 的区别：本端点不需离线 blob store 目录**——经源 Nexus REST 在线拉取制品。
-- **行为**：把所选 **Maven（`maven2`）/ Raw / npm / Docker（`docker`）的 hosted** 仓库经在线 HTTP 搬到本系统。**同步阶段**只做：枚举源仓库配置、匹配所选 `source`、解析凭据（失败即 `400` / `502`，不开任务）；随后**立即返回 `job_id`（`202`）**，实际搬运在**后台任务**异步执行（FR-83），进度经 `GET /migrate/jobs/{id}` 轮询。后台任务：① 建 / 复用目标 hosted 仓库（名取 `target`，允许与源不同名；格式取源格式映射后的本系统格式）；② **普通文件格式（Maven / Raw / npm）**——经 `service/rest/v1/components?repository=X`（`continuationToken` 分页）枚举该仓库全部 asset，按各 asset 的 `downloadUrl` HTTP 流式下载（不整体载入内存），经既有制品机理写入——**blob 先落盘并校验 sha256 再写元数据索引（`cached=false`），写索引失败回滚不留孤儿**；落定后比对下载内容 sha256 与源报告值，不符即视为损坏、回滚该制品并跳过（保证文件字节一致，含 `.sha1`/`.md5`/`.sha256`/`.sha512` sidecar 一并搬运）。**Docker/OCI（FR-144）**——不套普通文件路径，改经源 Nexus 的 **Docker Registry v2 协议**（`{base}/repository/{repo}/v2/...`）搬运镜像图：`_catalog` 枚举镜像、`/tags/list` 枚举 tag，逐 tag 拉 manifest → 解析 manifest 图取出 config + 各 layer blob（或 manifest list 的子 manifest）→ 按 digest 内容寻址逐个流式拉取并校验 → 按本系统 docker 布局（`{image}/blobs|manifests|tags`）先落盘校验再写索引；reference 为 digest 的 manifest 校验内容一致、单 tag / 单镜像失败记跳过不中断整批。下载 / 写入瞬时失败**自动重试、指数退避**（确定性失败不重试）。按各格式覆盖 / 不可变策略处理重复（Maven release 不可覆盖、npm tarball 已发布不可覆盖、Docker tag / blob 内容寻址去重等），超 `limits.max_artifact_size` 跳过；搬运幂等可重入，单 asset / 单 tag 失败记录跳过、不中断整批。**仅 hosted 且格式为 `maven2` / `raw` / `npm` / `docker` 者参与**（FR-82 + FR-143 + FR-144；docker 需服务端装配 docker registry），其余格式与 proxy（在线只迁配置、缓存可回源重建，不搬）整体跳过。迁移**不搬运源系统上游凭据**。
+- **行为**：把所选 **Maven（`maven2`）/ Raw / npm / Docker（`docker`）的 hosted** 仓库经在线 HTTP 搬到本系统。**同步阶段**只做：枚举源仓库配置、匹配所选 `source`、解析凭据（失败即 `400` / `502`，不开任务）；随后**立即返回 `job_id`（`202`）**，实际搬运在**后台任务**异步执行（FR-83），进度经 `GET /migrate/jobs/{id}` 轮询。后台任务：① 建 / 复用目标 hosted 仓库（名取 `target`，允许与源不同名；格式取源格式映射后的本系统格式）；② **普通文件格式（Maven / Raw / npm）**——经 `service/rest/v1/components?repository=X`（`continuationToken` 分页）枚举该仓库全部 asset，按各 asset 的 `downloadUrl` HTTP 流式下载（不整体载入内存），经既有制品机理写入——**blob 先落盘并校验 sha256 再写元数据索引（`cached=false`），写索引失败回滚不留孤儿**；落定后比对下载内容 sha256 与源报告值，不符即视为损坏、回滚该制品并跳过（保证文件字节一致，含 `.sha1`/`.md5`/`.sha256`/`.sha512` sidecar 一并搬运）。**Docker/OCI（FR-144）**——不套普通文件路径，改经源 Nexus 的 **Docker Registry v2 协议**（`{base}/repository/{repo}/v2/...`）搬运镜像图：`_catalog` 枚举镜像、`/tags/list` 枚举 tag；两端点首页固定带 `n=100`，完整跟随响应 `Link` 中唯一的 `rel=next`（保留服务端编码游标，支持绝对 / 绝对路径 / 相对 / 仅 query URL），仅允许同 scheme/host/port 且路径仍在该仓库 v2 前缀内，跨页去重保序，坏 Link、循环与超过 10,000 页均使该仓枚举失败；随后逐 tag 拉 manifest → 解析 manifest 图取出 config + 各 layer blob（或 manifest list 的子 manifest）→ 按 digest 内容寻址逐个流式拉取并校验 → 按本系统 docker 布局（`{image}/blobs|manifests|tags`）先落盘校验再写索引；reference 为 digest 的 manifest 校验内容一致、单 tag / 单镜像失败记跳过不中断整批。下载 / 写入瞬时失败**自动重试、指数退避**（确定性失败不重试）。按各格式覆盖 / 不可变策略处理重复（Maven release 不可覆盖、npm tarball 已发布不可覆盖、Docker tag / blob 内容寻址去重等），超 `limits.max_artifact_size` 跳过；搬运幂等可重入，单 asset / 单 tag 失败记录跳过、不中断整批。**仅 hosted 且格式为 `maven2` / `raw` / `npm` / `docker` 者参与**（FR-82 + FR-143 + FR-144；docker 需服务端装配 docker registry），其余格式与 proxy（在线只迁配置、缓存可回源重建，不搬）整体跳过。迁移**不搬运源系统上游凭据**。
 - **响应**：`202 Accepted`，体 `{ "job_id": string }`——供轮询 `GET /api/v1/migrate/jobs/{id}`。
 - **错误**：`400` `base_url` 为空 / 未选择仓库 / 源仓库不存在；`401` 未认证；`403` 非管理员；`502` 连接 / 鉴权 / 解析源 Nexus 失败（同步枚举阶段）。
 
@@ -386,8 +388,8 @@
 
 迁移任务的**记录、节流进度快照与分仓库明细报告**经 `meta` 层落 SQLite，使进程重启后历史 / 进度 / 报告仍可查、残留在途任务标「已中断」、可一键幂等重跑续传。运行态真源仍是进程内 `MigrationJobs`（`GET /migrate/jobs` 系列，契约不变）；本组端点是**跨重启的历史与恢复视图**。凭据仍只存 `auth_ref` 引用、真值走 env，绝不入库。
 
-- **列迁移历史**：`GET /api/v1/migrate/tasks`。仅管理员。返回库中近期迁移任务（按起始时刻倒序，默认上限 100），含重启后被标 `interrupted` 的任务。响应：`[{ "id", "kind", "state", "label", "phase", "total_assets", "done_assets", "migrated", "skipped_existing", "skipped", "total_bytes", "done_bytes", "migrated_bytes", "skipped_bytes", "error", "started_at", "updated_at", "finished_at" }]`。`kind` ∈ `online` / `offline_proxy` / `offline_hosted`；`state` ∈ `running` / `paused` / `succeeded` / `failed` / `cancelled` / `interrupted`（`interrupted` = 进程重启时残留的在途任务被归一）；任务耗时由 `finished_at` − `started_at` 推导。
-- **查历史详情 + 报告**：`GET /api/v1/migrate/tasks/{id}`。仅管理员。响应为任务记录（同上字段展平）+ `repos`：分仓库明细报告数组，每项 `{ "source_repo", "target_repo", "format", "created", "migrated_artifacts", "skipped_existing_artifacts", "skipped_artifacts" }`。错误：`404` 未知 `id`。
+- **列迁移历史**：`GET /api/v1/migrate/tasks`。仅管理员。返回库中近期迁移任务（按起始时刻倒序，默认上限 100），含重启后被标 `interrupted` 的任务。响应：`[{ "id", "kind", "state", "label", "phase", "total_assets", "done_assets", "migrated", "skipped_existing", "skipped", "total_bytes", "done_bytes", "migrated_bytes", "skipped_bytes", "omitted_asset_failures", "error", "started_at", "updated_at", "finished_at" }]`。`kind` ∈ `online` / `offline_proxy` / `offline_hosted`；`state` ∈ `running` / `paused` / `succeeded` / `failed` / `cancelled` / `interrupted`（`interrupted` = 进程重启时残留的在途任务被归一）；旧行新增字段默认为 0。列表不查询失败明细表，避免 N+1。
+- **查历史详情 + 报告**：`GET /api/v1/migrate/tasks/{id}`。仅管理员。响应为任务记录（同上字段展平）+ `repos` + `asset_failures`。`repos` 每项为 `{ "source_repo", "target_repo", "format", "created", "migrated_artifacts", "skipped_existing_artifacts", "skipped_artifacts", "total_bytes", "done_bytes", "migrated_bytes", "skipped_bytes", "duration_ms" }`；`asset_failures` 每项为 `{ "source_repo", "asset", "reason" }`，仅返回最早 1,000 条稳定、脱敏的中文原因，超额数量见 `omitted_asset_failures`。旧行返回 0 与空数组。错误：`404` 未知 `id`。
 - **一键幂等重跑**：`POST /api/v1/migrate/tasks/{id}/rerun`。无请求体。仅管理员。据任务库中**脱敏参数快照**重建原请求并重新触发一次幂等搬运——复用既有引擎的 sha256 跳过（目标已存在且一致即跳过，进度区分「跳过 vs 新搬」），等效断点续传；凭据仍从 env 现解析（快照只存 `auth_ref` 引用）。生成**新 `job_id`**（不覆盖原历史记录）。响应：`202 Accepted`，体 `{ "job_id": string }`。错误：`400` 参数快照损坏 / 类别未知；`401` 未认证；`403` 非管理员；`404` 未知 `id`；`409` 已有迁移任务在途（复用迁移单飞门）。
 
 ### 统一任务注册表（FR-131）

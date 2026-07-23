@@ -42,8 +42,9 @@ pub use offline::{
 };
 
 pub use online::{
-    migrate_online_repositories, migrate_online_with_progress, JobControl, OnlineMigrationReport,
-    OnlinePullPhase, OnlinePullProgress, OnlinePullSelection, OnlineRepoMigrationOutcome,
+    migrate_online_repositories, migrate_online_with_progress, JobControl, MigrationAssetFailure,
+    OnlineMigrationReport, OnlinePullPhase, OnlinePullProgress, OnlinePullSelection,
+    OnlineRepoMigrationOutcome,
 };
 pub use proxy::{
     migrate_proxy_repositories, migrate_proxy_repositories_offline_with_progress,
@@ -77,6 +78,16 @@ pub(crate) fn map_nexus_format(nexus_format: &str) -> Option<&'static str> {
 /// proxy 与 hosted 搬运共用此归一化逻辑。
 pub(crate) fn normalize_blob_path(blob_name: &str) -> &str {
     blob_name.trim_start_matches('/')
+}
+
+/// 把毫秒数饱和转换为 `u64`，避免极端长耗时发生截断回绕。
+pub(crate) fn saturating_millis(millis: u128) -> u64 {
+    millis.min(u64::MAX as u128) as u64
+}
+
+/// 把无符号计数饱和转换为 SQLite 使用的 `i64`，避免溢出回绕为负数。
+pub(crate) fn u64_to_i64_saturating(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 /// Nexus 仓库列表 REST 端点（相对其 base URL）。
@@ -399,6 +410,8 @@ pub struct NexusAsset {
     pub download_url: String,
     /// Nexus 报告的 sha256：用于流式落定后比对，保证文件字节一致；缺失则不比对。
     pub sha256: Option<String>,
+    /// Nexus 声明的逻辑字节数；缺失、负数或非法值均为 None。
+    pub size: Option<u64>,
 }
 
 /// components REST 单页解析结果。
@@ -435,6 +448,8 @@ pub fn parse_components(body: &str) -> Result<ComponentsPage, MigrateError> {
         download_url: String,
         #[serde(default)]
         checksum: RawChecksum,
+        #[serde(rename = "fileSize", default)]
+        file_size: Option<serde_json::Value>,
     }
     #[derive(serde::Deserialize, Default)]
     struct RawChecksum {
@@ -452,6 +467,7 @@ pub fn parse_components(body: &str) -> Result<ComponentsPage, MigrateError> {
             path: a.path,
             download_url: a.download_url,
             sha256: a.checksum.sha256,
+            size: a.file_size.and_then(|value| value.as_u64()),
         })
         .collect();
     Ok(ComponentsPage {
@@ -612,6 +628,16 @@ mod tests {
     }
 
     #[test]
+    fn 饱和数值转换覆盖极值() {
+        assert_eq!(saturating_millis(0), 0);
+        assert_eq!(saturating_millis(u64::MAX as u128), u64::MAX);
+        assert_eq!(saturating_millis(u128::MAX), u64::MAX);
+        assert_eq!(u64_to_i64_saturating(0), 0);
+        assert_eq!(u64_to_i64_saturating(i64::MAX as u64), i64::MAX);
+        assert_eq!(u64_to_i64_saturating(u64::MAX), i64::MAX);
+    }
+
+    #[test]
     fn 解析仓库列表取基本元数据并区分_proxy_上游() {
         let repos = parse_repositories(SAMPLE).unwrap();
         assert_eq!(repos.len(), 2);
@@ -763,6 +789,24 @@ mod tests {
         assert_eq!(page.assets[1].path, "com/foo/lib/1.0/lib-1.0.jar.sha1");
         // checksum 缺 sha256 时为 None（不比对）
         assert_eq!(page.assets[2].sha256, None);
+    }
+
+    #[test]
+    fn 解析_components_file_size_兼容正常缺失负数与非法值() {
+        let body = r#"{
+            "items": [{ "assets": [
+                { "path": "a", "downloadUrl": "u1", "fileSize": 12, "checksum": {} },
+                { "path": "b", "downloadUrl": "u2", "checksum": {} },
+                { "path": "c", "downloadUrl": "u3", "fileSize": -1, "checksum": {} },
+                { "path": "d", "downloadUrl": "u4", "fileSize": "bad", "checksum": {} }
+            ]}],
+            "continuationToken": null
+        }"#;
+        let page = parse_components(body).unwrap();
+        assert_eq!(page.assets[0].size, Some(12));
+        assert_eq!(page.assets[1].size, None);
+        assert_eq!(page.assets[2].size, None);
+        assert_eq!(page.assets[3].size, None);
     }
 
     #[test]

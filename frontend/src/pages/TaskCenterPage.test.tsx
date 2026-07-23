@@ -33,15 +33,22 @@ function 迁移进度(overrides: Partial<OnlinePullJob> = {}): OnlinePullJob {
     total_assets: 10,
     done_assets: 3,
     migrated: 2,
+    skipped_existing: 0,
     skipped: 1,
+    total_bytes: 10240,
+    done_bytes: 3072,
+    migrated_bytes: 2048,
+    skipped_bytes: 1024,
     current_repo: 'repo-a',
     current_path: '/content/a.pom',
     paused: false,
     repos: [],
     skipped_repos: [],
+    asset_failures: [],
+    omitted_asset_failures: 0,
     error: null,
     ...overrides,
-  };
+  } as OnlinePullJob;
 }
 
 /** 构造一条任务详情。 */
