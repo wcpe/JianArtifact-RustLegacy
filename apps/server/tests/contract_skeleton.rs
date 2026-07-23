@@ -20,6 +20,8 @@ async fn test_app() -> Result<(Router, tempfile::TempDir), Box<dyn std::error::E
         bind: "127.0.0.1:0".to_string(),
         database_path: dir.path().join("test.db"),
         data_dir: dir.path().join("blobs"),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         // 测试用固定 JWT 密钥（非生产凭据），满足 build_app 的密钥非空校验
         jwt_secret: "test-jwt-secret-please-change".to_string(),
@@ -73,6 +75,8 @@ async fn 启动创建数据目录且创建失败返回_io_错误() -> TestResult
         bind: "127.0.0.1:0".to_string(),
         database_path: dir.path().join("test.db"),
         data_dir: data_dir.clone(),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         jwt_secret: "test-jwt-secret-please-change".to_string(),
         session_ttl_hours: 8,

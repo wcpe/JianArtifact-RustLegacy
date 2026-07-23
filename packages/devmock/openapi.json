@@ -176,7 +176,6 @@
         "tags": [
           "migration"
         ],
-        "summary": "发现：按源配置枚举可迁仓库（Admin）。",
         "operationId": "discover",
         "requestBody": {
           "content": {
@@ -190,7 +189,7 @@
         },
         "responses": {
           "200": {
-            "description": "发现结果",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -200,7 +199,7 @@
             }
           },
           "400": {
-            "description": "源配置无效（路径越界/矩阵外来源等）",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -210,7 +209,7 @@
             }
           },
           "403": {
-            "description": "无管理员权限",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -227,7 +226,6 @@
         "tags": [
           "migration"
         ],
-        "summary": "计划：按映射与决策生成可确认的迁移计划预览（Admin）。",
         "operationId": "plan",
         "requestBody": {
           "content": {
@@ -241,7 +239,7 @@
         },
         "responses": {
           "200": {
-            "description": "计划预览",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -251,7 +249,7 @@
             }
           },
           "400": {
-            "description": "映射无效或引用的发现结果不存在",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -261,7 +259,7 @@
             }
           },
           "403": {
-            "description": "无管理员权限",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -278,13 +276,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "任务列表（分页，Admin）。",
         "operationId": "list_tasks",
         "parameters": [
           {
             "name": "page",
             "in": "query",
-            "description": "页码，从 1 起",
             "required": false,
             "schema": {
               "type": "integer",
@@ -295,7 +291,6 @@
           {
             "name": "page_size",
             "in": "query",
-            "description": "每页条数，最大 200",
             "required": false,
             "schema": {
               "type": "integer",
@@ -306,7 +301,7 @@
         ],
         "responses": {
           "200": {
-            "description": "任务分页",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -316,7 +311,7 @@
             }
           },
           "403": {
-            "description": "无管理员权限",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -331,13 +326,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "创建任务：确认计划并异步执行，立即返回任务标识（Admin）。",
         "operationId": "create_task",
         "parameters": [
           {
             "name": "plan_id",
             "in": "query",
-            "description": "已确认的计划标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -346,7 +339,7 @@
         ],
         "responses": {
           "202": {
-            "description": "任务已受理",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -356,7 +349,7 @@
             }
           },
           "400": {
-            "description": "计划不存在或存在未决阻断冲突",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -366,7 +359,17 @@
             }
           },
           "403": {
-            "description": "无管理员权限",
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -383,13 +386,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "任务详情与进度（Admin）。",
         "operationId": "task_detail",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -398,7 +399,7 @@
         ],
         "responses": {
           "200": {
-            "description": "任务详情",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -407,8 +408,18 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "任务不存在",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -425,13 +436,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "取消任务（清理未提交临时文件，不删已成功且被引用的数据，Admin）。",
         "operationId": "cancel_task",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -440,7 +449,7 @@
         ],
         "responses": {
           "202": {
-            "description": "取消请求已受理",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -449,8 +458,114 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "当前状态不允许取消",
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/migration/tasks/{id}/finalize": {
+      "post": {
+        "tags": [
+          "migration"
+        ],
+        "operationId": "finalize_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RetryTaskRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -467,13 +582,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "暂停任务（在单对象原子提交边界生效，Admin）。",
         "operationId": "pause_task",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -482,7 +595,7 @@
         ],
         "responses": {
           "202": {
-            "description": "暂停请求已受理",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -491,8 +604,28 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "当前状态不允许暂停",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -509,13 +642,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "任务报告（Admin）。",
         "operationId": "task_report",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -524,7 +655,7 @@
         ],
         "responses": {
           "200": {
-            "description": "迁移报告",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -533,8 +664,18 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "404": {
-            "description": "任务不存在",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -551,13 +692,11 @@
         "tags": [
           "migration"
         ],
-        "summary": "继续任务（Admin）。",
         "operationId": "resume_task",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
@@ -566,7 +705,7 @@
         ],
         "responses": {
           "202": {
-            "description": "继续请求已受理",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -575,8 +714,28 @@
               }
             }
           },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "当前状态不允许继续",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -593,22 +752,36 @@
         "tags": [
           "migration"
         ],
-        "summary": "重试/续传（只处理失败、中断或变化对象，幂等，Admin）。",
         "operationId": "retry_task",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "任务标识",
             "required": true,
             "schema": {
               "type": "string"
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/RetryTaskRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
-            "description": "重试请求已受理",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -617,8 +790,38 @@
               }
             }
           },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "当前状态不允许重试",
+            "description": "",
             "content": {
               "application/json": {
                 "schema": {
@@ -2449,6 +2652,15 @@
           }
         }
       },
+      "ConflictAction": {
+        "type": "string",
+        "description": "对象级冲突动作。",
+        "enum": [
+          "rename",
+          "map-empty",
+          "abandon"
+        ]
+      },
       "CreateRepoRequest": {
         "type": "object",
         "description": "创建仓库请求体。",
@@ -2674,16 +2886,13 @@
         ],
         "properties": {
           "config_complete": {
-            "type": "boolean",
-            "description": "配置是否完整（false = 待补充，不可全量成功）。"
+            "type": "boolean"
           },
           "format": {
-            "$ref": "#/components/schemas/Format",
-            "description": "格式（矩阵外格式在 unsupported 中列出，不出现在此）。"
+            "$ref": "#/components/schemas/Format"
           },
           "has_credential_ref": {
-            "type": "boolean",
-            "description": "是否已有可用的上游凭据引用（凭据缺失的 proxy 为「配置未完成」）。"
+            "type": "boolean"
           },
           "members": {
             "type": [
@@ -2692,33 +2901,27 @@
             ],
             "items": {
               "type": "string"
-            },
-            "description": "group 成员（有序）。"
+            }
           },
           "name": {
-            "type": "string",
-            "description": "源仓库名。"
+            "type": "string"
           },
           "object_count": {
             "type": "integer",
-            "format": "int64",
-            "description": "可迁对象数（估算）。"
+            "format": "int64"
           },
           "repo_type": {
-            "$ref": "#/components/schemas/RepoType",
-            "description": "仓库类型。"
+            "$ref": "#/components/schemas/RepoType"
           },
           "total_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "可迁字节数（估算）。"
+            "format": "int64"
           },
           "upstream_url": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "proxy 上游地址（脱敏，不含凭据）。"
+            ]
           }
         }
       },
@@ -2734,30 +2937,25 @@
         ],
         "properties": {
           "degraded_bare_blob": {
-            "type": "boolean",
-            "description": "是否为裸 blob 降级模式（true 时任务总状态不得全量成功）。"
+            "type": "boolean"
           },
           "discovery_id": {
-            "type": "string",
-            "description": "本次发现的标识（后续计划引用）。"
+            "type": "string"
           },
           "repositories": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/DiscoveredRepo"
-            },
-            "description": "可迁仓库清单。"
+            }
           },
           "snapshot_time": {
-            "type": "string",
-            "description": "源快照时间。"
+            "type": "string"
           },
           "unsupported": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/UnsupportedItem"
-            },
-            "description": "不支持项清单（矩阵外格式/系统数据，禁止静默丢弃）。"
+            }
           }
         }
       },
@@ -2781,7 +2979,7 @@
       },
       "FailureSample": {
         "type": "object",
-        "description": "失败明细（有界样本）。",
+        "description": "失败明细。",
         "required": [
           "repo",
           "object_key",
@@ -2790,20 +2988,16 @@
         ],
         "properties": {
           "category": {
-            "type": "string",
-            "description": "稳定错误类别。"
+            "type": "string"
           },
           "message": {
-            "type": "string",
-            "description": "中文说明（脱敏）。"
+            "type": "string"
           },
           "object_key": {
-            "type": "string",
-            "description": "对象键。"
+            "type": "string"
           },
           "repo": {
-            "type": "string",
-            "description": "仓库名。"
+            "type": "string"
           }
         }
       },
@@ -2951,6 +3145,9 @@
           "mappings",
           "conflicts",
           "blocked",
+          "configuration_incomplete_count",
+          "supported_objects_not_migrated",
+          "unresolved_conflict_count",
           "object_count",
           "total_bytes",
           "estimated_disk_bytes",
@@ -2959,52 +3156,55 @@
         ],
         "properties": {
           "blocked": {
-            "type": "boolean",
-            "description": "是否存在阻断执行的未决冲突。"
+            "type": "boolean"
+          },
+          "configuration_incomplete_count": {
+            "type": "integer",
+            "format": "int64"
           },
           "conflicts": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PlanConflict"
-            },
-            "description": "冲突清单（存在未决阻断性冲突时不可执行）。"
+            }
           },
           "disk_sufficient": {
-            "type": "boolean",
-            "description": "磁盘空间是否满足估算。"
+            "type": "boolean"
           },
           "estimated_disk_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "目标空间估算（字节，含安全系数与保留量，NFR-12）。"
+            "format": "int64"
           },
           "mappings": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RepoMapping"
-            },
-            "description": "纳入执行的仓库映射。"
+            }
           },
           "object_count": {
             "type": "integer",
-            "format": "int64",
-            "description": "对象总数。"
+            "format": "int64"
           },
           "plan_id": {
-            "type": "string",
-            "description": "计划标识（创建任务时引用）。"
+            "type": "string"
+          },
+          "supported_objects_not_migrated": {
+            "type": "integer",
+            "format": "int64"
           },
           "total_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "字节总数。"
+            "format": "int64"
+          },
+          "unresolved_conflict_count": {
+            "type": "integer",
+            "format": "int64"
           },
           "unsupported": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/UnsupportedItem"
-            },
-            "description": "不支持项清单。"
+            }
           }
         }
       },
@@ -3014,6 +3214,10 @@
         "required": [
           "task_id",
           "status",
+          "configuration_incomplete_count",
+          "supported_objects_not_migrated",
+          "validation",
+          "online_drift",
           "repositories",
           "failures",
           "failures_omitted",
@@ -3021,87 +3225,201 @@
           "excluded"
         ],
         "properties": {
+          "configuration_incomplete_count": {
+            "type": "integer",
+            "format": "int64"
+          },
           "excluded": {
             "type": "array",
             "items": {
               "type": "string"
-            },
-            "description": "显式排除的仓库（保留在报告中，不伪装成从未发现）。"
+            }
           },
           "failures": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/FailureSample"
-            },
-            "description": "失败样本（有界）。"
+            }
           },
           "failures_omitted": {
             "type": "integer",
-            "format": "int64",
-            "description": "因样本上限被省略的失败数。"
+            "format": "int64"
+          },
+          "online_drift": {
+            "$ref": "#/components/schemas/OnlineDriftSummary"
           },
           "repositories": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RepoReport"
-            },
-            "description": "分仓库报告。"
+            }
           },
           "status": {
-            "$ref": "#/components/schemas/TaskStatus",
-            "description": "最终状态。"
+            "$ref": "#/components/schemas/TaskStatus"
+          },
+          "supported_objects_not_migrated": {
+            "type": "integer",
+            "format": "int64"
           },
           "task_id": {
-            "type": "string",
-            "description": "任务标识。"
+            "type": "string"
           },
           "unsupported": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/UnsupportedItem"
-            },
-            "description": "不支持/未迁移项。"
+            }
+          },
+          "validation": {
+            "$ref": "#/components/schemas/MigrationValidation"
           }
         }
       },
       "MigrationSource": {
         "type": "object",
-        "description": "迁移源配置（发现请求体）。Nexus 账号口令仅用于传输与内存中的在线拉取，\n绝不落库、不进日志、不进任务参数快照与报告（持久化只存安全运行时引用）。",
+        "description": "迁移源配置。账号口令只用于本次请求及进程内任务凭据槽。",
         "required": [
           "kind"
         ],
         "properties": {
           "kind": {
-            "$ref": "#/components/schemas/SourceKind",
-            "description": "来源类别。"
+            "$ref": "#/components/schemas/SourceKind"
           },
           "password": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "Nexus 口令（明文仅传输与内存使用，不落库不进日志）。"
+            ]
           },
           "path": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "服务器上的路径（native-dir：Nexus 数据目录；package：包路径）；须落在 migration-workdir 白名单根内。"
+            ]
           },
           "url": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "Nexus 实例地址。online 必填；native-dir 选填——填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。"
+            ]
           },
           "username": {
             "type": [
               "string",
               "null"
+            ]
+          }
+        }
+      },
+      "MigrationValidation": {
+        "type": "object",
+        "description": "迁移结果校验汇总。",
+        "required": [
+          "proxy_positive_cache",
+          "blob",
+          "protocol_metadata"
+        ],
+        "properties": {
+          "blob": {
+            "$ref": "#/components/schemas/ValidationCounts"
+          },
+          "protocol_metadata": {
+            "$ref": "#/components/schemas/ValidationCounts"
+          },
+          "proxy_positive_cache": {
+            "$ref": "#/components/schemas/ValidationCounts"
+          }
+        }
+      },
+      "ObjectConflictDecision": {
+        "type": "object",
+        "description": "对象级冲突决策。",
+        "required": [
+          "source_repository",
+          "source_object_key",
+          "source_sha256",
+          "original_target_repository",
+          "original_target_path",
+          "observed_target_sha256",
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ConflictAction",
+            "description": "冲突处理动作。"
+          },
+          "observed_target_sha256": {
+            "type": "string",
+            "description": "计划时观察到的目标对象 sha256。"
+          },
+          "original_target_path": {
+            "type": "string",
+            "description": "原目标对象路径。"
+          },
+          "original_target_repository": {
+            "type": "string",
+            "description": "原目标仓库名。"
+          },
+          "source_object_key": {
+            "type": "string",
+            "description": "源对象键。"
+          },
+          "source_repository": {
+            "type": "string",
+            "description": "源仓库名。"
+          },
+          "source_sha256": {
+            "type": "string",
+            "description": "源对象 sha256。"
+          },
+          "target_path": {
+            "type": [
+              "string",
+              "null"
             ],
-            "description": "Nexus 用户名（配合 url 做在线拉取时提供）。"
+            "description": "决策后的目标路径。"
+          },
+          "target_repository": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "决策后的目标仓库。"
+          }
+        }
+      },
+      "OnlineDriftSummary": {
+        "type": "object",
+        "description": "在线迁移期间的源端漂移汇总。",
+        "required": [
+          "added",
+          "modified",
+          "deleted",
+          "unresolved_conflict_count",
+          "conflict_decisions"
+        ],
+        "properties": {
+          "added": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "conflict_decisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectConflictDecision"
+            }
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "modified": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unresolved_conflict_count": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -3124,7 +3442,7 @@
       },
       "PlanConflict": {
         "type": "object",
-        "description": "冲突条目（默认禁止覆盖；同校验跳过，异校验阻断待显式决策）。",
+        "description": "冲突条目。",
         "required": [
           "target",
           "path",
@@ -3133,20 +3451,26 @@
         ],
         "properties": {
           "category": {
-            "type": "string",
-            "description": "稳定类别（如「同路径同校验」「同路径不同校验」「目标仓库已存在」）。"
+            "type": "string"
+          },
+          "decision": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ObjectConflictDecision"
+              }
+            ]
           },
           "detail": {
-            "type": "string",
-            "description": "中文说明与可选决策。"
+            "type": "string"
           },
           "path": {
-            "type": "string",
-            "description": "冲突路径。"
+            "type": "string"
           },
           "target": {
-            "type": "string",
-            "description": "目标仓库名。"
+            "type": "string"
           }
         }
       },
@@ -3159,15 +3483,13 @@
         ],
         "properties": {
           "discovery_id": {
-            "type": "string",
-            "description": "引用的发现结果。"
+            "type": "string"
           },
           "mappings": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RepoMapping"
-            },
-            "description": "各仓库映射与决策。"
+            }
           }
         }
       },
@@ -3305,15 +3627,20 @@
       },
       "RepoMapping": {
         "type": "object",
-        "description": "单仓库迁移映射（计划请求）。",
+        "description": "单仓库迁移映射。",
         "required": [
           "source",
           "excluded"
         ],
         "properties": {
+          "conflict_decisions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectConflictDecision"
+            }
+          },
           "excluded": {
-            "type": "boolean",
-            "description": "是否排除（显式排除保留在报告中，任务不得全量成功）。"
+            "type": "boolean"
           },
           "manual_members": {
             "type": [
@@ -3322,33 +3649,28 @@
             ],
             "items": {
               "type": "string"
-            },
-            "description": "手动补的 group 成员（源配置未提供 Nexus 地址、配置缺失时，有序）。"
+            }
           },
           "manual_upstream_url": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "手动补的 proxy 上游地址（源配置未提供 Nexus 地址、配置缺失时）。"
+            ]
           },
           "source": {
-            "type": "string",
-            "description": "源仓库名。"
+            "type": "string"
           },
           "target": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "目标仓库名（缺省同名）。"
+            ]
           },
           "upstream_credential_ref": {
             "type": [
               "string",
               "null"
-            ],
-            "description": "proxy 上游凭据引用名（手动补配置或补凭据时提供）。"
+            ]
           }
         }
       },
@@ -3370,56 +3692,45 @@
         ],
         "properties": {
           "credential_status": {
-            "type": "string",
-            "description": "凭据引用状态（如「已映射」「未映射」）。"
+            "type": "string"
           },
           "done": {
             "type": "integer",
-            "format": "int64",
-            "description": "已完成数。"
+            "format": "int64"
           },
           "done_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "已完成字节。"
+            "format": "int64"
           },
           "duration_ms": {
             "type": "integer",
-            "format": "int64",
-            "description": "耗时（毫秒）。"
+            "format": "int64"
           },
           "failed": {
             "type": "integer",
-            "format": "int64",
-            "description": "失败数。"
+            "format": "int64"
           },
           "migrated": {
             "type": "integer",
-            "format": "int64",
-            "description": "实际迁移数。"
+            "format": "int64"
           },
           "skipped": {
             "type": "integer",
-            "format": "int64",
-            "description": "已存在跳过数（幂等命中）。"
+            "format": "int64"
           },
           "source": {
-            "type": "string",
-            "description": "源仓库名。"
+            "type": "string"
           },
           "target": {
-            "type": "string",
-            "description": "目标仓库名。"
+            "type": "string"
           },
           "total": {
             "type": "integer",
-            "format": "int64",
-            "description": "对象总数。"
+            "format": "int64"
           },
           "total_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "字节总数。"
+            "format": "int64"
           }
         }
       },
@@ -3431,6 +3742,23 @@
           "proxy",
           "group"
         ]
+      },
+      "RetryTaskRequest": {
+        "type": "object",
+        "properties": {
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "Role": {
         "type": "string",
@@ -3510,7 +3838,7 @@
       },
       "SourceKind": {
         "type": "string",
-        "description": "迁移来源类别（ADR-0015：默认离线直读原生数据目录）。",
+        "description": "迁移来源类别。",
         "enum": [
           "native-dir",
           "online",
@@ -3519,10 +3847,11 @@
       },
       "TaskInfo": {
         "type": "object",
-        "description": "任务信息与节流进度。",
+        "description": "任务信息与进度。",
         "required": [
           "task_id",
           "status",
+          "phase",
           "plan_id",
           "done_objects",
           "total_objects",
@@ -3533,44 +3862,38 @@
         ],
         "properties": {
           "created_at": {
-            "type": "string",
-            "description": "创建时间。"
+            "type": "string"
           },
           "done_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "已完成字节。"
+            "format": "int64"
           },
           "done_objects": {
             "type": "integer",
-            "format": "int64",
-            "description": "已完成对象数。"
+            "format": "int64"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/TaskPhase"
           },
           "plan_id": {
-            "type": "string",
-            "description": "引用的计划标识。"
+            "type": "string"
           },
           "status": {
-            "$ref": "#/components/schemas/TaskStatus",
-            "description": "当前状态。"
+            "$ref": "#/components/schemas/TaskStatus"
           },
           "task_id": {
-            "type": "string",
-            "description": "任务标识。"
+            "type": "string"
           },
           "total_bytes": {
             "type": "integer",
-            "format": "int64",
-            "description": "字节总数。"
+            "format": "int64"
           },
           "total_objects": {
             "type": "integer",
-            "format": "int64",
-            "description": "对象总数。"
+            "format": "int64"
           },
           "updated_at": {
-            "type": "string",
-            "description": "最近更新时间。"
+            "type": "string"
           }
         }
       },
@@ -3588,31 +3911,37 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/TaskInfo"
-            },
-            "description": "当前页任务。"
+            }
           },
           "page": {
             "type": "integer",
             "format": "int32",
-            "description": "当前页码（从 1 起）。",
             "minimum": 0
           },
           "page_size": {
             "type": "integer",
             "format": "int32",
-            "description": "每页条数。",
             "minimum": 0
           },
           "total": {
             "type": "integer",
-            "format": "int64",
-            "description": "总条数。"
+            "format": "int64"
           }
         }
       },
+      "TaskPhase": {
+        "type": "string",
+        "description": "迁移任务固定四阶段。",
+        "enum": [
+          "initial-transfer",
+          "awaiting-cutover",
+          "finalizing",
+          "completed"
+        ]
+      },
       "TaskStatus": {
         "type": "string",
-        "description": "任务状态机十态（M1-FR-028）。",
+        "description": "迁移任务固定十态。",
         "enum": [
           "queued",
           "running",
@@ -3696,16 +4025,13 @@
         ],
         "properties": {
           "category": {
-            "type": "string",
-            "description": "稳定类别（如「非受支持格式」「系统配置」）。"
+            "type": "string"
           },
           "name": {
-            "type": "string",
-            "description": "名称或坐标。"
+            "type": "string"
           },
           "reason": {
-            "type": "string",
-            "description": "中文说明。"
+            "type": "string"
           }
         }
       },
@@ -3865,6 +4191,29 @@
             "type": "integer",
             "format": "int64",
             "description": "总条数。"
+          }
+        }
+      },
+      "ValidationCounts": {
+        "type": "object",
+        "description": "校验计数。",
+        "required": [
+          "checked",
+          "passed",
+          "failed"
+        ],
+        "properties": {
+          "checked": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "passed": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },

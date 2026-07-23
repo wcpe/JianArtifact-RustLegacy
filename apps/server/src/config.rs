@@ -17,6 +17,10 @@ pub struct Config {
     pub database_path: PathBuf,
     /// blob 数据目录，就绪自检会在此写探针文件。
     pub data_dir: PathBuf,
+    /// Nexus 离线来源允许访问的服务器工作根；未配置时禁用离线发现。
+    pub migration_workdir: Option<PathBuf>,
+    /// 单个迁移任务内的对象并发数，默认 4，仅允许 1 到 8。
+    pub migration_object_concurrency: usize,
     /// 日志级别过滤（tracing EnvFilter 语法，如 `info`）。
     pub log_level: String,
     /// JWT HS256 会话令牌签名密钥（机密，仅经环境变量注入，缺失即拒绝启动，不落库不进日志）。
@@ -45,6 +49,8 @@ impl Default for Config {
             bind: "0.0.0.0:8080".to_string(),
             database_path: PathBuf::from("data/jianartifact.db"),
             data_dir: PathBuf::from("data/blobs"),
+            migration_workdir: None,
+            migration_object_concurrency: 4,
             log_level: "info".to_string(),
             // 密钥无内置默认值，须经环境变量注入；空值在 build_app 处被拒绝启动
             jwt_secret: String::new(),
@@ -88,11 +94,14 @@ mod tests {
         assert_eq!(config.max_artifact_bytes, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.min_free_bytes, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.min_free_percent, 5);
+        assert_eq!(config.migration_workdir, None);
         assert_eq!(config.public_base_url, None);
         assert_eq!(config.maven_metadata_ttl_secs, 1800);
         assert_eq!(config.npm_packument_ttl_secs, 1800);
         assert_eq!(config.npm_publish_max_bytes, 134_217_728);
+        assert_eq!(config.migration_object_concurrency, 4);
         let value = serde_json::to_value(config)?;
+        assert_eq!(value.get("migration-object-concurrency"), Some(&4.into()));
         assert!(value.get("max-artifact-bytes").is_some());
         assert!(value.get("min-free-bytes").is_some());
         assert!(value.get("min-free-percent").is_some());

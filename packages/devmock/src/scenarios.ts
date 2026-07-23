@@ -5,6 +5,25 @@ import type { SeedData, SeedFile, SeedRepo, SeedTask, SeedToken, SeedUser } from
 
 type RepoInfo = components['schemas']['RepoInfo'];
 type TaskInfo = components['schemas']['TaskInfo'];
+type MigrationReport = components['schemas']['MigrationReport'];
+
+function emptyValidation(): MigrationReport['validation'] {
+  return {
+    blob: { checked: 0, passed: 0, failed: 0 },
+    protocol_metadata: { checked: 0, passed: 0, failed: 0 },
+    proxy_positive_cache: { checked: 0, passed: 0, failed: 0 },
+  };
+}
+
+function emptyOnlineDrift(): MigrationReport['online_drift'] {
+  return {
+    added: 0,
+    modified: 0,
+    deleted: 0,
+    unresolved_conflict_count: 0,
+    conflict_decisions: [],
+  };
+}
 
 /** 九类场景标识。 */
 export type ScenarioId =
@@ -228,6 +247,7 @@ function succeededTask(): SeedTask {
     task_id: 'task_hist_1',
     plan_id: 'plan_hist_1',
     status: 'succeeded',
+    phase: 'completed',
     done_objects: 120,
     total_objects: 120,
     done_bytes: 734_003_200,
@@ -237,9 +257,14 @@ function succeededTask(): SeedTask {
   };
   return {
     info,
+    source: 'package',
     report: {
       task_id: info.task_id,
       status: 'succeeded',
+      configuration_incomplete_count: 0,
+      supported_objects_not_migrated: 0,
+      validation: emptyValidation(),
+      online_drift: emptyOnlineDrift(),
       repositories: [
         {
           source: 'maven-releases',
@@ -270,6 +295,7 @@ function runningTask(): SeedTask {
       task_id: 'task_run_1',
       plan_id: 'plan_run_1',
       status: 'running',
+      phase: 'initial-transfer',
       done_objects: 10,
       total_objects: 100,
       done_bytes: 104_857_600,
@@ -278,6 +304,7 @@ function runningTask(): SeedTask {
       updated_at: '2026-07-01T09:05:00Z',
     },
     report: null,
+    source: 'package',
   };
 }
 
@@ -287,6 +314,7 @@ function partialTask(): SeedTask {
     task_id: 'task_part_1',
     plan_id: 'plan_part_1',
     status: 'partial',
+    phase: 'completed',
     done_objects: 96,
     total_objects: 100,
     done_bytes: 900_000_000,
@@ -296,9 +324,14 @@ function partialTask(): SeedTask {
   };
   return {
     info,
+    source: 'package',
     report: {
       task_id: info.task_id,
       status: 'partial',
+      configuration_incomplete_count: 0,
+      supported_objects_not_migrated: 10,
+      validation: emptyValidation(),
+      online_drift: emptyOnlineDrift(),
       repositories: [
         {
           source: 'npm-mirror',

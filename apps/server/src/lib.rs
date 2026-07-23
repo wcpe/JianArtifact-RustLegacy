@@ -10,6 +10,7 @@ pub mod domain;
 pub mod error;
 pub mod health;
 pub mod logging;
+pub mod migration;
 pub mod persistence;
 pub mod protocol;
 pub mod repository;
@@ -44,6 +45,11 @@ pub(crate) async fn build_app_with_bootstrap(
     username: Option<String>,
     password: Option<String>,
 ) -> Result<Router, StartupError> {
+    if !(1..=8).contains(&config.migration_object_concurrency) {
+        return Err(StartupError::AuthConfig(
+            "迁移对象并发数必须在 1 到 8 之间".to_string(),
+        ));
+    }
     // JWT 密钥属机密配置，缺失即拒绝启动（不落库、不进日志）
     if config.jwt_secret.trim().is_empty() {
         return Err(StartupError::AuthConfig(
@@ -58,6 +64,7 @@ pub(crate) async fn build_app_with_bootstrap(
     ));
     blob_store.initialize().await?;
     let pool = persistence::init(&config.database_url(), &config.database_path).await?;
+    recover_migration_tasks(&pool).await?;
     let referenced = persistence::referenced_blob_hashes(&pool).await?;
     let recovered = blob_store.recover(&referenced).await?;
     tracing::info!(
@@ -85,6 +92,19 @@ pub(crate) async fn build_app_with_bootstrap(
         artifacts,
     };
     Ok(api::router(state))
+}
+
+async fn recover_migration_tasks(pool: &sqlx::SqlitePool) -> Result<(), StartupError> {
+    match persistence::migration::recover_migration_tasks_on_startup(pool).await {
+        Ok(recovered) => {
+            tracing::info!(recovered_tasks = recovered, "已完成迁移任务启动恢复");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(code = error.code(), "启动恢复迁移任务状态失败");
+            Err(StartupError::MigrationRecovery)
+        }
+    }
 }
 
 async fn recover_blob_reclamations(
@@ -122,6 +142,8 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             database_path: 目录.path().join("bootstrap.db"),
             data_dir: 目录.path().join("blobs"),
+            migration_workdir: Some(目录.path().join("migration")),
+            migration_object_concurrency: 4,
             log_level: "warn".to_string(),
             jwt_secret: JWT_SECRET.to_string(),
             session_ttl_hours: 8,
@@ -132,6 +154,25 @@ mod tests {
             max_artifact_bytes: 5 * 1024 * 1024 * 1024,
             min_free_bytes: 5 * 1024 * 1024 * 1024,
             min_free_percent: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn 迁移对象并发数超出范围时启动拒绝() {
+        for value in [0, 9] {
+            let 目录 = tempfile::tempdir().unwrap();
+            let mut config = 测试配置(&目录);
+            config.migration_object_concurrency = value;
+
+            let error = build_app_with_bootstrap(config, None, None)
+                .await
+                .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("迁移对象并发数必须在 1 到 8 之间")
+            );
         }
     }
 

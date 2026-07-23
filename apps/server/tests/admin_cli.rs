@@ -35,6 +35,8 @@ fn config(dir: &TempDir) -> Config {
         bind: "127.0.0.1:0".to_string(),
         database_path: dir.path().join("metadata/test.db"),
         data_dir: dir.path().join("blobs"),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: 8,

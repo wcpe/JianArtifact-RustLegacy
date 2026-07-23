@@ -3,6 +3,7 @@
 
 pub mod artifact;
 pub mod encoding;
+pub mod migration;
 pub mod repository;
 
 use serde::{Deserialize, Serialize};

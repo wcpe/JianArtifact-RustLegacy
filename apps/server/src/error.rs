@@ -24,6 +24,8 @@ pub enum StartupError {
     Storage(crate::storage::StorageError),
     #[error("启动恢复 blob 回收意图失败")]
     BlobReclamationRecovery,
+    #[error("启动恢复迁移任务状态失败")]
+    MigrationRecovery,
     #[error("认证配置无效：{0}")]
     AuthConfig(String),
 }

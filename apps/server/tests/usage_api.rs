@@ -49,6 +49,8 @@ async fn setup(public_base_url: Option<&str>) -> TestContext {
         bind: "127.0.0.1:0".to_string(),
         database_path,
         data_dir: dir.path().join("blobs"),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: 8,

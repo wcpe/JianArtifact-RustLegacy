@@ -26,6 +26,17 @@ pub enum CliCommand {
         /// 是否从标准输入读取单行口令。
         password_stdin: bool,
     },
+    /// 从 Nexus 原生目录导出离线迁移包。
+    MigrationExport {
+        /// 迁移工作根内的 Nexus 原生目录相对路径。
+        source: String,
+        /// 迁移工作根内的输出目录相对路径。
+        output: String,
+        /// 迁移工作根内的 canonical JSON 仓库配置相对路径。
+        repository_config: String,
+        /// 已确认的 Nexus 3.70.x 版本。
+        nexus_version: String,
+    },
 }
 
 /// CLI 参数、输入或本地数据库操作错误。
@@ -69,8 +80,11 @@ where
         [first, second, rest @ ..] if first == "admin" && second == "reset-password" => {
             parse_reset_password(rest)
         }
+        [first, second, rest @ ..] if first == "migration" && second == "export" => {
+            parse_migration_export(rest)
+        }
         _ => Err(AdminError::InvalidArguments(
-            "支持 openapi 或 admin reset-password <用户名> [--password-stdin]",
+            "支持 openapi、admin reset-password 或 migration export",
         )),
     }
 }
@@ -112,6 +126,42 @@ fn parse_reset_password(args: &[String]) -> Result<CliCommand, AdminError> {
         username,
         password_stdin,
     })
+}
+
+fn parse_migration_export(args: &[String]) -> Result<CliCommand, AdminError> {
+    let mut values = std::collections::BTreeMap::new();
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if !matches!(
+            option,
+            "--source" | "--output" | "--repository-config" | "--nexus-version"
+        ) || values.contains_key(option)
+        {
+            return Err(AdminError::InvalidArguments("存在未知或重复选项"));
+        }
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.is_empty() && !value.starts_with('-'))
+            .ok_or(AdminError::InvalidArguments("导出选项缺少参数值"))?;
+        values.insert(option, value.clone());
+        index += 2;
+    }
+    Ok(CliCommand::MigrationExport {
+        source: take_export_option(&mut values, "--source")?,
+        output: take_export_option(&mut values, "--output")?,
+        repository_config: take_export_option(&mut values, "--repository-config")?,
+        nexus_version: take_export_option(&mut values, "--nexus-version")?,
+    })
+}
+
+fn take_export_option(
+    values: &mut std::collections::BTreeMap<&str, String>,
+    option: &'static str,
+) -> Result<String, AdminError> {
+    values.remove(option).ok_or(AdminError::InvalidArguments(
+        "缺少 migration export 必需选项",
+    ))
 }
 
 /// 打开既有数据库、读取新口令并按用户名执行单条更新。
@@ -336,6 +386,64 @@ mod tests {
                 "--password-stdin",
                 "--password-stdin",
             ],
+        ] {
+            assert!(parse(&values).is_err());
+        }
+    }
+
+    #[test]
+    fn migration_export严格解析全部必需选项() {
+        let expected = CliCommand::MigrationExport {
+            source: "nexus/blobs".to_string(),
+            output: "exports/package".to_string(),
+            repository_config: "config/repositories.json".to_string(),
+            nexus_version: "3.70.4-02".to_string(),
+        };
+        assert_eq!(
+            parse(&[
+                "migration",
+                "export",
+                "--output",
+                "exports/package",
+                "--source",
+                "nexus/blobs",
+                "--nexus-version",
+                "3.70.4-02",
+                "--repository-config",
+                "config/repositories.json",
+            ])
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn migration_export拒绝缺失重复未知和无值选项() {
+        for values in [
+            vec![
+                "migration",
+                "export",
+                "--source",
+                "source",
+                "--output",
+                "package",
+            ],
+            vec![
+                "migration",
+                "export",
+                "--source",
+                "source",
+                "--source",
+                "other",
+                "--output",
+                "package",
+                "--repository-config",
+                "repositories.json",
+                "--nexus-version",
+                "3.70.4-02",
+            ],
+            vec!["migration", "export", "--unknown", "value"],
+            vec!["migration", "export", "--source", "--output"],
         ] {
             assert!(parse(&values).is_err());
         }

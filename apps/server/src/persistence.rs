@@ -10,13 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use crate::domain::Role;
+use crate::domain::encoding::strict_base64_decode;
 use crate::domain::repository::{
     AclRecord, Format, OverwritePolicy, Permission, RepoType, Repository, VersionPolicy, Visibility,
 };
 use crate::error::{ApiError, StartupError};
+
+pub(crate) mod migration;
 
 /// 编译期内嵌的迁移集合（`apps/server/migrations`）。
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -99,6 +102,40 @@ pub struct NpmHostedVersionInput {
     pub version: String,
     pub manifest_json: String,
     pub dist_tags: Vec<String>,
+}
+
+/// 迁移 npm hosted 包的单版本元数据。
+pub struct NpmMigrationVersionInput {
+    pub version: String,
+    pub manifest_json: String,
+    pub tarball_path: String,
+    pub shasum: Option<String>,
+    pub integrity: Option<String>,
+}
+
+/// 迁移 npm hosted 包元数据，引用已经校验提交的 tarball 制品。
+pub struct NpmMigrationPackageInput {
+    pub repo_id: i64,
+    pub package_name: String,
+    pub versions: Vec<NpmMigrationVersionInput>,
+    pub dist_tags: BTreeMap<String, String>,
+}
+
+/// npm 迁移单类校验计数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NpmMigrationValidationCounts {
+    pub checked: u64,
+    pub passed: u64,
+    pub failed: u64,
+}
+
+/// npm 迁移协议元数据与 proxy 正缓存校验结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NpmMigrationValidationReport {
+    #[serde(default)]
+    pub proxy_positive_cache: NpmMigrationValidationCounts,
+    #[serde(default)]
+    pub protocol_metadata: NpmMigrationValidationCounts,
 }
 
 /// npm proxy tarball 映射输入。
@@ -751,14 +788,20 @@ pub async fn commit_proxy_artifact(
     pool: &SqlitePool,
     input: &ArtifactWriteInput,
     expected_upstream_url: &str,
+    allow_overwrite: bool,
 ) -> Result<ArtifactCommitResult, ArtifactCommitError> {
     let size = artifact_size_i64(input.size).map_err(ArtifactCommitError::Internal)?;
+    if !allow_overwrite {
+        return insert_proxy_artifact_without_overwrite(pool, input, size, expected_upstream_url)
+            .await;
+    }
+
     let mut tx = pool
         .begin()
         .await
         .map_err(artifact_commit_internal("开启代理缓存提交事务失败"))?;
     let old = load_replaced_sha256(&mut tx, input).await?;
-    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url).await?;
+    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url, true).await?;
     let Some(row) = row else {
         tx.rollback()
             .await
@@ -766,6 +809,27 @@ pub async fn commit_proxy_artifact(
         return Err(ArtifactCommitError::StaleProxyConfiguration);
     };
     finish_artifact_upsert(tx, row, old, input).await
+}
+
+async fn insert_proxy_artifact_without_overwrite(
+    pool: &SqlitePool,
+    input: &ArtifactWriteInput,
+    size: i64,
+    expected_upstream_url: &str,
+) -> Result<ArtifactCommitResult, ArtifactCommitError> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(artifact_commit_internal("获取代理缓存提交连接失败"))?;
+    let row = conditional_proxy_upsert(&mut connection, input, size, expected_upstream_url, false)
+        .await?
+        .ok_or(ArtifactCommitError::StaleProxyConfiguration)?;
+    let artifact = ArtifactRecord::try_from(row).map_err(ArtifactCommitError::Internal)?;
+    Ok(ArtifactCommitResult {
+        artifact,
+        reclamation: None,
+        created: true,
+    })
 }
 
 async fn insert_artifact_without_overwrite(
@@ -828,20 +892,31 @@ async fn load_replaced_sha256(
 }
 
 async fn conditional_proxy_upsert(
-    tx: &mut Transaction<'_, Sqlite>,
+    connection: &mut SqliteConnection,
     input: &ArtifactWriteInput,
     size: i64,
     expected_upstream_url: &str,
+    allow_overwrite: bool,
 ) -> Result<Option<ArtifactRow>, ArtifactCommitError> {
+    let conflict_clause = if allow_overwrite {
+        " ON CONFLICT(repo_id, path) DO UPDATE SET sha256 = excluded.sha256, sha1 = excluded.sha1, md5 = excluded.md5, sha512 = excluded.sha512, size = excluded.size, cached = excluded.cached, updated_at = datetime('now')"
+    } else {
+        ""
+    };
     let sql = format!(
-        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM repositories WHERE id = ? AND repo_type = 'proxy' AND upstream_url = ? ON CONFLICT(repo_id, path) DO UPDATE SET sha256 = excluded.sha256, sha1 = excluded.sha1, md5 = excluded.md5, sha512 = excluded.sha512, size = excluded.size, cached = excluded.cached, updated_at = datetime('now') RETURNING {ARTIFACT_COLUMNS}"
+        "INSERT INTO artifacts (repo_id, path, sha256, sha1, md5, sha512, size, cached) SELECT ?, ?, ?, ?, ?, ?, ?, ? FROM repositories WHERE id = ? AND repo_type = 'proxy' AND upstream_url = ?{conflict_clause} RETURNING {ARTIFACT_COLUMNS}"
     );
     bind_artifact_write(sqlx::query_as::<_, ArtifactRow>(&sql), input, size)
         .bind(input.repo_id)
         .bind(expected_upstream_url)
-        .fetch_optional(&mut **tx)
+        .fetch_optional(connection)
         .await
-        .map_err(artifact_commit_internal("提交代理缓存索引失败"))
+        .map_err(|error| match error {
+            sqlx::Error::Database(database_error) if database_error.is_unique_violation() => {
+                ArtifactCommitError::Conflict
+            }
+            _ => ArtifactCommitError::Internal(ApiError::internal("提交代理缓存索引失败")),
+        })
 }
 
 fn bind_artifact_write<'q>(
@@ -912,6 +987,261 @@ pub async fn commit_npm_hosted_version(
         .await
         .map_err(|_| npm_internal("提交 npm 发布事务失败"))?;
     ArtifactRecord::try_from(artifact).map_err(NpmVersionCommitError::Internal)
+}
+
+/// 校验迁移 npm packument 引用的 tarball 与声明摘要一致。
+pub async fn validate_npm_migration_package(
+    pool: &SqlitePool,
+    input: &NpmMigrationPackageInput,
+) -> Result<(), ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启 npm 迁移摘要校验事务失败"))?;
+    for version in &input.versions {
+        let artifact = load_npm_migration_artifact(&mut tx, input, version).await?;
+        validate_npm_migration_digests(version, &artifact)?;
+    }
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交 npm 迁移摘要校验事务失败"))?;
+    Ok(())
+}
+
+/// 为迁移已提交的 npm tarball 重建 hosted 版本与 dist-tag 元数据。
+pub async fn import_npm_migration_package(
+    pool: &SqlitePool,
+    input: &NpmMigrationPackageInput,
+) -> Result<(), ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启 npm 迁移元数据事务失败"))?;
+    for version in &input.versions {
+        import_npm_migration_version(&mut tx, input, version).await?;
+    }
+    sqlx::query("DELETE FROM npm_dist_tags WHERE repo_id = ? AND package_name = ?")
+        .bind(input.repo_id)
+        .bind(&input.package_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::internal("更新 npm 迁移 dist-tag 失败"))?;
+    for (tag, version) in &input.dist_tags {
+        sqlx::query(
+            "INSERT INTO npm_dist_tags (repo_id, package_name, tag, version) VALUES (?, ?, ?, ?)",
+        )
+        .bind(input.repo_id)
+        .bind(&input.package_name)
+        .bind(tag)
+        .bind(version)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| ApiError::internal("更新 npm 迁移 dist-tag 失败"))?;
+    }
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交 npm 迁移元数据事务失败"))?;
+    Ok(())
+}
+
+/// 将 npm 迁移校验计数写入任务报告，供报告接口读取。
+pub async fn store_npm_migration_validation_report(
+    pool: &SqlitePool,
+    task_id: &str,
+    validation: NpmMigrationValidationReport,
+) -> Result<(), ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|_| ApiError::internal("开启 npm 迁移报告事务失败"))?;
+    let report_json: Option<String> =
+        sqlx::query_scalar("SELECT report_json FROM migration_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| ApiError::internal("读取 npm 迁移报告失败"))?
+            .ok_or_else(|| ApiError::internal("npm 迁移任务不存在"))?;
+    let mut report = match report_json {
+        Some(value) => serde_json::from_str(&value)
+            .map_err(|_| ApiError::internal("npm 迁移报告不是有效 JSON"))?,
+        None => serde_json::json!({}),
+    };
+    merge_npm_migration_validation(&mut report, validation)?;
+    let serialized = serde_json::to_string(&report)
+        .map_err(|_| ApiError::internal("序列化 npm 迁移报告失败"))?;
+    sqlx::query(
+        "UPDATE migration_tasks SET report_json = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(serialized)
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| ApiError::internal("写入 npm 迁移报告失败"))?;
+    tx.commit()
+        .await
+        .map_err(|_| ApiError::internal("提交 npm 迁移报告事务失败"))?;
+    Ok(())
+}
+
+/// 读取任务报告中已持久化的 npm 迁移校验计数。
+pub async fn load_npm_migration_validation_report(
+    pool: &SqlitePool,
+    task_id: &str,
+) -> Result<Option<NpmMigrationValidationReport>, ApiError> {
+    let report_json: Option<String> =
+        sqlx::query_scalar("SELECT report_json FROM migration_tasks WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| ApiError::internal("读取 npm 迁移报告失败"))?
+            .ok_or_else(|| ApiError::internal("npm 迁移任务不存在"))?;
+    let Some(report_json) = report_json else {
+        return Ok(None);
+    };
+    let report: serde_json::Value = serde_json::from_str(&report_json)
+        .map_err(|_| ApiError::internal("npm 迁移报告不是有效 JSON"))?;
+    report
+        .get("validation")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::internal("npm 迁移校验计数无效"))
+}
+
+fn merge_npm_migration_validation(
+    report: &mut serde_json::Value,
+    validation: NpmMigrationValidationReport,
+) -> Result<(), ApiError> {
+    let report = report
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("npm 迁移报告必须为对象"))?;
+    let validation_value = report
+        .entry("validation")
+        .or_insert_with(|| serde_json::json!({}));
+    let validation_object = validation_value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("npm 迁移报告校验字段必须为对象"))?;
+    validation_object.insert(
+        "proxy_positive_cache".to_string(),
+        serde_json::to_value(validation.proxy_positive_cache)
+            .map_err(|_| ApiError::internal("序列化 proxy 正缓存校验计数失败"))?,
+    );
+    validation_object.insert(
+        "protocol_metadata".to_string(),
+        serde_json::to_value(validation.protocol_metadata)
+            .map_err(|_| ApiError::internal("序列化 npm 协议元数据校验计数失败"))?,
+    );
+    Ok(())
+}
+
+async fn import_npm_migration_version(
+    tx: &mut Transaction<'_, Sqlite>,
+    package: &NpmMigrationPackageInput,
+    version: &NpmMigrationVersionInput,
+) -> Result<(), ApiError> {
+    let artifact = load_npm_migration_artifact(tx, package, version).await?;
+    validate_npm_migration_digests(version, &artifact)?;
+    sqlx::query("INSERT INTO npm_versions (repo_id, package_name, version, manifest_json, tarball_path, artifact_id, sha256, sha1, md5, sha512) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(repo_id, package_name, version) DO NOTHING")
+        .bind(package.repo_id)
+        .bind(&package.package_name)
+        .bind(&version.version)
+        .bind(&version.manifest_json)
+        .bind(&version.tarball_path)
+        .bind(artifact.id)
+        .bind(&artifact.sha256)
+        .bind(&artifact.sha1)
+        .bind(&artifact.md5)
+        .bind(&artifact.sha512)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("写入 npm 迁移版本元数据失败"))?;
+    let current: (String, String, i64, String) = sqlx::query_as("SELECT manifest_json, tarball_path, artifact_id, sha256 FROM npm_versions WHERE repo_id = ? AND package_name = ? AND version = ?")
+        .bind(package.repo_id)
+        .bind(&package.package_name)
+        .bind(&version.version)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("核对 npm 迁移版本元数据失败"))?;
+    if current
+        != (
+            version.manifest_json.clone(),
+            version.tarball_path.clone(),
+            artifact.id,
+            artifact.sha256,
+        )
+    {
+        return Err(ApiError::conflict(
+            "NPM_MIGRATION_METADATA_CONFLICT",
+            "目标 npm 版本元数据与迁移来源不一致",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_npm_migration_artifact(
+    tx: &mut Transaction<'_, Sqlite>,
+    package: &NpmMigrationPackageInput,
+    version: &NpmMigrationVersionInput,
+) -> Result<ArtifactRow, ApiError> {
+    let sql = format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE repo_id = ? AND path = ?");
+    sqlx::query_as::<_, ArtifactRow>(&sql)
+        .bind(package.repo_id)
+        .bind(&version.tarball_path)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| ApiError::internal("查询 npm 迁移 tarball 失败"))?
+        .ok_or_else(|| ApiError::internal("npm 迁移元数据引用的 tarball 不存在"))
+}
+
+fn validate_npm_migration_digests(
+    version: &NpmMigrationVersionInput,
+    artifact: &ArtifactRow,
+) -> Result<(), ApiError> {
+    if version
+        .shasum
+        .as_deref()
+        .is_some_and(|value| value != artifact.sha1)
+    {
+        return Err(npm_migration_digest_conflict());
+    }
+    if let Some(integrity) = version.integrity.as_deref() {
+        let expected = integrity
+            .strip_prefix("sha512-")
+            .and_then(strict_base64_decode)
+            .ok_or_else(npm_migration_digest_conflict)?;
+        let actual =
+            decode_lower_hex(&artifact.sha512).ok_or_else(npm_migration_digest_conflict)?;
+        if expected != actual {
+            return Err(npm_migration_digest_conflict());
+        }
+    }
+    Ok(())
+}
+
+fn npm_migration_digest_conflict() -> ApiError {
+    ApiError::conflict(
+        "NPM_MIGRATION_DIGEST_CONFLICT",
+        "npm packument 摘要与迁移 tarball 不一致",
+    )
+}
+
+fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((lower_hex_nibble(pair[0])? << 4) | lower_hex_nibble(pair[1])?))
+        .collect()
+}
+
+fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 async fn insert_npm_version(
@@ -1293,7 +1623,7 @@ pub async fn commit_npm_proxy_tarball(
         .begin()
         .await
         .map_err(|_| npm_internal("开启 npm tarball 缓存事务失败"))?;
-    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url)
+    let row = conditional_proxy_upsert(&mut tx, input, size, expected_upstream_url, true)
         .await
         .map_err(|error| match error {
             ArtifactCommitError::StaleProxyConfiguration => {
@@ -3672,6 +4002,7 @@ mod tests {
             &pool,
             &制品输入(repo_id.0, "cached.bin", 'a', true, 1),
             "https://old.example/base",
+            true,
         )
         .await
         .unwrap_err();
@@ -3681,6 +4012,202 @@ mod tests {
         ));
         assert!(
             find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proxy拒绝覆盖并发提交不同路径全部成功() {
+        const 并发数: usize = 4;
+        const 轮数: usize = 64;
+        const 上游地址: &str = "https://upstream.example/base";
+
+        let (pool, database_path) = concurrent_test_pool().await;
+        let repo_id: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('proxy-concurrent-commit', 'raw', 'proxy', 'private', ?) RETURNING id",
+        )
+        .bind(上游地址)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for 轮次 in 0..轮数 {
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(并发数));
+            let mut tasks = tokio::task::JoinSet::new();
+            for 对象序号 in 0..并发数 {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                tasks.spawn(async move {
+                    barrier.wait().await;
+                    commit_proxy_artifact(
+                        &pool,
+                        &制品输入(
+                            repo_id.0,
+                            &format!("并发/{轮次}/{对象序号}.bin"),
+                            ['a', 'b', 'c', 'd'][对象序号],
+                            true,
+                            1,
+                        ),
+                        上游地址,
+                        false,
+                    )
+                    .await
+                });
+            }
+
+            let mut 成功数 = 0;
+            while let Some(result) = tasks.join_next().await {
+                if result.expect("并发提交任务不应崩溃").is_ok() {
+                    成功数 += 1;
+                }
+            }
+            assert_eq!(成功数, 并发数, "第 {轮次} 轮四个不同对象应全部提交成功");
+        }
+
+        let object_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM artifacts WHERE repo_id = ?")
+                .bind(repo_id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            object_count.0,
+            (轮数 * 并发数) as i64,
+            "并发提交完成后对象总数应与轮数和并发数一致"
+        );
+
+        pool.close().await;
+        tokio::fs::remove_file(database_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn 迁移proxy提交保留外部改写冲突守卫() {
+        let pool = test_pool().await;
+        let repo_id: (i64,) = sqlx::query_as(
+            "INSERT INTO repositories (name, format, repo_type, visibility, upstream_url) VALUES ('migration-proxy-conflict', 'raw', 'proxy', 'private', 'https://upstream.example/base') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        commit_proxy_artifact(
+            &pool,
+            &制品输入(repo_id.0, "cached.bin", 'a', true, 1),
+            "https://upstream.example/base",
+            true,
+        )
+        .await
+        .unwrap();
+
+        let error = commit_proxy_artifact(
+            &pool,
+            &制品输入(repo_id.0, "cached.bin", 'b', true, 1),
+            "https://upstream.example/base",
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ArtifactCommitError::Conflict));
+        assert_eq!(
+            find_artifact_by_path(&pool, repo_id.0, "cached.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .sha256,
+            "a".repeat(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn npm迁移校验计数写入报告且保留既有字段() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO migration_discoveries (id, source_kind, source_instance_id, snapshot_id, snapshot_time, source_locator, discovery_json) VALUES ('discovery-report', 'native-dir', 'source', 'snapshot', '0', '/source', '{}')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO migration_tasks (id, discovery_id, plan_id, source_kind, status, phase, snapshot_json, report_json, total_objects, total_bytes) VALUES ('task-report', 'discovery-report', 'plan-report', 'native-dir', 'queued', 'initial-transfer', '{}', '{\"existing\":true,\"validation\":{\"blob\":{\"checked\":1,\"passed\":1,\"failed\":0}}}', 0, 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let validation = NpmMigrationValidationReport {
+            proxy_positive_cache: NpmMigrationValidationCounts {
+                checked: 2,
+                passed: 1,
+                failed: 1,
+            },
+            protocol_metadata: NpmMigrationValidationCounts {
+                checked: 3,
+                passed: 2,
+                failed: 1,
+            },
+        };
+
+        store_npm_migration_validation_report(&pool, "task-report", validation)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            load_npm_migration_validation_report(&pool, "task-report")
+                .await
+                .unwrap(),
+            Some(validation)
+        );
+        let report: String =
+            sqlx::query_scalar("SELECT report_json FROM migration_tasks WHERE id = 'task-report'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(
+            report.get("existing").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report
+                .pointer("/validation/blob/checked")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn npm迁移摘要冲突不写入版本与标签() {
+        let pool = test_pool().await;
+        let repo_id = 创建制品测试仓库(&pool, "npm-migration-digest").await;
+        commit_artifact(
+            &pool,
+            &制品输入(repo_id, "pkg/-/pkg-1.0.0.tgz", 'a', false, 1),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut input = NpmMigrationPackageInput {
+            repo_id,
+            package_name: "pkg".to_string(),
+            versions: vec![NpmMigrationVersionInput {
+                version: "1.0.0".to_string(),
+                manifest_json: "{}".to_string(),
+                tarball_path: "pkg/-/pkg-1.0.0.tgz".to_string(),
+                shasum: Some("b".repeat(40)),
+                integrity: Some("sha512-YQ==".to_string()),
+            }],
+            dist_tags: BTreeMap::from([("latest".to_string(), "1.0.0".to_string())]),
+        };
+
+        let error = import_npm_migration_package(&pool, &input)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "NPM_MIGRATION_DIGEST_CONFLICT");
+        input.versions[0].shasum = None;
+        let integrity_error = validate_npm_migration_package(&pool, &input)
+            .await
+            .unwrap_err();
+        assert_eq!(integrity_error.code(), "NPM_MIGRATION_DIGEST_CONFLICT");
+        assert!(
+            find_npm_package(&pool, repo_id, "pkg")
                 .await
                 .unwrap()
                 .is_none()

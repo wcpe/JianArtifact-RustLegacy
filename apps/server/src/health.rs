@@ -113,6 +113,8 @@ mod tests {
                 bind: "127.0.0.1:0".to_string(),
                 database_path: dir.path().join("test.db"),
                 data_dir,
+                migration_workdir: Some(dir.path().join("migration")),
+                migration_object_concurrency: 4,
                 log_level: "warn".to_string(),
                 jwt_secret: "health-test-secret".to_string(),
                 session_ttl_hours: 8,

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 受控本地上游：仅提供仓库内 fixture，不访问公网，并记录逐路径请求次数。
+// 受控本地上游：仅提供仓库内 fixture，不访问公网，并记录逐路径及方法请求次数。
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -23,7 +23,25 @@ const contentTypes = new Map([
   ['.tgz', 'application/octet-stream'],
 ]);
 const counts = new Map();
+const methodCounts = new Map();
+const artifactWaiters = new Set();
 let enabled = true;
+let artifactHeld = false;
+
+const largeBlockBytes = 8 * 1024 * 1024;
+const blockPatternStride = 131;
+const proxySeed = 0x22;
+const migrationSeed = 0x33;
+const largeSamples = new Map([
+  ['1g', { bytes: sampleBytes('ACCEPTANCE_PERFORMANCE_1G_BYTES', 1024 * 1024 * 1024), sha256: null }],
+  ['5g', { bytes: sampleBytes('ACCEPTANCE_PERFORMANCE_5G_BYTES', 5 * 1024 * 1024 * 1024), sha256: null }],
+]);
+
+function sampleBytes(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} 必须是正整数`);
+  return value;
+}
 
 function tarHeader(name, size, mode) {
   const header = Buffer.alloc(512);
@@ -79,7 +97,18 @@ const npmFixtures = new Map(
 );
 
 function stateBody() {
-  return Buffer.from(JSON.stringify({ enabled, total: [...counts.values()].reduce((a, b) => a + b, 0), counts: Object.fromEntries(counts) }));
+  const samples = Object.fromEntries(
+    [...largeSamples].map(([name, sample]) => [name, { bytes: sample.bytes, configured: sample.sha256 !== null }]),
+  );
+  return Buffer.from(JSON.stringify({
+    enabled,
+    total: [...counts.values()].reduce((a, b) => a + b, 0),
+    counts: Object.fromEntries(counts),
+    method_counts: Object.fromEntries(methodCounts),
+    artifact_hold: artifactHeld,
+    artifact_waiting: artifactWaiters.size,
+    large_samples: samples,
+  }));
 }
 
 function respond(response, status, body = Buffer.alloc(0), contentType = 'application/octet-stream', method = 'GET') {
@@ -87,14 +116,57 @@ function respond(response, status, body = Buffer.alloc(0), contentType = 'applic
   response.end(method === 'HEAD' ? undefined : body);
 }
 
-function control(request, response, pathname) {
+function configureLargeSamples(url) {
+  for (const name of ['1g', '5g']) {
+    const sample = largeSamples.get(name);
+    const bytes = Number(url.searchParams.get(`${name}_bytes`));
+    const sha256 = url.searchParams.get(`${name}_sha256`) ?? '';
+    if (bytes !== sample.bytes || !/^[0-9a-f]{64}$/.test(sha256)) return false;
+    sample.sha256 = sha256;
+  }
+  return true;
+}
+
+function releaseArtifactResponses() {
+  artifactHeld = false;
+  for (const waiter of [...artifactWaiters]) {
+    artifactWaiters.delete(waiter);
+    if (!waiter.response.destroyed) respond(waiter.response, 200, waiter.body, waiter.contentType, waiter.method);
+  }
+}
+
+function holdArtifactResponse(response, body, contentType, method) {
+  const waiter = { response, body, contentType, method };
+  artifactWaiters.add(waiter);
+  response.once('close', () => artifactWaiters.delete(waiter));
+}
+
+function control(request, response, url) {
+  const { pathname } = url;
   if (pathname === '/__acceptance/state' && request.method === 'GET') {
     respond(response, 200, stateBody(), 'application/json', request.method);
     return true;
   }
   if (pathname === '/__acceptance/reset' && request.method === 'POST') {
+    releaseArtifactResponses();
     counts.clear();
+    methodCounts.clear();
     respond(response, 200, stateBody(), 'application/json', request.method);
+    return true;
+  }
+  if (pathname === '/__acceptance/artifact/hold' && request.method === 'POST') {
+    artifactHeld = true;
+    respond(response, 200, stateBody(), 'application/json', request.method);
+    return true;
+  }
+  if (pathname === '/__acceptance/artifact/release' && request.method === 'POST') {
+    releaseArtifactResponses();
+    respond(response, 200, stateBody(), 'application/json', request.method);
+    return true;
+  }
+  if (pathname === '/__acceptance/configure-large' && request.method === 'POST') {
+    const valid = configureLargeSamples(url);
+    respond(response, valid ? 200 : 400, stateBody(), 'application/json', request.method);
     return true;
   }
   if (pathname === '/__acceptance/enable' && request.method === 'POST') {
@@ -118,6 +190,64 @@ function npmResponse(pathname) {
   return undefined;
 }
 
+function largeSampleForPath(pathname) {
+  const direct = pathname.match(/^\/raw\/large-(1g|5g)\.bin$/);
+  if (direct) return { sample: largeSamples.get(direct[1]), seed: proxySeed };
+  const migration = pathname.match(/^\/migration-(1g|5g)\/repository\/performance-migration-source-\1\/large-\1\.bin$/);
+  return migration ? { sample: largeSamples.get(migration[1]), seed: migrationSeed } : undefined;
+}
+
+function blockFillByte(seed, blockIndex) {
+  return ((seed + blockIndex * blockPatternStride) % 255) + 1;
+}
+
+function respondLarge(response, profile, method) {
+  const { sample, seed } = profile;
+  response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': sample.bytes });
+  if (method === 'HEAD') {
+    response.end();
+    return;
+  }
+  let remaining = sample.bytes;
+  let blockIndex = 0;
+  const write = () => {
+    if (remaining === 0 || response.destroyed) {
+      if (!response.destroyed) response.end();
+      return;
+    }
+    const chunkBytes = Math.min(largeBlockBytes, remaining);
+    const chunk = Buffer.alloc(chunkBytes, blockFillByte(seed, blockIndex));
+    remaining -= chunkBytes;
+    blockIndex += 1;
+    if (!response.write(chunk)) response.once('drain', write);
+    else setImmediate(write);
+  };
+  write();
+}
+
+function nexusResponse(url) {
+  const matched = url.pathname.match(/^\/migration-(1g|5g)\/service\/rest\/v1\/(repositories|components)$/);
+  if (!matched) return undefined;
+  const [label, resource] = matched.slice(1);
+  const repository = `performance-migration-source-${label}`;
+  if (resource === 'repositories') {
+    return [Buffer.from(JSON.stringify([{ name: repository, format: 'raw', type: 'hosted' }])), 200];
+  }
+  const sample = largeSamples.get(label);
+  if (sample.sha256 === null || url.searchParams.get('repository') !== repository) {
+    return [Buffer.from(JSON.stringify({ items: [], continuationToken: null })), 503];
+  }
+  const asset = {
+    id: `asset-${label}`,
+    downloadUrl: `${origin}/migration-${label}/repository/${repository}/large-${label}.bin`,
+    path: `large-${label}.bin`,
+    fileSize: sample.bytes,
+    checksum: { sha256: sample.sha256 },
+  };
+  const component = { id: `component-${label}`, name: `large-${label}`, assets: [asset] };
+  return [Buffer.from(JSON.stringify({ items: [component], continuationToken: null })), 200];
+}
+
 function staticResponse(pathname) {
   const path = resolve(root, `.${decodeURIComponent(pathname)}`);
   if (!path.startsWith(`${root}${sep}`) || !statSync(path, { throwIfNoEntry: false })?.isFile()) return undefined;
@@ -125,16 +255,33 @@ function staticResponse(pathname) {
 }
 
 const server = createServer((request, response) => {
-  const pathname = new URL(request.url, origin).pathname;
-  if (control(request, response, pathname)) return;
+  const url = new URL(request.url, origin);
+  const { pathname } = url;
+  if (control(request, response, url)) return;
   counts.set(pathname, (counts.get(pathname) ?? 0) + 1);
+  const methodPath = `${request.method} ${pathname}`;
+  methodCounts.set(methodPath, (methodCounts.get(methodPath) ?? 0) + 1);
   if (!enabled) {
     respond(response, 503, Buffer.from('受控上游已断开'), 'text/plain; charset=utf-8', request.method);
+    return;
+  }
+  const largeSample = largeSampleForPath(pathname);
+  if (largeSample) {
+    respondLarge(response, largeSample, request.method);
+    return;
+  }
+  const nexus = nexusResponse(url);
+  if (nexus) {
+    respond(response, nexus[1], nexus[0], 'application/json', request.method);
     return;
   }
   const result = npmResponse(pathname) ?? staticResponse(pathname);
   if (!result) {
     respond(response, 404, Buffer.alloc(0), 'application/octet-stream', request.method);
+    return;
+  }
+  if (pathname === '/raw/artifact.txt' && artifactHeld) {
+    holdArtifactResponse(response, result[0], result[1], request.method);
     return;
   }
   respond(response, 200, result[0], result[1], request.method);

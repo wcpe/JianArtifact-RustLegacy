@@ -24,6 +24,7 @@ type UpdateRepoRequest = Schemas['UpdateRepoRequest'];
 type SetAclRequest = Schemas['SetAclRequest'];
 type MigrationSource = Schemas['MigrationSource'];
 type PlanRequest = Schemas['PlanRequest'];
+type RetryTaskRequest = Schemas['RetryTaskRequest'];
 
 /** 仓储错误 → 契约一致的错误响应体（ErrorBody：code/message）。 */
 function errorOf(error: ApiError): Response {
@@ -162,6 +163,54 @@ async function authenticatedJson<T>(
   initialStore.clearRequestContext();
   if (!initial.ok) return errorOf(initial.error);
   const body = (await request.json()) as T;
+  const store = getStore();
+  const current = store.authenticate(token);
+  if (!current.ok) {
+    store.clearRequestContext();
+    return errorOf(current.error);
+  }
+  try {
+    return action(store, body);
+  } finally {
+    store.clearRequestContext();
+  }
+}
+
+/** 受保护可选 JSON 请求：无 Content-Type 视为无请求体，有 JSON 类型则严格解析。 */
+async function authenticatedOptionalJson<T>(
+  request: Request,
+  getStore: () => DevmockStore,
+  action: (store: DevmockStore, body: T | undefined) => Response,
+): Promise<Response> {
+  const token = bearerToken(request);
+  const initialStore = getStore();
+  const initial = initialStore.authenticate(token);
+  initialStore.clearRequestContext();
+  if (!initial.ok) return errorOf(initial.error);
+  let body: T | undefined;
+  const contentType = request.headers.get('Content-Type');
+  if (contentType !== null) {
+    const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
+    const jsonType =
+      mediaType === 'application/json' ||
+      (mediaType?.startsWith('application/') === true && mediaType.endsWith('+json'));
+    if (!jsonType) {
+      return errorOf({
+        status: 400,
+        code: 'MIGRATION_INVALID_REQUEST',
+        message: '迁移请求字段或 JSON 格式无效',
+      });
+    }
+    try {
+      body = (await request.json()) as T;
+    } catch {
+      return errorOf({
+        status: 400,
+        code: 'MIGRATION_INVALID_REQUEST',
+        message: '迁移请求字段或 JSON 格式无效',
+      });
+    }
+  }
   const store = getStore();
   const current = store.authenticate(token);
   if (!current.ok) {
@@ -392,8 +441,13 @@ export function createHandlers(getStore: () => DevmockStore) {
       ),
     ),
     http.post('*/api/v1/migration/tasks/:id/retry', ({ params, request }) =>
-      authenticated(request, getStore, (store) =>
-        jsonOf(store.controlTask(stringOf(params.id), 'retry'), 202),
+      authenticatedOptionalJson<RetryTaskRequest>(request, getStore, (store, body) =>
+        jsonOf(store.controlTask(stringOf(params.id), 'retry', body), 202),
+      ),
+    ),
+    http.post('*/api/v1/migration/tasks/:id/finalize', ({ params, request }) =>
+      authenticatedOptionalJson<RetryTaskRequest>(request, getStore, (store, body) =>
+        jsonOf(store.finalizeTask(stringOf(params.id), body), 202),
       ),
     ),
     http.get('*/api/v1/migration/tasks/:id/report', ({ params, request }) =>

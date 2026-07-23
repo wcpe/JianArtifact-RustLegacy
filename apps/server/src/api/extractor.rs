@@ -93,8 +93,11 @@ impl FromRequestParts<AppState> for ArtifactRoute {
 /// 在 `RequireAuth` 基础上要求管理员角色，否则 403。
 pub struct RequireAdmin(pub AuthIdentity);
 
-/// 仅接受 Bearer JWT 会话令牌，产出会话声明（供刷新 / 退出撤销当前会话）；Basic 与 API Token 一律拒绝。
+/// 仅接受严格有效的 Bearer JWT 会话令牌，产出刷新所需声明；Basic 与 API Token 一律拒绝。
 pub struct SessionClaims(pub Claims);
+
+/// 仅接受可退出的 Bearer JWT 会话令牌；允许当前 jti 已被同家族刷新消费，但家族撤销仍拒绝。
+pub struct LogoutClaims(pub Claims);
 
 impl FromRequestParts<AppState> for RequireAuth {
     type Rejection = ApiError;
@@ -146,15 +149,33 @@ impl FromRequestParts<AppState> for SessionClaims {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let header = authorization_header(parts).ok_or_else(err_unauthenticated)?;
-        let (scheme, value) = split_scheme(header).ok_or_else(err_unauthenticated)?;
-        // 撤销 / 刷新只针对 Bearer JWT 会话：API Token（jat_ 前缀）与 Basic 不是会话，拒绝
-        if !scheme.eq_ignore_ascii_case("bearer") || value.starts_with(API_TOKEN_PREFIX) {
-            return Err(err_invalid());
-        }
-        let (claims, _identity) = validate_jwt(state, value).await?;
+        let token = session_token(parts)?;
+        let (claims, _identity) = validate_jwt(state, token).await?;
         Ok(SessionClaims(claims))
     }
+}
+
+impl FromRequestParts<AppState> for LogoutClaims {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = session_token(parts)?;
+        let (claims, _identity) = validate_logout_jwt(state, token).await?;
+        Ok(LogoutClaims(claims))
+    }
+}
+
+/// 提取 Bearer JWT 会话令牌；API Token 与 Basic 不是会话，统一拒绝。
+fn session_token(parts: &Parts) -> Result<&str, ApiError> {
+    let header = authorization_header(parts).ok_or_else(err_unauthenticated)?;
+    let (scheme, value) = split_scheme(header).ok_or_else(err_unauthenticated)?;
+    if !scheme.eq_ignore_ascii_case("bearer") || value.starts_with(API_TOKEN_PREFIX) {
+        return Err(err_invalid());
+    }
+    Ok(value)
 }
 
 /// 读取 `Authorization` 头文本；缺失或含非 ASCII 视为未携带凭据。
@@ -196,19 +217,35 @@ async fn resolve_bearer(state: &AppState, value: &str) -> Result<AuthIdentity, A
     }
 }
 
-/// 校验 JWT 会话：验签 / 过期 → 查库 → 撤销、版本失配、禁用均即时失效。返回声明与身份。
+/// 普通会话严格校验单令牌与会话家族撤销状态。
 async fn validate_jwt(state: &AppState, token: &str) -> Result<(Claims, AuthIdentity), ApiError> {
+    validate_jwt_revocation(state, token, false).await
+}
+
+/// 退出允许旧 jti 已被刷新消费，但仍严格拒绝已撤销的会话家族。
+async fn validate_logout_jwt(
+    state: &AppState,
+    token: &str,
+) -> Result<(Claims, AuthIdentity), ApiError> {
+    validate_jwt_revocation(state, token, true).await
+}
+
+/// 校验 JWT 验签、过期、用户状态、会话版本与撤销状态，返回声明与身份。
+async fn validate_jwt_revocation(
+    state: &AppState,
+    token: &str,
+    allow_revoked_jti: bool,
+) -> Result<(Claims, AuthIdentity), ApiError> {
     let claims = jwt::verify(&state.auth, token)?;
     let user_id: i64 = claims.sub.parse().map_err(|_| err_invalid())?;
     let user = persistence::find_user_by_id(&state.pool, user_id)
         .await?
         .ok_or_else(err_invalid)?;
-    // 每请求查库校验：会话家族或单令牌被撤销、版本失配、账户禁用，任一即失效
     let jti_revoked =
         persistence::is_revoked(&state.pool, &session_revoke_hash(&claims.jti)).await?;
     let family_revoked =
         persistence::is_revoked(&state.pool, &session_family_revoke_hash(&claims.sid)).await?;
-    if jti_revoked || family_revoked {
+    if family_revoked || (jti_revoked && !allow_revoked_jti) {
         return Err(err_invalid());
     }
     if user.token_version != claims.ver || !user.enabled {

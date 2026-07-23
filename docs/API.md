@@ -1,6 +1,6 @@
 # 接口契约：JianArtifact
 
-> 对外接口约定的单一真源说明。本文档在初始化阶段只登记「约定与稳定契约」，不虚构未实现端点；约定变更必须原地更新本文档并通过文档漂移门禁。
+> 对外接口约定的单一真源说明。本文档只登记已实现的跨端点约定与稳定契约，不虚构未实现端点；约定变更必须原地更新本文档并通过文档漂移门禁。
 
 ## 1. 契约真源
 
@@ -18,7 +18,7 @@
   - Raw：按任意规范化路径直接读写，路径必须经过规范化与越界防护。
   - Maven：Maven2 标准仓库布局（POM、构件、metadata、checksum sidecar）。
   - npm：npm registry 协议布局（packument、tarball、dist-tag、scoped package）。
-- 格式协议通用路径的 GET/HEAD/PUT/DELETE 与仓库根目录 GET 已纳入同一 OpenAPI 并真实挂载；Raw hosted/proxy 已落地真实 HTTP 语义，Maven、npm 与 group 仍按路线图逐域替换占位。包管理器与自动化客户端只依赖该路径空间，无需理解管理 API。
+- 格式协议通用路径的 GET/HEAD/PUT/DELETE 与仓库根目录 GET 已纳入同一 OpenAPI 并真实挂载；Raw、Maven、npm 的 hosted/proxy/group 已落地真实 HTTP 语义。包管理器与自动化客户端只依赖该路径空间，无需理解管理 API。
 - 首启管理员设置页固定为 `/setup`，一次性令牌只放在 URL fragment（`/setup#token=<令牌>`）；fragment 不属于 HTTP 请求路径，服务端不得从 query 或路径接收令牌。页面调用 `/api/v1/setup/*` 完成状态查询与提交。
 - 健康检查端点独立于上述两个路径空间（见 §5）。
 
@@ -48,7 +48,7 @@
 
 ### 2.5 仓库管理契约
 
-- 仓库列表、详情、创建、PATCH、删除、ACL、目录浏览与路径搜索端点已由真实 Rust 领域服务和 SQLite 持久化承载；使用片段仍按路线图后续落地。
+- 仓库列表、详情、创建、PATCH、删除、ACL、目录浏览、路径搜索与使用片段端点已由真实 Rust 领域服务和 SQLite 持久化承载。
 - ACL 设置与移除以精确用户名作为路径键：`/api/v1/repos/{name}/acl/{username}`；客户端必须对用户名做路径编码，不得依赖数据库用户 ID。仓库 admin 可直接按用户名授权，不依赖全局用户列表权限。
 - 仓库 PATCH 中字段缺失表示不更新；`upstream_credential_ref: null` 表示清空上游凭据引用，其他类型专属必填字段不接受 null 清空。
 - 浏览与搜索响应的 `FileEntry.path` 是仓库根相对完整路径，客户端以该字段为准，不自行拼接父目录与条目名。
@@ -64,6 +64,14 @@
 - proxy 缓存事务仅在仓库仍为 proxy 且当前 `upstream_url` 等于回源预期快照时提交索引；旧配置提交被拒后，请求重新读取仓库与授权状态，并按新配置最多透明重试一次。若重试期间配置再次变化，则返回稳定 503，表示代理配置连续变化且本次请求未写入旧缓存。
 - proxy 禁止自动重定向，3xx/其他 4xx/5xx/断流分别以稳定 `PROXY_UPSTREAM_*` 类别返回 502；上游 404 返回 404，连接或响应超时返回 504。失败不写入缓存索引。
 - proxy 凭据引用只存环境变量名；运行时变量值必须是完整的 `Basic …` 或 `Bearer …`，只注入 `Authorization` 头，明文不得进入数据库、响应或日志。修改 `upstream_url` 会在同一数据库事务内失效该仓库全部正缓存索引并登记 blob 回收意图，单独修改凭据引用保留缓存。
+
+### 2.7 Nexus 迁移控制契约
+
+- 迁移管理端点仅允许 Admin 调用：`POST /api/v1/migration/discover` 生成持久化发现快照，`POST /api/v1/migration/plan` 生成不可变计划，`POST /api/v1/migration/tasks?plan_id=...` 创建后台任务；任务列表、详情和报告分别使用 `GET /api/v1/migration/tasks`、`GET /api/v1/migration/tasks/{id}`、`GET /api/v1/migration/tasks/{id}/report`。
+- 任务控制端点为 `pause`、`resume`、`cancel`、`retry` 与 `finalize`。`TaskInfo` 同时返回十态 `status` 和四态 `phase`；`paused + awaiting-cutover` 不能通过 `resume` 越过切换门，只能由 `finalize` 启动最终增量扫描。
+- `retry` 与 `finalize` 都接受可省略的 JSON 请求体 `{"username":"...","password":"..."}`。用户名和口令必须同时提供或同时省略；本次传入凭据与任务当前进程内已有凭据合并判定。在线任务后续仍需回源且两者都不存在时返回 409；离线任务不得提交 Nexus 临时凭据。
+- Nexus 用户名和口令仅驻留进程内存，不进入 SQLite、发现/计划/任务快照、检查点、日志、错误正文、响应或报告。进程重启后在线任务通过 `retry` 或 `finalize` 重新补交凭据。
+- 报告返回 blob、协议元数据、proxy 正缓存三类最终校验的 `checked/passed/failed`，以及在线 `added/modified/deleted` 漂移、未决冲突数、冲突决策、分仓统计和有界失败样本。npm packument 缺失、畸形、版本或 dist-tag 不一致均计为协议元数据失败，不得静默成功。
 
 ## 3. 错误约定
 

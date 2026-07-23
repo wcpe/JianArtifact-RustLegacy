@@ -47,6 +47,8 @@ async fn setup_details() -> (Router, TempDir, SqlitePool, Arc<AuthRuntime>, i64,
         bind: "127.0.0.1:0".to_string(),
         database_path: db_path,
         data_dir: dir.path().join("blobs"),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: SESSION_TTL_HOURS,
@@ -193,6 +195,13 @@ async fn assert_auth_401(app: &Router, uri: &str, auth: &str) {
         .expect("认证错误响应应含 code")
         .to_string();
     assert!(code.starts_with("AUTH_"), "应返回 AUTH_ 错误码：{code}");
+}
+
+/// 断言退出接口严格拒绝无效会话。
+async fn assert_logout_401(app: &Router, auth: &str) {
+    let (status, body) = send(app, "POST", "/api/v1/auth/logout", Some(auth), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "无效会话退出应返回 401");
+    assert_eq!(as_json(&body)["code"], "AUTH_INVALID_SESSION");
 }
 
 /// 统计三张认证表所有文本列中包含指定明文的记录数。
@@ -434,23 +443,22 @@ async fn 退出与刷新竞态不遗留有效新会话() {
     let (app, _dir) = setup().await;
     let old_auth = login(&app, "alice", "alice-pw").await;
 
-    let refresh = send(&app, "POST", "/api/v1/auth/refresh", Some(&old_auth), None);
-    let logout = send(&app, "POST", "/api/v1/auth/logout", Some(&old_auth), None);
-    let (refresh_result, logout_result) = tokio::join!(refresh, logout);
+    // 固定 refresh 先消费旧 jti 的竞态顺序，避免依赖运行时调度概率
+    let refresh_result = send(&app, "POST", "/api/v1/auth/refresh", Some(&old_auth), None).await;
+    assert_eq!(refresh_result.0, StatusCode::OK);
+    let token = as_json(&refresh_result.1)["token"]
+        .as_str()
+        .expect("刷新成功应返回令牌")
+        .to_owned();
+    let new_auth = format!("Bearer {token}");
 
+    let repeated_refresh = send(&app, "POST", "/api/v1/auth/refresh", Some(&old_auth), None).await;
+    assert_eq!(repeated_refresh.0, StatusCode::UNAUTHORIZED);
+    let logout_result = send(&app, "POST", "/api/v1/auth/logout", Some(&old_auth), None).await;
     assert_eq!(logout_result.0, StatusCode::NO_CONTENT);
-    assert!(matches!(
-        refresh_result.0,
-        StatusCode::OK | StatusCode::UNAUTHORIZED
-    ));
-    if refresh_result.0 == StatusCode::OK {
-        let token = as_json(&refresh_result.1)["token"]
-            .as_str()
-            .expect("刷新成功应返回令牌")
-            .to_owned();
-        let new_auth = format!("Bearer {token}");
-        assert_auth_401(&app, "/api/v1/auth/me", &new_auth).await;
-    }
+    let repeated_logout = send(&app, "POST", "/api/v1/auth/logout", Some(&old_auth), None).await;
+    assert_eq!(repeated_logout.0, StatusCode::UNAUTHORIZED);
+    assert_auth_401(&app, "/api/v1/auth/me", &new_auth).await;
     assert_auth_401(&app, "/api/v1/auth/me", &old_auth).await;
 }
 
@@ -537,6 +545,32 @@ async fn 禁用与刷新竞态不产生有效新会话() {
             "竞态中签发的令牌在禁用完成后必须失效"
         );
     }
+}
+
+#[tokio::test]
+async fn 退出仍严格校验会话有效性() {
+    let (app, _dir, pool, runtime, _, alice_id) = setup_details().await;
+    let (expired, _) = jwt::sign(&AuthRuntime::new(JWT_SECRET, 0), alice_id, 0).unwrap();
+    let (missing_user, _) = jwt::sign(&runtime, i64::MAX, 0).unwrap();
+    let (wrong_version, _) = jwt::sign(&runtime, alice_id, 1).unwrap();
+    for auth in [
+        "Bearer broken.jwt.signature".to_string(),
+        format!("Bearer {expired}"),
+        format!("Bearer {missing_user}"),
+        format!("Bearer {wrong_version}"),
+    ] {
+        assert_logout_401(&app, &auth).await;
+    }
+
+    persistence::update_user_fields(&pool, alice_id, Some(false), None, None)
+        .await
+        .unwrap();
+    let disabled_user = persistence::find_user_by_id(&pool, alice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (disabled, _) = jwt::sign(&runtime, alice_id, disabled_user.token_version).unwrap();
+    assert_logout_401(&app, &format!("Bearer {disabled}")).await;
 }
 
 #[tokio::test]

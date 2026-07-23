@@ -2,18 +2,18 @@
 
 > 系统当前真貌（HOW）。始终原地更新到现状；结构 / 机制变了就改它。
 >
-> 当前状态：阶段 3 已完成认证与用户、仓库权限/配置生命周期、BlobStore 与制品索引、Raw hosted/proxy、仓库浏览搜索及就绪探针真实后端；Maven、npm、group、使用片段与迁移仍按路线图逐域实现。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
+> 当前状态：阶段 3 已完成认证、仓库与 Raw/Maven/npm/group 全协议域；阶段 4 已落地 Nexus 迁移发现、计划、执行、断点续传、显式切换、最终扫描、报告、离线导出 CLI 与 Web 真连，并通过指定 Rust 1.96.1、5 GiB cgroup 容器内完整 14 步严格质量门；尚缺 Web 计划编辑闭环与真实 Nexus OSS 3.70.x 三路径验收。实现进度以 [`ROADMAP.md`](ROADMAP.md) 阶段表为准。
 
 ## 1. 定位与边界
 
 JianArtifact 是一个以低运维成本为目标的自托管制品仓库，统一管理 Raw、Maven、npm 三种格式的 hosted、proxy 与只读 group 仓库，并承接存量 Nexus Repository OSS 3.70.x 中上述仓库的全量迁移与切换。
 
-第一期目标运行形态（阶段 3 当前已落地 Rust 管理 API、SQLite 认证与仓库配置元数据、就绪探针及独立前端构建）：
+第一期目标运行形态当前已落地 Rust 管理 API、三格式协议、SQLite 元数据、文件系统 blob、迁移执行器、就绪探针及内嵌前端：
 
-- **一个 Rust 服务进程**：当前承载认证、用户、仓库配置/ACL、制品索引与浏览管理 API、Raw hosted/proxy 协议及健康探针；其他格式与迁移随对应业务域接入同一进程。
-- **一个 SQLite 元数据库**：当前已作为认证、用户、仓库配置、ACL、group 成员关系与制品索引的唯一真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
-- **一个本地文件系统 blob 数据目录**：当前按 SHA-256 内容寻址落盘，并由 `/readyz` 验证挂载可写；SQLite 索引是引用关系唯一真源。
-- **前端最终内嵌交付**：当前 React 管理端独立构建，尚未接入 Rust 静态资源路由；后续以编译期内嵌方式收敛为单二进制交付。
+- **一个 Rust 服务进程**：承载认证、用户、仓库配置/ACL、制品索引与浏览管理 API、Raw/Maven/npm hosted/proxy/group 协议、Nexus 迁移控制与健康探针。
+- **一个 SQLite 元数据库**：作为认证、用户、仓库配置、ACL、group 成员关系、制品索引、迁移发现/计划/任务/检查点/报告的唯一持久化真源，通过 sqlx（SQLite bundled）访问，无外部数据库依赖。
+- **一个本地文件系统 blob 数据目录**：按 SHA-256 内容寻址落盘，并由 `/readyz` 验证挂载可写；SQLite 索引是引用关系唯一真源，迁移对象复用同一原子提交边界。
+- **前端内嵌交付**：React 管理端先构建为静态资源，再由 Rust 服务内嵌并提供单二进制交付。
 - **TLS 在反向代理终止**：服务本身只监听明文 HTTP，可置于任意反向代理之后。
 
 边界之外（详见第 8.2 节非目标）：不做多节点集群、对象存储后端、LDAP/OIDC，Raw/Maven/npm 之外的格式进入后续分期。
@@ -68,7 +68,7 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | `artifact` | 共享制品服务：索引原子提交、带租约读取、引用安全回收、proxy 单飞与长生命周期上游客户端 |
 | `repository` | 仓库领域服务：仓库 CRUD、配置失效、浏览搜索、group 成员关系与 ACL 应用 |
 | `domain` | 核心领域类型与纯逻辑：仓库/制品/用户模型、路径规范化、覆盖策略、状态机 |
-| `migration` | Nexus 迁移：在线/离线发现、计划、执行、断点续传、报告 |
+| `migration` | Nexus 迁移：十态/四阶段状态机、进程内临时凭据、冲突前置条件、在线/原生目录/目录包发现、不可变计划、后台执行与对象检查点、最终增量扫描、报告，以及原生目录到离线包 v1 的 CLI 导出 |
 | `persistence` | SQLite 访问层：仓储接口实现、事务、迁移脚本 |
 | `storage` | blob 存储：内容寻址落盘、临时文件、提交守卫、读写租约、删除许可与启动恢复 |
 | `config` | 启动配置装载与校验，只读提供给各层 |
@@ -89,8 +89,9 @@ pnpm workspace + Turborepo 统一编排，工作区**恰有两个可构建子工
 | 仓库 ACL | 用户 × 仓库 × 动作（read/write/admin） |
 | 制品索引 | `repo_id + path` 唯一映射到 SHA-256 内容，记录 SHA-1/MD5/SHA-512、大小、正缓存标记与创建/更新时间；blob 引用数按 SHA-256 聚合，不另设计数表 |
 | blob 回收意图 | 以 SHA-256 为主键持久化待回收内容及正整数 `generation`；代次隔离同摘要的新旧任务，陈旧任务不得误删文件或清除新意图 |
-| 迁移任务 | 任务标识、不可变参数快照、状态机状态、节流进度、幂等信息 |
-| 迁移分仓明细 | 每仓库的对象/字节计数、校验结果、凭据引用状态、有界失败样本 |
+| 迁移发现与计划 | 来源发现快照、仓库映射、配置补充、冲突前置条件及不可变计划 JSON |
+| 迁移任务与检查点 | 任务标识、不可变参数快照、十态状态、四态阶段、内部重试检查点、节流进度，以及按源仓库/对象键记录的幂等执行结果 |
+| 迁移报告与 npm 校验 | 每仓库对象/字节计数、有界失败样本、在线漂移和冲突决策；npm 协议元数据校验计数独立持久化并并入最终报告 |
 
 M1-FR-046 的 `initial-admin.token` 不属于数据表：它是仅在用户表为空且未完整提供环境变量自举凭据时生成的数据库同目录一次性文件，保存 32 字节随机数的十六进制表示，权限固定为 `0600`。创建时先把完整内容写入并同步同目录 `0600` 临时文件，再以同文件系统硬链接原子发布正式路径，避免崩溃留下半写令牌。用户表非空是首启入口永久关闭的权威状态，不能以令牌文件存在与否反向开启功能。
 
@@ -114,8 +115,8 @@ M1-FR-046 的 `initial-admin.token` 不属于数据表：它是仅在用户表�
 
 详细契约见 `docs/API.md`，此处只给概览与定位：
 
-- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期、ACL、制品统计、目录浏览与路径搜索已真实现，首启管理员状态/提交接口（M1-FR-046）、使用片段及迁移按各自开发状态推进。setup 页面只从 `/setup#token=<令牌>` 的 fragment 取值并向 `/api/v1/setup` 请求体提交，令牌不进入请求路径或 query。仓库列表在 SQL 中按 read 权限过滤并聚合制品数/总大小，私有无权与不存在返回一致错误，group 详情仅返回调用方可读成员。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
-- **格式协议端点**：Raw hosted/proxy 已由 `protocol::raw` 实现 GET/HEAD/PUT/DELETE 与 JSON 目录索引，`api::formats` 只负责提取请求和 OpenAPI。Maven（标准布局 + metadata + checksum sidecar）、npm（publish/packument/tarball/dist-tag）与 group 后续按域接入同一 `ArtifactService`，协议层始终不得直连数据库。
+- **管理 API**：`apps/web` 消费的 JSON API；认证、用户、Token、仓库配置生命周期、ACL、制品统计、目录浏览、路径搜索、首启管理员和 Nexus 迁移控制均已真实现。迁移 API 覆盖发现、计划、任务创建/查询、暂停/继续/取消/重试、显式最终扫描与报告；Nexus 账号口令只驻留当前进程内存。setup 页面只从 `/setup#token=<令牌>` 的 fragment 取值并向 `/api/v1/setup` 请求体提交，令牌不进入请求路径或 query。`devmock` 双向契约测试只比较 `/api/v1` 管理业务路径。
+- **格式协议端点**：Raw、Maven、npm 的 hosted/proxy/group 均经对应协议适配与同一 `ArtifactService` 实现；`api::formats` 只负责提取请求和 OpenAPI，协议层始终不得直连数据库。
 - **健康检查**：`/healthz` 只报告进程存活；`/readyz` 以临时事务写入并回滚探测 SQLite，以随机且排他创建的临时文件探测 blob 目录，运行期挂载丢失时不自愈重建，响应不泄露路径、凭据或内部拓扑。
 
 ## 6. 关键机制
@@ -141,9 +142,10 @@ Raw proxy 使用进程内长生命周期 reqwest/rustls 客户端，连接超时
 
 ### 6.3 迁移状态机与持久化
 
-- 迁移任务异步执行，状态机：`queued / running / pausing / paused / cancelling / cancelled / succeeded / partial / failed / interrupted`。仅零显式放弃、零未迁移受支持对象、零未解决配置项时可标记 `succeeded`。
-- 沿用已验证的设计：**任务表 + 分仓库明细表**持久化任务参数快照、节流进度、对象检查点与有界失败样本；服务重启后在途任务标记为 `interrupted`（已中断），可一键续传。
-- 暂停/取消只在单对象原子提交边界生效；取消清理未提交临时文件，但不删除已成功且被引用的数据。
+- 迁移任务异步执行，生命周期固定为 `queued / running / pausing / paused / cancelling / cancelled / succeeded / partial / failed / interrupted`，并以 `initial-transfer / awaiting-cutover / finalizing / completed` 表示正交业务阶段。仅零显式放弃、零未迁移受支持对象、零未解决配置项且最终校验证据完整时可标记 `succeeded`。
+- SQLite 持久化发现快照、不可变计划、任务快照、状态/阶段、内部重试检查点、节流进度、逐对象幂等结果、分仓统计、有界失败样本、在线漂移及 npm 协议校验计数。服务重启后在途任务标记为 `interrupted`，保留阶段和检查点。
+- Nexus 临时用户名/口令只存在当前进程的运行时槽；`retry` 与 `finalize` 可重新提交成对凭据，并与任务当前已有内存凭据合并判定。任务终结或取消时立即丢弃。
+- 暂停/取消只在单对象原子提交边界生效；取消清理未提交临时文件，但不删除已成功且被引用的数据。`paused + awaiting-cutover` 不能普通恢复，只能由显式 `finalize` 越过停写确认门。
 
 ### 6.4 幂等键与增量续传
 
@@ -165,8 +167,8 @@ Raw proxy 使用进程内长生命周期 reqwest/rustls 客户端，连接超时
 
 ## 7. 部署
 
-- 目标交付物为**单个 Rust 二进制**（前端产物编译期内嵌）；当前阶段 Rust 服务与前端仍分别构建，静态资源内嵌待后续部署域落地。后端保持零系统级 C 库依赖（sqlx SQLite bundled，不依赖系统 sqlite3），Rust 生产代码 `forbid(unsafe)`。
-- 当前运行时依赖为 SQLite 文件、就绪探针使用的可写数据目录与启动配置；blob 目录语义随存储域落地。
+- 目标交付物为**单个 Rust 二进制**：前端产物先构建，再编译期内嵌到服务；后端保持零系统级 C 库依赖（sqlx SQLite bundled，不依赖系统 sqlite3），Rust 生产代码 `forbid(unsafe)`。
+- 运行时依赖为 SQLite 文件、内容寻址 blob 数据目录、可选迁移工作目录与启动配置；就绪探针验证数据库可读写和 blob 目录可写。
 - TLS 由反向代理终止；服务自身不管理证书。
 - 首次启动先尝试环境变量管理员自举；空用户库且变量不完整时，以数据库同目录 `initial-admin.token` 和 `/setup#token=<令牌>` 完成首个管理员初始化。任一方式成功后用户表非空，入口永久关闭并删除令牌文件。
 - 主机管理员可执行 `jianartifact admin reset-password <用户名>` 重置本地用户口令；命令只打开既有数据库，不提供命令行明文口令参数，也不改变角色、启用状态与 API Token。
@@ -194,6 +196,7 @@ Raw proxy 使用进程内长生命周期 reqwest/rustls 客户端，连接超时
 | `docs/adr/0014-frontend-first-delivery.md` | M1 按域三步工序：契约骨架 → 前端 + devmock → 后端业务实现，契约真源仍为 ADR-0012 |
 | `docs/adr/0015-offline-native-datadir-primary.md` | 迁移首选离线直读 Nexus 原生数据目录（blob 磁盘直读 + 配置 REST/手动），在线 REST 降为备选 |
 | `docs/adr/0016-apps-packages-two-roots.md` | 工作区改为 apps/（入口）+ packages/（共享库）双根，取代 ADR-0001 的单一 apps/ 根 |
+| `docs/adr/0017-migration-control-and-export-contract.md` | Nexus 迁移的显式切换门、临时凭据生命周期、冲突决策与离线目录包 v1 冻结契约 |
 
 ### 8.2 第一期非目标
 

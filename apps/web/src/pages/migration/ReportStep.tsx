@@ -34,12 +34,79 @@ export function ReportStep({ taskId, onRestart }: { taskId: string; onRestart: (
     return <ErrorState message={error?.message ?? '加载报告失败'} onRetry={reload} />;
   }
 
+  const validationRows = [
+    ['Blob', report.validation.blob],
+    ['协议元数据', report.validation.protocol_metadata],
+    ['Proxy 正缓存', report.validation.proxy_positive_cache],
+  ] as const;
+  const driftRows = [
+    ['新增对象', report.online_drift.added],
+    ['修改对象', report.online_drift.modified],
+    ['删除对象', report.online_drift.deleted],
+    ['未决冲突', report.online_drift.unresolved_conflict_count],
+    ['冲突决策', report.online_drift.conflict_decisions.length],
+  ] as const;
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3">
         {/* 报告步顶层标题用语义 h2（向导内的区段标题） */}
         <h2 className="text-lg font-semibold">迁移报告</h2>
         <StatusBadge kind="task-status" value={report.status} />
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>最终扫描校验</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table aria-label="最终扫描校验">
+              <TableHeader>
+                <TableRow>
+                  <TableHead scope="col">证据类型</TableHead>
+                  <TableHead scope="col">已检查</TableHead>
+                  <TableHead scope="col">通过</TableHead>
+                  <TableHead scope="col">失败</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {validationRows.map(([label, counts]) => (
+                  <TableRow key={label}>
+                    <TableCell className="font-medium">{label}</TableCell>
+                    <TableCell>{counts.checked}</TableCell>
+                    <TableCell>{counts.passed}</TableCell>
+                    <TableCell>{counts.failed}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>在线漂移</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <Table aria-label="在线漂移">
+              <TableHeader>
+                <TableRow>
+                  <TableHead scope="col">指标</TableHead>
+                  <TableHead scope="col">数量</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {driftRows.map(([label, count]) => (
+                  <TableRow key={label}>
+                    <TableCell className="font-medium">{label}</TableCell>
+                    <TableCell>{count}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
       </div>
 
       <Card>

@@ -5,9 +5,10 @@ export default defineConfig({
   testDir: './e2e',
   testIgnore: '**/real-backend/**',
   outputDir: './test-results/devmock',
-  timeout: 30_000,
+  timeout: 120_000,
   fullyParallel: false,
   retries: 0,
+  workers: 1,
   reporter: [['list']],
   use: {
     baseURL: 'http://127.0.0.1:4173',

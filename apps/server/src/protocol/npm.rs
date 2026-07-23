@@ -25,6 +25,7 @@ use crate::state::AppState;
 
 const PROXY_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROXY_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const NPM_PACKUMENT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageRoute {
@@ -479,6 +480,29 @@ async fn fetch_proxy_packument(
     headers: &HeaderMap,
     package_name: &str,
 ) -> Result<Value, ApiError> {
+    fetch_proxy_packument_with_idle_timeout(
+        state,
+        repository,
+        route,
+        uri,
+        headers,
+        package_name,
+        PROXY_CHUNK_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+/// 使用指定空闲超时回源并缓存 packument，供协议实现与快速超时测试共用。
+#[doc(hidden)]
+pub async fn fetch_proxy_packument_with_idle_timeout(
+    state: &AppState,
+    repository: &Repository,
+    route: &ArtifactRoute,
+    uri: &Uri,
+    headers: &HeaderMap,
+    package_name: &str,
+    idle_timeout: Duration,
+) -> Result<Value, ApiError> {
     let expected_upstream = repository
         .upstream_url
         .as_deref()
@@ -490,7 +514,7 @@ async fn fetch_proxy_packument(
     }
     let response = send_upstream(request).await?;
     validate_upstream_status(response.status())?;
-    let bytes = response.bytes().await.map_err(|_| proxy_transfer_error())?;
+    let bytes = read_proxy_packument(response, idle_timeout).await?;
     let upstream: Value = serde_json::from_slice(&bytes).map_err(|_| proxy_bad_gateway())?;
     let base_url = public_base_url(state, uri, headers)?;
     let (rewritten, tarballs) =
@@ -1405,6 +1429,34 @@ async fn send_upstream(request: reqwest::RequestBuilder) -> Result<reqwest::Resp
                 proxy_transfer_error()
             }
         })
+}
+
+async fn read_proxy_packument(
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+) -> Result<Vec<u8>, ApiError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > NPM_PACKUMENT_MAX_BYTES as u64)
+    {
+        return Err(proxy_bad_gateway());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(idle_timeout, response.chunk())
+        .await
+        .map_err(|_| proxy_timeout())?
+        .map_err(|_| proxy_transfer_error())?
+    {
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(proxy_bad_gateway)?;
+        if next_len > NPM_PACKUMENT_MAX_BYTES {
+            return Err(proxy_bad_gateway());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn validate_upstream_status(status: reqwest::StatusCode) -> Result<(), ApiError> {

@@ -14,7 +14,10 @@ use crate::persistence::{
     self, ArtifactCommitError, ArtifactDirectoryEntry, ArtifactRecord, ArtifactWriteInput,
     BlobReclamation, NpmHostedVersionInput, NpmProxyPackumentInput, NpmVersionCommitError,
 };
-pub use crate::persistence::{NpmPackageRecord, NpmProxyPackument, NpmProxyTarballInput};
+pub use crate::persistence::{
+    NpmMigrationPackageInput, NpmMigrationVersionInput, NpmPackageRecord, NpmProxyPackument,
+    NpmProxyTarballInput,
+};
 
 /// npm hosted 发布提交参数。
 pub struct NpmHostedCommit {
@@ -183,6 +186,26 @@ impl ArtifactService {
         .await
     }
 
+    /// 按迁移覆盖守卫提交 proxy 正缓存，并校验任务上游快照。
+    pub async fn commit_migration_proxy_pending(
+        &self,
+        repo_id: i64,
+        path: &str,
+        pending: PendingBlob,
+        expected_upstream_url: &str,
+        allow_overwrite: bool,
+    ) -> Result<CommitPendingResult, ApiError> {
+        self.commit_pending_inner(
+            repo_id,
+            path,
+            pending,
+            true,
+            allow_overwrite,
+            Some(expected_upstream_url),
+        )
+        .await
+    }
+
     /// 原子提交 npm hosted tarball、manifest 与 dist-tag。
     pub async fn commit_npm_hosted(
         &self,
@@ -203,6 +226,22 @@ impl ArtifactService {
         };
         let result = persistence::commit_npm_hosted_version(&self.pool, &input).await;
         self.complete_npm_pending(result, pending).await
+    }
+
+    /// 校验迁移 npm packument 引用的 tarball 摘要。
+    pub async fn validate_npm_migration_package(
+        &self,
+        input: &NpmMigrationPackageInput,
+    ) -> Result<(), ApiError> {
+        persistence::validate_npm_migration_package(&self.pool, input).await
+    }
+
+    /// 为迁移已提交的 tarball 重建 npm hosted 协议元数据。
+    pub async fn import_npm_migration_package(
+        &self,
+        input: &NpmMigrationPackageInput,
+    ) -> Result<(), ApiError> {
+        persistence::import_npm_migration_package(&self.pool, input).await
     }
 
     /// 读取 npm hosted 包元数据。
@@ -323,7 +362,8 @@ impl ArtifactService {
         let input = artifact_write_input(repo_id, path, pending.metadata(), cached);
         let committed = match expected_upstream_url {
             Some(expected) => {
-                persistence::commit_proxy_artifact(&self.pool, &input, expected).await
+                persistence::commit_proxy_artifact(&self.pool, &input, expected, allow_overwrite)
+                    .await
             }
             None => persistence::commit_artifact(&self.pool, &input, allow_overwrite).await,
         };

@@ -9,6 +9,7 @@ pub mod setup;
 pub mod tokens;
 pub mod users;
 
+use axum::extract::Extension;
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -97,6 +98,7 @@ impl PageQuery {
         migration::resume_task,
         migration::cancel_task,
         migration::retry_task,
+        migration::finalize_task,
         migration::task_report,
     ),
     // 仅被参数引用的 schema 不会被自动收集，须显式注册，否则契约文档出现悬空 $ref
@@ -121,6 +123,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 
 /// 装配全部路由与中间件。
 pub fn router(state: AppState) -> Router {
+    let migration_runtime = std::sync::Arc::new(crate::migration::MigrationRuntime::default());
     let router = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
@@ -189,6 +192,10 @@ pub fn router(state: AppState) -> Router {
             post(migration::retry_task),
         )
         .route(
+            "/api/v1/migration/tasks/{id}/finalize",
+            post(migration::finalize_task),
+        )
+        .route(
             "/api/v1/migration/tasks/{id}/report",
             get(migration::task_report),
         );
@@ -198,5 +205,6 @@ pub fn router(state: AppState) -> Router {
     router
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(Extension(migration_runtime))
         .with_state(state)
 }

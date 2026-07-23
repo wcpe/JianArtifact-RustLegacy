@@ -98,7 +98,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 发现：按源配置枚举可迁仓库（Admin）。 */
         post: operations["discover"];
         delete?: never;
         options?: never;
@@ -115,7 +114,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 计划：按映射与决策生成可确认的迁移计划预览（Admin）。 */
         post: operations["plan"];
         delete?: never;
         options?: never;
@@ -130,10 +128,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 任务列表（分页，Admin）。 */
         get: operations["list_tasks"];
         put?: never;
-        /** 创建任务：确认计划并异步执行，立即返回任务标识（Admin）。 */
         post: operations["create_task"];
         delete?: never;
         options?: never;
@@ -148,7 +144,6 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 任务详情与进度（Admin）。 */
         get: operations["task_detail"];
         put?: never;
         post?: never;
@@ -167,8 +162,23 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 取消任务（清理未提交临时文件，不删已成功且被引用的数据，Admin）。 */
         post: operations["cancel_task"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/migration/tasks/{id}/finalize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["finalize_task"];
         delete?: never;
         options?: never;
         head?: never;
@@ -184,7 +194,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 暂停任务（在单对象原子提交边界生效，Admin）。 */
         post: operations["pause_task"];
         delete?: never;
         options?: never;
@@ -199,7 +208,6 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 任务报告（Admin）。 */
         get: operations["task_report"];
         put?: never;
         post?: never;
@@ -218,7 +226,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 继续任务（Admin）。 */
         post: operations["resume_task"];
         delete?: never;
         options?: never;
@@ -235,7 +242,6 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** 重试/续传（只处理失败、中断或变化对象，幂等，Admin）。 */
         post: operations["retry_task"];
         delete?: never;
         options?: never;
@@ -567,6 +573,11 @@ export interface components {
             /** @description 当前口令（校验通过才允许修改）。 */
             old_password: string;
         };
+        /**
+         * @description 对象级冲突动作。
+         * @enum {string}
+         */
+        ConflictAction: "rename" | "map-empty" | "abandon";
         /** @description 创建仓库请求体。 */
         CreateRepoRequest: {
             /** @description 制品格式（创建后不可变）。 */
@@ -655,42 +666,24 @@ export interface components {
         };
         /** @description 发现到的源仓库。 */
         DiscoveredRepo: {
-            /** @description 配置是否完整（false = 待补充，不可全量成功）。 */
             config_complete: boolean;
-            /** @description 格式（矩阵外格式在 unsupported 中列出，不出现在此）。 */
             format: components["schemas"]["Format"];
-            /** @description 是否已有可用的上游凭据引用（凭据缺失的 proxy 为「配置未完成」）。 */
             has_credential_ref: boolean;
-            /** @description group 成员（有序）。 */
             members?: string[] | null;
-            /** @description 源仓库名。 */
             name: string;
-            /**
-             * Format: int64
-             * @description 可迁对象数（估算）。
-             */
+            /** Format: int64 */
             object_count: number;
-            /** @description 仓库类型。 */
             repo_type: components["schemas"]["RepoType"];
-            /**
-             * Format: int64
-             * @description 可迁字节数（估算）。
-             */
+            /** Format: int64 */
             total_bytes: number;
-            /** @description proxy 上游地址（脱敏，不含凭据）。 */
             upstream_url?: string | null;
         };
         /** @description 发现结果。 */
         DiscoveryResult: {
-            /** @description 是否为裸 blob 降级模式（true 时任务总状态不得全量成功）。 */
             degraded_bare_blob: boolean;
-            /** @description 本次发现的标识（后续计划引用）。 */
             discovery_id: string;
-            /** @description 可迁仓库清单。 */
             repositories: components["schemas"]["DiscoveredRepo"][];
-            /** @description 源快照时间。 */
             snapshot_time: string;
-            /** @description 不支持项清单（矩阵外格式/系统数据，禁止静默丢弃）。 */
             unsupported: components["schemas"]["UnsupportedItem"][];
         };
         /** @description 对外统一错误响应体。 */
@@ -700,15 +693,11 @@ export interface components {
             /** @description 面向用户的中文错误消息，不含内部细节。 */
             message: string;
         };
-        /** @description 失败明细（有界样本）。 */
+        /** @description 失败明细。 */
         FailureSample: {
-            /** @description 稳定错误类别。 */
             category: string;
-            /** @description 中文说明（脱敏）。 */
             message: string;
-            /** @description 对象键。 */
             object_key: string;
-            /** @description 仓库名。 */
             repo: string;
         };
         /** @description 浏览条目（目录或文件）。 */
@@ -771,69 +760,88 @@ export interface components {
         };
         /** @description 迁移计划预览。 */
         MigrationPlan: {
-            /** @description 是否存在阻断执行的未决冲突。 */
             blocked: boolean;
-            /** @description 冲突清单（存在未决阻断性冲突时不可执行）。 */
+            /** Format: int64 */
+            configuration_incomplete_count: number;
             conflicts: components["schemas"]["PlanConflict"][];
-            /** @description 磁盘空间是否满足估算。 */
             disk_sufficient: boolean;
-            /**
-             * Format: int64
-             * @description 目标空间估算（字节，含安全系数与保留量，NFR-12）。
-             */
+            /** Format: int64 */
             estimated_disk_bytes: number;
-            /** @description 纳入执行的仓库映射。 */
             mappings: components["schemas"]["RepoMapping"][];
-            /**
-             * Format: int64
-             * @description 对象总数。
-             */
+            /** Format: int64 */
             object_count: number;
-            /** @description 计划标识（创建任务时引用）。 */
             plan_id: string;
-            /**
-             * Format: int64
-             * @description 字节总数。
-             */
+            /** Format: int64 */
+            supported_objects_not_migrated: number;
+            /** Format: int64 */
             total_bytes: number;
-            /** @description 不支持项清单。 */
+            /** Format: int64 */
+            unresolved_conflict_count: number;
             unsupported: components["schemas"]["UnsupportedItem"][];
         };
         /** @description 迁移任务报告。 */
         MigrationReport: {
-            /** @description 显式排除的仓库（保留在报告中，不伪装成从未发现）。 */
+            /** Format: int64 */
+            configuration_incomplete_count: number;
             excluded: string[];
-            /** @description 失败样本（有界）。 */
             failures: components["schemas"]["FailureSample"][];
-            /**
-             * Format: int64
-             * @description 因样本上限被省略的失败数。
-             */
+            /** Format: int64 */
             failures_omitted: number;
-            /** @description 分仓库报告。 */
+            online_drift: components["schemas"]["OnlineDriftSummary"];
             repositories: components["schemas"]["RepoReport"][];
-            /** @description 最终状态。 */
             status: components["schemas"]["TaskStatus"];
-            /** @description 任务标识。 */
+            /** Format: int64 */
+            supported_objects_not_migrated: number;
             task_id: string;
-            /** @description 不支持/未迁移项。 */
             unsupported: components["schemas"]["UnsupportedItem"][];
+            validation: components["schemas"]["MigrationValidation"];
         };
-        /**
-         * @description 迁移源配置（发现请求体）。Nexus 账号口令仅用于传输与内存中的在线拉取，
-         *     绝不落库、不进日志、不进任务参数快照与报告（持久化只存安全运行时引用）。
-         */
+        /** @description 迁移源配置。账号口令只用于本次请求及进程内任务凭据槽。 */
         MigrationSource: {
-            /** @description 来源类别。 */
             kind: components["schemas"]["SourceKind"];
-            /** @description Nexus 口令（明文仅传输与内存使用，不落库不进日志）。 */
             password?: string | null;
-            /** @description 服务器上的路径（native-dir：Nexus 数据目录；package：包路径）；须落在 migration-workdir 白名单根内。 */
             path?: string | null;
-            /** @description Nexus 实例地址。online 必填；native-dir 选填——填写则用账号口令经 REST 在线拉取仓库配置，留空则发现后手动补配置。 */
             url?: string | null;
-            /** @description Nexus 用户名（配合 url 做在线拉取时提供）。 */
             username?: string | null;
+        };
+        /** @description 迁移结果校验汇总。 */
+        MigrationValidation: {
+            blob: components["schemas"]["ValidationCounts"];
+            protocol_metadata: components["schemas"]["ValidationCounts"];
+            proxy_positive_cache: components["schemas"]["ValidationCounts"];
+        };
+        /** @description 对象级冲突决策。 */
+        ObjectConflictDecision: {
+            /** @description 冲突处理动作。 */
+            action: components["schemas"]["ConflictAction"];
+            /** @description 计划时观察到的目标对象 sha256。 */
+            observed_target_sha256: string;
+            /** @description 原目标对象路径。 */
+            original_target_path: string;
+            /** @description 原目标仓库名。 */
+            original_target_repository: string;
+            /** @description 源对象键。 */
+            source_object_key: string;
+            /** @description 源仓库名。 */
+            source_repository: string;
+            /** @description 源对象 sha256。 */
+            source_sha256: string;
+            /** @description 决策后的目标路径。 */
+            target_path?: string | null;
+            /** @description 决策后的目标仓库。 */
+            target_repository?: string | null;
+        };
+        /** @description 在线迁移期间的源端漂移汇总。 */
+        OnlineDriftSummary: {
+            /** Format: int64 */
+            added: number;
+            conflict_decisions: components["schemas"]["ObjectConflictDecision"][];
+            /** Format: int64 */
+            deleted: number;
+            /** Format: int64 */
+            modified: number;
+            /** Format: int64 */
+            unresolved_conflict_count: number;
         };
         /**
          * @description hosted 同路径覆盖策略。
@@ -845,22 +853,17 @@ export interface components {
          * @enum {string}
          */
         Permission: "read" | "write" | "admin";
-        /** @description 冲突条目（默认禁止覆盖；同校验跳过，异校验阻断待显式决策）。 */
+        /** @description 冲突条目。 */
         PlanConflict: {
-            /** @description 稳定类别（如「同路径同校验」「同路径不同校验」「目标仓库已存在」）。 */
             category: string;
-            /** @description 中文说明与可选决策。 */
+            decision?: null | components["schemas"]["ObjectConflictDecision"];
             detail: string;
-            /** @description 冲突路径。 */
             path: string;
-            /** @description 目标仓库名。 */
             target: string;
         };
         /** @description 计划请求体。 */
         PlanRequest: {
-            /** @description 引用的发现结果。 */
             discovery_id: string;
-            /** @description 各仓库映射与决策。 */
             mappings: components["schemas"]["RepoMapping"][];
         };
         /** @description 仓库信息。 */
@@ -916,68 +919,36 @@ export interface components {
              */
             total: number;
         };
-        /** @description 单仓库迁移映射（计划请求）。 */
+        /** @description 单仓库迁移映射。 */
         RepoMapping: {
-            /** @description 是否排除（显式排除保留在报告中，任务不得全量成功）。 */
+            conflict_decisions?: components["schemas"]["ObjectConflictDecision"][];
             excluded: boolean;
-            /** @description 手动补的 group 成员（源配置未提供 Nexus 地址、配置缺失时，有序）。 */
             manual_members?: string[] | null;
-            /** @description 手动补的 proxy 上游地址（源配置未提供 Nexus 地址、配置缺失时）。 */
             manual_upstream_url?: string | null;
-            /** @description 源仓库名。 */
             source: string;
-            /** @description 目标仓库名（缺省同名）。 */
             target?: string | null;
-            /** @description proxy 上游凭据引用名（手动补配置或补凭据时提供）。 */
             upstream_credential_ref?: string | null;
         };
         /** @description 单仓库迁移报告。 */
         RepoReport: {
-            /** @description 凭据引用状态（如「已映射」「未映射」）。 */
             credential_status: string;
-            /**
-             * Format: int64
-             * @description 已完成数。
-             */
+            /** Format: int64 */
             done: number;
-            /**
-             * Format: int64
-             * @description 已完成字节。
-             */
+            /** Format: int64 */
             done_bytes: number;
-            /**
-             * Format: int64
-             * @description 耗时（毫秒）。
-             */
+            /** Format: int64 */
             duration_ms: number;
-            /**
-             * Format: int64
-             * @description 失败数。
-             */
+            /** Format: int64 */
             failed: number;
-            /**
-             * Format: int64
-             * @description 实际迁移数。
-             */
+            /** Format: int64 */
             migrated: number;
-            /**
-             * Format: int64
-             * @description 已存在跳过数（幂等命中）。
-             */
+            /** Format: int64 */
             skipped: number;
-            /** @description 源仓库名。 */
             source: string;
-            /** @description 目标仓库名。 */
             target: string;
-            /**
-             * Format: int64
-             * @description 对象总数。
-             */
+            /** Format: int64 */
             total: number;
-            /**
-             * Format: int64
-             * @description 字节总数。
-             */
+            /** Format: int64 */
             total_bytes: number;
         };
         /**
@@ -985,6 +956,10 @@ export interface components {
          * @enum {string}
          */
         RepoType: "hosted" | "proxy" | "group";
+        RetryTaskRequest: {
+            password?: string | null;
+            username?: string | null;
+        };
         /**
          * @description 全局角色。落库为 users.role（CHECK 约束取值 'admin'/'user'），序列化为小写。
          * @enum {string}
@@ -1020,65 +995,44 @@ export interface components {
             setup_required: boolean;
         };
         /**
-         * @description 迁移来源类别（ADR-0015：默认离线直读原生数据目录）。
+         * @description 迁移来源类别。
          * @enum {string}
          */
         SourceKind: "native-dir" | "online" | "package";
-        /** @description 任务信息与节流进度。 */
+        /** @description 任务信息与进度。 */
         TaskInfo: {
-            /** @description 创建时间。 */
             created_at: string;
-            /**
-             * Format: int64
-             * @description 已完成字节。
-             */
+            /** Format: int64 */
             done_bytes: number;
-            /**
-             * Format: int64
-             * @description 已完成对象数。
-             */
+            /** Format: int64 */
             done_objects: number;
-            /** @description 引用的计划标识。 */
+            phase: components["schemas"]["TaskPhase"];
             plan_id: string;
-            /** @description 当前状态。 */
             status: components["schemas"]["TaskStatus"];
-            /** @description 任务标识。 */
             task_id: string;
-            /**
-             * Format: int64
-             * @description 字节总数。
-             */
+            /** Format: int64 */
             total_bytes: number;
-            /**
-             * Format: int64
-             * @description 对象总数。
-             */
+            /** Format: int64 */
             total_objects: number;
-            /** @description 最近更新时间。 */
             updated_at: string;
         };
         /** @description 任务列表分页响应。 */
         TaskListResponse: {
-            /** @description 当前页任务。 */
             items: components["schemas"]["TaskInfo"][];
-            /**
-             * Format: int32
-             * @description 当前页码（从 1 起）。
-             */
+            /** Format: int32 */
             page: number;
-            /**
-             * Format: int32
-             * @description 每页条数。
-             */
+            /** Format: int32 */
             page_size: number;
-            /**
-             * Format: int64
-             * @description 总条数。
-             */
+            /** Format: int64 */
             total: number;
         };
         /**
-         * @description 任务状态机十态（M1-FR-028）。
+         * @description 迁移任务固定四阶段。
+         * @enum {string}
+         */
+        TaskPhase: "initial-transfer" | "awaiting-cutover" | "finalizing" | "completed";
+        /**
+         * @description 迁移任务固定十态。
          * @enum {string}
          */
         TaskStatus: "queued" | "running" | "pausing" | "paused" | "cancelling" | "cancelled" | "succeeded" | "partial" | "failed" | "interrupted";
@@ -1116,11 +1070,8 @@ export interface components {
         };
         /** @description 不支持项。 */
         UnsupportedItem: {
-            /** @description 稳定类别（如「非受支持格式」「系统配置」）。 */
             category: string;
-            /** @description 名称或坐标。 */
             name: string;
-            /** @description 中文说明。 */
             reason: string;
         };
         /** @description 编辑仓库请求体：字段可选，只更新给出的项。 */
@@ -1190,6 +1141,15 @@ export interface components {
              * @description 总条数。
              */
             total: number;
+        };
+        /** @description 校验计数。 */
+        ValidationCounts: {
+            /** Format: int64 */
+            checked: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            passed: number;
         };
         /**
          * @description Maven hosted 版本策略。
@@ -1372,7 +1332,6 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 发现结果 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1381,7 +1340,6 @@ export interface operations {
                     "application/json": components["schemas"]["DiscoveryResult"];
                 };
             };
-            /** @description 源配置无效（路径越界/矩阵外来源等） */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1390,7 +1348,6 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 无管理员权限 */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1414,7 +1371,6 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 计划预览 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1423,7 +1379,6 @@ export interface operations {
                     "application/json": components["schemas"]["MigrationPlan"];
                 };
             };
-            /** @description 映射无效或引用的发现结果不存在 */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1432,7 +1387,6 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 无管理员权限 */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1446,9 +1400,7 @@ export interface operations {
     list_tasks: {
         parameters: {
             query?: {
-                /** @description 页码，从 1 起 */
                 page?: number;
-                /** @description 每页条数，最大 200 */
                 page_size?: number;
             };
             header?: never;
@@ -1457,7 +1409,6 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 任务分页 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1466,7 +1417,6 @@ export interface operations {
                     "application/json": components["schemas"]["TaskListResponse"];
                 };
             };
-            /** @description 无管理员权限 */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -1480,7 +1430,6 @@ export interface operations {
     create_task: {
         parameters: {
             query: {
-                /** @description 已确认的计划标识 */
                 plan_id: string;
             };
             header?: never;
@@ -1489,7 +1438,6 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description 任务已受理 */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1498,7 +1446,6 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 计划不存在或存在未决阻断冲突 */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -1507,8 +1454,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description 无管理员权限 */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1523,14 +1477,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 任务详情 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1539,7 +1491,14 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 任务不存在 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1555,14 +1514,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 取消请求已受理 */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1571,7 +1528,79 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 当前状态不允许取消 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    finalize_task: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["RetryTaskRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskInfo"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1587,14 +1616,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 暂停请求已受理 */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1603,7 +1630,22 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 当前状态不允许暂停 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1619,14 +1661,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 迁移报告 */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1635,7 +1675,14 @@ export interface operations {
                     "application/json": components["schemas"]["MigrationReport"];
                 };
             };
-            /** @description 任务不存在 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1651,14 +1698,12 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description 继续请求已受理 */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1667,7 +1712,22 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 当前状态不允许继续 */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -1683,14 +1743,16 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description 任务标识 */
                 id: string;
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["RetryTaskRequest"];
+            };
+        };
         responses: {
-            /** @description 重试请求已受理 */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -1699,7 +1761,30 @@ export interface operations {
                     "application/json": components["schemas"]["TaskInfo"];
                 };
             };
-            /** @description 当前状态不允许重试 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
             409: {
                 headers: {
                     [name: string]: unknown;

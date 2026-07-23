@@ -24,6 +24,8 @@ type FileEntry = Schemas['FileEntry'];
 type FileListResponse = Schemas['FileListResponse'];
 type UsageSnippet = Schemas['UsageSnippet'];
 type MigrationSource = Schemas['MigrationSource'];
+type RetryTaskRequest = Schemas['RetryTaskRequest'];
+type SourceKind = Schemas['SourceKind'];
 type DiscoveryResult = Schemas['DiscoveryResult'];
 type DiscoveredRepo = Schemas['DiscoveredRepo'];
 type PlanRequest = Schemas['PlanRequest'];
@@ -69,6 +71,11 @@ export interface SeedRepo {
 export interface SeedTask {
   info: TaskInfo;
   report: MigrationReport | null;
+  source: SourceKind;
+  completion?: {
+    configuration_incomplete_count: number;
+    supported_objects_not_migrated: number;
+  };
 }
 
 /** 场景种子数据：DevmockStore 的完整初始状态。 */
@@ -107,6 +114,17 @@ function ok<T>(value: T): StoreResult<T> {
 
 function fail(status: number, code: string, message: string): StoreFailure {
   return { ok: false, error: { status, code, message } };
+}
+
+function invalidRetryCredentials(request: RetryTaskRequest | undefined): StoreFailure | null {
+  const username = request?.username ?? undefined;
+  const password = request?.password ?? undefined;
+  const hasUsername = typeof username === 'string' && username.length > 0;
+  const hasPassword = typeof password === 'string' && password.length > 0;
+  if (hasUsername !== hasPassword || username === '' || password === '') {
+    return fail(400, 'MIGRATION_INVALID_REQUEST', '用户名与密码必须同时填写');
+  }
+  return null;
 }
 
 function unauthorized(): StoreFailure {
@@ -350,21 +368,60 @@ const ACTION_LABEL: Record<TaskAction, string> = {
   retry: '重试',
 };
 
-/** 推进 running 任务进度：每次轮询前进约五分之一，完成即转 succeeded。 */
-function advanceProgress(info: TaskInfo): void {
+function emptyValidation(): MigrationReport['validation'] {
+  return {
+    blob: { checked: 0, passed: 0, failed: 0 },
+    protocol_metadata: { checked: 0, passed: 0, failed: 0 },
+    proxy_positive_cache: { checked: 0, passed: 0, failed: 0 },
+  };
+}
+
+function emptyOnlineDrift(): MigrationReport['online_drift'] {
+  return {
+    added: 0,
+    modified: 0,
+    deleted: 0,
+    unresolved_conflict_count: 0,
+    conflict_decisions: [],
+  };
+}
+
+/** 推进 running 任务进度；在线首轮完成必须停在显式切换门。 */
+function advanceProgress(task: SeedTask): void {
+  const { info } = task;
   if (info.status !== 'running' || info.total_objects <= 0) return;
   const step = Math.max(1, Math.floor(info.total_objects / 5));
   info.done_objects = Math.min(info.total_objects, info.done_objects + step);
   info.done_bytes = Math.floor((info.done_objects / info.total_objects) * info.total_bytes);
   info.updated_at = now();
-  if (info.done_objects >= info.total_objects) info.status = 'succeeded';
+  if (info.done_objects < info.total_objects) return;
+  if (task.source === 'online' && info.phase === 'initial-transfer') {
+    info.status = 'paused';
+    info.phase = 'awaiting-cutover';
+    return;
+  }
+  const incomplete = task.completion;
+  info.status =
+    incomplete &&
+    (incomplete.configuration_incomplete_count > 0 || incomplete.supported_objects_not_migrated > 0)
+      ? 'partial'
+      : 'succeeded';
+  info.phase = 'completed';
 }
 
 /** 按任务当前状态合成基础报告（无预置报告的任务用）。 */
-function synthesizeReport(info: TaskInfo): MigrationReport {
+function synthesizeReport(task: SeedTask): MigrationReport {
+  const { info } = task;
   return {
     task_id: info.task_id,
     status: info.status,
+    configuration_incomplete_count: task.completion?.configuration_incomplete_count ?? 0,
+    supported_objects_not_migrated: Math.max(
+      task.completion?.supported_objects_not_migrated ?? 0,
+      info.total_objects - info.done_objects,
+    ),
+    validation: emptyValidation(),
+    online_drift: emptyOnlineDrift(),
     repositories: [
       {
         source: 'maven-releases',
@@ -402,7 +459,9 @@ export class DevmockStore {
   private upstreamDown = false;
   private setupToken: string | null = null;
   private readonly discoveries = new Map<string, DiscoveryResult>();
+  private readonly discoverySources = new Map<string, SourceKind>();
   private readonly plans = new Map<string, MigrationPlan>();
+  private readonly planSources = new Map<string, SourceKind>();
   private seq = 0;
 
   // 迁移任务与会话持久化键：模拟后端跨页面重载仍保有服务端状态。
@@ -440,7 +499,9 @@ export class DevmockStore {
       const persisted = JSON.parse(raw) as SeedTask[];
       const known = new Set(this.tasks.map((t) => t.info.task_id));
       for (const task of persisted) {
-        if (!known.has(task.info.task_id)) this.tasks.push(task);
+        if (!known.has(task.info.task_id)) {
+          this.tasks.push({ ...task, source: task.source ?? 'package' });
+        }
       }
     } catch {
       // 持久化内容损坏时忽略，回到纯种子状态
@@ -504,7 +565,9 @@ export class DevmockStore {
     this.upstreamDown = seed.upstreamDown;
     this.setupToken = seed.setupToken ?? null;
     this.discoveries.clear();
+    this.discoverySources.clear();
     this.plans.clear();
+    this.planSources.clear();
     this.seq = 0;
   }
 
@@ -1008,6 +1071,7 @@ export class DevmockStore {
       ],
     };
     this.discoveries.set(result.discovery_id, result);
+    this.discoverySources.set(result.discovery_id, source.kind);
     return ok(result);
   }
 
@@ -1039,6 +1103,17 @@ export class DevmockStore {
     const included = req.mappings.filter((m) => !m.excluded);
     const sources = new Set(included.map((m) => m.source));
     const chosen = discovery.repositories.filter((r) => sources.has(r.name));
+    const excludedSources = new Set(req.mappings.filter((m) => m.excluded).map((m) => m.source));
+    const excluded = discovery.repositories.filter((r) => excludedSources.has(r.name));
+    const mappingBySource = new Map(req.mappings.map((mapping) => [mapping.source, mapping]));
+    const configurationIncompleteCount = chosen.filter((repo) => {
+      if (repo.config_complete) return false;
+      const mapping = mappingBySource.get(repo.name);
+      if (repo.repo_type === 'proxy') return !mapping?.manual_upstream_url;
+      if (repo.repo_type === 'group') return !mapping?.manual_members?.length;
+      return true;
+    }).length;
+    const supportedObjectsNotMigrated = excluded.reduce((sum, repo) => sum + repo.object_count, 0);
     const totalBytes = chosen.reduce((sum, r) => sum + r.total_bytes, 0);
     this.seq += 1;
     const result: MigrationPlan = {
@@ -1046,6 +1121,9 @@ export class DevmockStore {
       mappings: req.mappings,
       conflicts,
       blocked: conflicts.length > 0,
+      configuration_incomplete_count: configurationIncompleteCount,
+      supported_objects_not_migrated: supportedObjectsNotMigrated,
+      unresolved_conflict_count: conflicts.length,
       object_count: chosen.reduce((sum, r) => sum + r.object_count, 0),
       total_bytes: totalBytes,
       estimated_disk_bytes: Math.ceil(totalBytes * 1.2),
@@ -1053,6 +1131,7 @@ export class DevmockStore {
       unsupported: discovery.unsupported,
     };
     this.plans.set(result.plan_id, result);
+    this.planSources.set(result.plan_id, this.discoverySources.get(req.discovery_id) ?? 'package');
     return ok(result);
   }
 
@@ -1068,6 +1147,7 @@ export class DevmockStore {
       task_id: `task_${String(this.seq)}`,
       plan_id: planId,
       status: 'running',
+      phase: 'initial-transfer',
       done_objects: 0,
       total_objects: plan.object_count,
       done_bytes: 0,
@@ -1075,7 +1155,15 @@ export class DevmockStore {
       created_at: now(),
       updated_at: now(),
     };
-    this.tasks.push({ info, report: null });
+    this.tasks.push({
+      info,
+      report: null,
+      source: this.planSources.get(planId) ?? 'package',
+      completion: {
+        configuration_incomplete_count: plan.configuration_incomplete_count,
+        supported_objects_not_migrated: plan.supported_objects_not_migrated,
+      },
+    });
     this.persistTasks();
     return ok(info);
   }
@@ -1094,22 +1182,63 @@ export class DevmockStore {
     if (!admin.ok) return admin;
     const task = this.tasks.find((t) => t.info.task_id === id);
     if (!task) return notFound('任务不存在');
-    advanceProgress(task.info);
+    advanceProgress(task);
     this.persistTasks();
     return ok(task.info);
   }
 
   /** 任务控制动作：按状态机合法转移执行，非法转移返回 409。 */
-  controlTask(id: string, action: TaskAction): StoreResult<TaskInfo> {
+  controlTask(
+    id: string,
+    action: TaskAction,
+    retryRequest?: RetryTaskRequest,
+  ): StoreResult<TaskInfo> {
     const admin = this.requireAdmin();
     if (!admin.ok) return admin;
+    if (action === 'retry') {
+      const invalidCredentials = invalidRetryCredentials(retryRequest);
+      if (invalidCredentials) return invalidCredentials;
+    }
     const task = this.tasks.find((t) => t.info.task_id === id);
     if (!task) return notFound('任务不存在');
     const rule = TASK_ACTIONS[action];
     if (!rule.from.includes(task.info.status)) {
       return fail(409, 'ILLEGAL_TRANSITION', `当前状态不允许${ACTION_LABEL[action]}`);
     }
-    task.info.status = rule.to;
+    if (action === 'resume' && task.info.phase === 'awaiting-cutover') {
+      return fail(409, 'ILLEGAL_TRANSITION', '等待切换阶段只能执行最终收口');
+    }
+    if (action === 'retry') {
+      const interruptedAtCutover =
+        task.info.status === 'interrupted' && task.info.phase === 'awaiting-cutover';
+      task.info.status = interruptedAtCutover ? 'paused' : 'running';
+      if (task.info.phase === 'completed') task.info.phase = 'initial-transfer';
+    } else {
+      task.info.status = rule.to;
+      if (rule.to === 'cancelled') task.info.phase = 'completed';
+    }
+    task.info.updated_at = now();
+    this.persistTasks();
+    return ok(task.info);
+  }
+
+  /** 在线任务收口：仅等待切换门允许进入最终扫描。 */
+  finalizeTask(id: string, retryRequest?: RetryTaskRequest): StoreResult<TaskInfo> {
+    const admin = this.requireAdmin();
+    if (!admin.ok) return admin;
+    const invalidCredentials = invalidRetryCredentials(retryRequest);
+    if (invalidCredentials) return invalidCredentials;
+    const task = this.tasks.find((item) => item.info.task_id === id);
+    if (!task) return notFound('任务不存在');
+    if (
+      task.source !== 'online' ||
+      task.info.status !== 'paused' ||
+      task.info.phase !== 'awaiting-cutover'
+    ) {
+      return fail(409, 'ILLEGAL_TRANSITION', '当前状态或阶段不允许最终收口');
+    }
+    task.info.status = 'running';
+    task.info.phase = 'finalizing';
     task.info.updated_at = now();
     this.persistTasks();
     return ok(task.info);
@@ -1121,7 +1250,7 @@ export class DevmockStore {
     if (!admin.ok) return admin;
     const task = this.tasks.find((t) => t.info.task_id === id);
     if (!task) return notFound('任务不存在');
-    return ok(task.report ?? synthesizeReport(task.info));
+    return ok(task.report ?? synthesizeReport(task));
   }
 }
 

@@ -8,6 +8,7 @@ use jianartifact_server::admin::{CliCommand, parse_args, reset_password};
 use jianartifact_server::api::ApiDoc;
 use jianartifact_server::config::Config;
 use jianartifact_server::error::StartupError;
+use jianartifact_server::migration::export::export_native_package;
 use jianartifact_server::{build_app, logging};
 use utoipa::OpenApi;
 
@@ -33,6 +34,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let config = Config::load()?;
             reset_password(&config.database_path, &username, password_stdin).await?;
             writeln!(std::io::stdout().lock(), "口令重置成功")?;
+        }
+        CliCommand::MigrationExport {
+            source,
+            output,
+            repository_config,
+            nexus_version,
+        } => {
+            let config = Config::load()?;
+            export_native_package(
+                config.migration_workdir.as_deref(),
+                &source,
+                &output,
+                &repository_config,
+                &nexus_version,
+            )?;
+            writeln!(std::io::stdout().lock(), "离线迁移包导出成功")?;
         }
     }
     Ok(())

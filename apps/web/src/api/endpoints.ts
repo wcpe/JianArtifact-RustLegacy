@@ -107,6 +107,14 @@ export const migrationApi = {
     apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/resume`, { method: 'POST' }),
   cancel: (id: string) =>
     apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/cancel`, { method: 'POST' }),
-  retry: (id: string) =>
-    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/retry`, { method: 'POST' }),
+  retry: (id: string, body?: Schemas['RetryTaskRequest']) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/retry`, {
+      method: 'POST',
+      body,
+    }),
+  finalize: (id: string, body?: Schemas['RetryTaskRequest']) =>
+    apiRequest<Schemas['TaskInfo']>(`/api/v1/migration/tasks/${id}/finalize`, {
+      method: 'POST',
+      body,
+    }),
 };

@@ -9,16 +9,20 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use http_body_util::BodyExt;
+use jianartifact_server::api::extractor::ArtifactRoute;
 use jianartifact_server::api::router;
 use jianartifact_server::artifact::ArtifactService;
 use jianartifact_server::auth::AuthRuntime;
 use jianartifact_server::config::Config;
+use jianartifact_server::domain::repository::{Permission, Subject};
 use jianartifact_server::domain::{Role, create_user};
 use jianartifact_server::persistence;
+use jianartifact_server::protocol::npm;
+use jianartifact_server::repository;
 use jianartifact_server::state::AppState;
 use jianartifact_server::storage::BlobStore;
 use serde_json::{Value, json};
@@ -36,6 +40,7 @@ const TARBALL: &[u8] = b"npm-test-tarball";
 struct TestContext {
     app: Router,
     pool: SqlitePool,
+    state: AppState,
     _dir: TempDir,
 }
 
@@ -55,6 +60,19 @@ struct FixtureUpstreamState {
     hits: Arc<AtomicUsize>,
     packument: Value,
     tarballs: Arc<HashMap<String, Vec<u8>>>,
+}
+
+#[derive(Clone, Copy)]
+enum PackumentStreamMode {
+    DeclaredOversized,
+    ChunkedOversized,
+    Idle,
+}
+
+#[derive(Clone)]
+struct PackumentStreamState {
+    hits: Arc<AtomicUsize>,
+    mode: PackumentStreamMode,
 }
 
 impl Drop for Upstream {
@@ -79,6 +97,8 @@ async fn setup_with_publish_limit(ttl_secs: u64, publish_max_bytes: u64) -> Test
         bind: "127.0.0.1:0".to_string(),
         database_path: db_path,
         data_dir: dir.path().join("blobs"),
+        migration_workdir: Some(dir.path().join("migration")),
+        migration_object_concurrency: 4,
         log_level: "warn".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         session_ttl_hours: 8,
@@ -109,8 +129,9 @@ async fn setup_with_publish_limit(ttl_secs: u64, publish_max_bytes: u64) -> Test
         artifacts,
     };
     TestContext {
-        app: router(state),
+        app: router(state.clone()),
         pool,
+        state,
         _dir: dir,
     }
 }
@@ -452,6 +473,97 @@ async fn start_fixture_upstream(
     }
 }
 
+async fn write_prefix_then_wait(mut sender: tokio::io::DuplexStream, mut remaining: usize) {
+    let chunk = vec![b' '; 64 * 1024];
+    while remaining > 0 {
+        let length = remaining.min(chunk.len());
+        if sender.write_all(&chunk[..length]).await.is_err() {
+            return;
+        }
+        remaining -= length;
+    }
+    let _sender = sender;
+    std::future::pending::<()>().await;
+}
+
+fn pending_packument_body(prefix_bytes: usize) -> Body {
+    let (sender, receiver) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(write_prefix_then_wait(sender, prefix_bytes));
+    Body::from_stream(tokio_util::io::ReaderStream::new(receiver))
+}
+
+async fn packument_stream_handler(
+    State(state): State<PackumentStreamState>,
+    Path(path): Path<String>,
+) -> Response {
+    const OVERSIZED_BYTES: usize = 16 * 1024 * 1024 + 1;
+    state.hits.fetch_add(1, Ordering::SeqCst);
+    if path != "base/demo" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (body, content_length) = match state.mode {
+        PackumentStreamMode::DeclaredOversized => {
+            (pending_packument_body(0), Some(OVERSIZED_BYTES))
+        }
+        PackumentStreamMode::ChunkedOversized => (pending_packument_body(OVERSIZED_BYTES), None),
+        PackumentStreamMode::Idle => (pending_packument_body(0), None),
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(length) = content_length {
+        response = response.header(header::CONTENT_LENGTH, length);
+    }
+    response.body(body).unwrap()
+}
+
+async fn start_packument_stream_upstream(mode: PackumentStreamMode) -> Upstream {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = PackumentStreamState {
+        hits: Arc::clone(&hits),
+        mode,
+    };
+    let app = Router::new()
+        .route("/{*path}", get(packument_stream_handler))
+        .with_state(state);
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Upstream {
+        base_url: format!("http://{address}/base"),
+        hits,
+        task,
+    }
+}
+
+async fn assert_proxy_packument_too_large(mode: PackumentStreamMode) {
+    let context = setup(1800).await;
+    let upstream = start_packument_stream_upstream(mode).await;
+    insert_repository(
+        &context.pool,
+        "npm-oversized",
+        "proxy",
+        Some(&upstream.base_url),
+    )
+    .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        send(
+            &context.app,
+            "GET",
+            "/repository/npm-oversized/demo",
+            None,
+            Body::empty(),
+        ),
+    )
+    .await
+    .expect("服务端应在上游流结束前立即拒绝超限 packument");
+    assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(json_body(&response)["code"], "PROXY_UPSTREAM_FAILURE");
+    assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
+}
+
 async fn start_upstream() -> Upstream {
     let hits = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -490,6 +602,73 @@ async fn start_upstream() -> Upstream {
         hits,
         task,
     }
+}
+
+#[tokio::test]
+async fn proxy_packument声明长度超过十六mib时读取body前拒绝() {
+    assert_proxy_packument_too_large(PackumentStreamMode::DeclaredOversized).await;
+}
+
+#[tokio::test]
+async fn proxy_packument分块累计超限后不等待流结束() {
+    assert_proxy_packument_too_large(PackumentStreamMode::ChunkedOversized).await;
+}
+
+#[tokio::test]
+async fn proxy_packument空闲超时映射且失败不写缓存() {
+    let context = setup(1800).await;
+    let upstream = start_packument_stream_upstream(PackumentStreamMode::Idle).await;
+    let repo_id = insert_repository(
+        &context.pool,
+        "npm-timeout",
+        "proxy",
+        Some(&upstream.base_url),
+    )
+    .await;
+    let proxy = repository::protocol_repository(
+        &context.pool,
+        Subject::Anonymous,
+        "npm-timeout",
+        Permission::Read,
+    )
+    .await
+    .unwrap();
+    let route = ArtifactRoute {
+        repository: "npm-timeout".to_string(),
+        path: "demo".to_string(),
+        trailing_slash: false,
+    };
+    let uri = Uri::from_static("/repository/npm-timeout/demo");
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, "registry.test".parse().unwrap());
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        npm::fetch_proxy_packument_with_idle_timeout(
+            &context.state,
+            &proxy,
+            &route,
+            &uri,
+            &headers,
+            "demo",
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("测试注入的短空闲超时应及时生效")
+    .unwrap_err();
+    assert_eq!(error.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error.code(), "PROXY_UPSTREAM_TIMEOUT");
+    assert!(
+        context
+            .state
+            .artifacts
+            .npm_proxy_packument(repo_id, "demo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(upstream.hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

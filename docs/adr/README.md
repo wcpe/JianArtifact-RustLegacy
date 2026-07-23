@@ -20,6 +20,7 @@
 | [0014](0014-frontend-first-delivery.md) | 前端先行交付工序与契约骨架 | 已接受 |
 | [0015](0015-offline-native-datadir-primary.md) | 离线直读 Nexus 原生数据目录为首选全量迁移路径 | 已接受 |
 | [0016](0016-apps-packages-two-roots.md) | 工作区采用 apps/ + packages/ 双根结构 | 已接受 |
+| [0017](0017-migration-control-and-export-contract.md) | 迁移控制面与离线导出契约 | 已接受 |
 
 > 模板：[`_template.md`](_template.md)（状态 / 背景 / 决策 / 理由 / 后果 / 备选方案），新 ADR 从模板复制起稿、顺延编号。
 

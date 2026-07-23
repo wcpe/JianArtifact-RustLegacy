@@ -13,6 +13,7 @@ import {
   CardHeader,
   CardTitle,
   ErrorState,
+  Input,
   Skeleton,
   StatusBadge,
 } from '@jianartifact/ui';
@@ -27,7 +28,7 @@ type TaskInfo = components['schemas']['TaskInfo'];
 const POLL_INTERVAL_MS = 1500;
 
 // 控制动作标识
-type ControlKey = 'pause' | 'resume' | 'cancel' | 'retry';
+type ControlKey = 'pause' | 'resume' | 'cancel' | 'retry' | 'finalize';
 
 // 控制动作的中文按钮文案
 const CONTROL_LABEL: Record<ControlKey, string> = {
@@ -35,14 +36,7 @@ const CONTROL_LABEL: Record<ControlKey, string> = {
   resume: '继续',
   cancel: '取消',
   retry: '重试',
-};
-
-// 控制动作对应的 API 调用
-const CONTROL_API: Record<ControlKey, (id: string) => Promise<TaskInfo>> = {
-  pause: migrationApi.pause,
-  resume: migrationApi.resume,
-  cancel: migrationApi.cancel,
-  retry: migrationApi.retry,
+  finalize: '执行最终增量扫描',
 };
 
 // 状态 → 可用控制动作映射（对齐后端十态状态机的合法转移，未列出的状态不提供控制按钮）：
@@ -94,6 +88,8 @@ export function ProgressStep({
   const [error, setError] = useState<string | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
@@ -123,13 +119,23 @@ export function ProgressStep({
     };
   }, [taskId, reloadToken]);
 
-  // 执行控制动作：成功以响应体立即刷新任务详情，并重启轮询（重试从终态恢复运行时需要）；
-  // 409（非法状态转移）等错误以后端消息在页内 Alert 展示
+  // 执行控制动作：成功以响应体立即刷新任务详情，并重启轮询；在线任务重启后可在此重新提交临时凭据。
   const runControl = async (key: ControlKey) => {
     setControlError(null);
+    if ((username || password) && (!username || !password)) {
+      setControlError('用户名与密码必须同时填写');
+      return;
+    }
+    const credentials = username && password ? { username, password } : undefined;
     setControlBusy(true);
     try {
-      const info = await CONTROL_API[key](taskId);
+      let info: TaskInfo;
+      if (key === 'pause') info = await migrationApi.pause(taskId);
+      else if (key === 'resume') info = await migrationApi.resume(taskId);
+      else if (key === 'cancel') info = await migrationApi.cancel(taskId);
+      else if (key === 'retry') info = await migrationApi.retry(taskId, credentials);
+      else info = await migrationApi.finalize(taskId, credentials);
+      setPassword('');
       setTask(info);
       setReloadToken((value) => value + 1);
     } catch (err) {
@@ -161,8 +167,16 @@ export function ProgressStep({
       ? Math.min(100, Math.round((task.done_objects / task.total_objects) * 100))
       : 0;
   const terminal = isTerminalStatus(task.status);
-  const controls = CONTROLS_BY_STATUS[task.status] ?? [];
-  const phase = STATUS_PHASE[task.status] ?? task.status;
+  const controls: ControlKey[] =
+    task.status === 'paused' && task.phase === 'awaiting-cutover'
+      ? ['finalize', 'cancel']
+      : (CONTROLS_BY_STATUS[task.status] ?? []);
+  const phase =
+    task.phase === 'awaiting-cutover'
+      ? '初次迁移已完成，请停写 Nexus 后执行最终增量扫描'
+      : task.phase === 'finalizing'
+        ? '正在执行最终增量扫描并核对源端稳定性'
+        : (STATUS_PHASE[task.status] ?? task.phase);
   const active = ACTIVE_STATUSES.has(task.status);
 
   return (
@@ -210,6 +224,29 @@ export function ProgressStep({
             </span>
           </div>
         </div>
+
+        {controls.includes('retry') || controls.includes('finalize') ? (
+          <div className="grid gap-3 rounded-lg border border-border/70 bg-muted/30 p-3 md:grid-cols-2">
+            <div className="md:col-span-2 text-sm text-muted-foreground">
+              若服务已重启，请为在线 Nexus 任务重新填写临时凭据；凭据仅驻留当前进程内存。
+            </div>
+            <Input
+              aria-label="Nexus 用户名"
+              autoComplete="username"
+              placeholder="Nexus 用户名（可选）"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+            <Input
+              aria-label="Nexus 密码"
+              autoComplete="current-password"
+              placeholder="Nexus 密码（可选）"
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </div>
+        ) : null}
 
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex gap-2">

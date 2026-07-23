@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::api::extractor::{RequireAuth, SessionClaims};
+use crate::api::extractor::{LogoutClaims, RequireAuth, SessionClaims};
 use crate::api::users::UserInfo;
 use crate::auth::jwt;
 use crate::auth::password::verify_password_or_dummy_async;
@@ -118,7 +118,7 @@ pub async fn refresh(
     ),
 )]
 pub async fn logout(
-    SessionClaims(claims): SessionClaims,
+    LogoutClaims(claims): LogoutClaims,
     State(state): State<AppState>,
 ) -> Result<StatusCode, ApiError> {
     let revoke_until = claims.exp.saturating_add(state.auth.session_ttl_secs()) as i64;

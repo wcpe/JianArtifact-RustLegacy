@@ -271,6 +271,7 @@ describe('迁移发现与计划', () => {
       }),
     );
     expect(blocked.blocked).toBe(true);
+    expect(blocked.unresolved_conflict_count).toBe(1);
     expect(blocked.conflicts.some((c) => c.category === '目标仓库已存在')).toBe(true);
     expect(unwrapError(store.createTask(blocked.plan_id)).status).toBe(400);
     const renamed = unwrap(
@@ -280,7 +281,36 @@ describe('迁移发现与计划', () => {
       }),
     );
     expect(renamed.blocked).toBe(false);
-    expect(unwrap(store.createTask(renamed.plan_id)).status).toBe('running');
+    expect(renamed.configuration_incomplete_count).toBe(0);
+    expect(renamed.supported_objects_not_migrated).toBe(0);
+    const task = unwrap(store.createTask(renamed.plan_id));
+    expect(task.status).toBe('running');
+    expect(task.phase).toBe('initial-transfer');
+  });
+
+  it('online 首轮完成停在切换门，只有 finalize 后才能成功', () => {
+    const store = createStore('default');
+    const discovery = unwrap(store.discover({ kind: 'online', url: 'https://nexus.example.com' }));
+    const plan = unwrap(
+      store.plan({
+        discovery_id: discovery.discovery_id,
+        mappings: [{ source: 'maven-legacy', target: 'maven-online', excluded: false }],
+      }),
+    );
+    const task = unwrap(store.createTask(plan.plan_id));
+    for (let index = 0; index < 6; index += 1) store.getTask(task.task_id);
+
+    const awaiting = unwrap(store.getTask(task.task_id));
+    expect(awaiting.status).toBe('paused');
+    expect(awaiting.phase).toBe('awaiting-cutover');
+    expect(unwrapError(store.controlTask(task.task_id, 'resume')).status).toBe(409);
+
+    const finalizing = unwrap(store.finalizeTask(task.task_id));
+    expect(finalizing.status).toBe('running');
+    expect(finalizing.phase).toBe('finalizing');
+    const completed = unwrap(store.getTask(task.task_id));
+    expect(completed.status).toBe('succeeded');
+    expect(completed.phase).toBe('completed');
   });
 
   it('引用不存在的发现结果返回 400', () => {
@@ -306,6 +336,32 @@ describe('迁移发现与计划', () => {
     const proxyOnline = online.repositories.find((repo) => repo.repo_type === 'proxy');
     expect(proxyOnline?.config_complete).toBe(true);
   });
+
+  it('配置缺口或排除受支持对象时任务只能 partial', () => {
+    const store = createStore('default');
+    const discovery = unwrap(store.discover({ kind: 'native-dir', path: 'nexus-data' }));
+    const plan = unwrap(
+      store.plan({
+        discovery_id: discovery.discovery_id,
+        mappings: [
+          { source: 'npm-mirror', target: 'npm-imported', excluded: false },
+          { source: 'raw-archive', excluded: true },
+        ],
+      }),
+    );
+    expect(plan.configuration_incomplete_count).toBe(1);
+    expect(plan.supported_objects_not_migrated).toBe(42);
+
+    const task = unwrap(store.createTask(plan.plan_id));
+    for (let index = 0; index < 6; index += 1) store.getTask(task.task_id);
+    const completed = unwrap(store.getTask(task.task_id));
+    expect(completed.status).toBe('partial');
+    expect(completed.phase).toBe('completed');
+
+    const report = unwrap(store.getReport(task.task_id));
+    expect(report.configuration_incomplete_count).toBe(1);
+    expect(report.supported_objects_not_migrated).toBe(42);
+  });
 });
 
 describe('迁移状态机与进度轮询', () => {
@@ -318,19 +374,52 @@ describe('迁移状态机与进度轮询', () => {
 
   it('running→pause→paused→resume→running、cancel 链与非法转移 409', () => {
     const store = createStore('migration-running');
-    expect(unwrap(store.controlTask('task_run_1', 'pause')).status).toBe('paused');
-    expect(unwrap(store.controlTask('task_run_1', 'resume')).status).toBe('running');
-    expect(unwrap(store.controlTask('task_run_1', 'cancel')).status).toBe('cancelled');
-    expect(unwrap(store.controlTask('task_run_1', 'retry')).status).toBe('running');
+    const paused = unwrap(store.controlTask('task_run_1', 'pause'));
+    expect(paused.status).toBe('paused');
+    expect(paused.phase).toBe('initial-transfer');
+    const resumed = unwrap(store.controlTask('task_run_1', 'resume'));
+    expect(resumed.status).toBe('running');
+    expect(resumed.phase).toBe('initial-transfer');
+    const cancelled = unwrap(store.controlTask('task_run_1', 'cancel'));
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.phase).toBe('completed');
+    const retried = unwrap(store.controlTask('task_run_1', 'retry'));
+    expect(retried.status).toBe('running');
+    expect(retried.phase).toBe('initial-transfer');
     // succeeded 历史任务不允许暂停或继续
     expect(unwrapError(store.controlTask('task_hist_1', 'pause')).status).toBe(409);
     expect(unwrapError(store.controlTask('task_hist_1', 'resume')).status).toBe(409);
+    expect(unwrapError(store.finalizeTask('task_run_1')).status).toBe(409);
+  });
+
+  it('重试与收口的临时凭据必须成对提供', () => {
+    const store = createStore('migration-running');
+    unwrap(store.controlTask('task_run_1', 'cancel'));
+    const retry = store.controlTask('task_run_1', 'retry', { username: 'nexus-admin' });
+    expect(unwrapError(retry).code).toBe('MIGRATION_INVALID_REQUEST');
+
+    const online = createStore('default');
+    const discovery = unwrap(online.discover({ kind: 'online', url: 'https://nexus.example.com' }));
+    const plan = unwrap(
+      online.plan({
+        discovery_id: discovery.discovery_id,
+        mappings: [{ source: 'maven-legacy', target: 'maven-finalize', excluded: false }],
+      }),
+    );
+    const task = unwrap(online.createTask(plan.plan_id));
+    for (let index = 0; index < 6; index += 1) online.getTask(task.task_id);
+    const finalize = online.finalizeTask(task.task_id, { password: 'nexus-pass' });
+    expect(unwrapError(finalize).code).toBe('MIGRATION_INVALID_REQUEST');
   });
 
   it('partial 场景报告含失败样本与不支持项', () => {
     const store = createStore('migration-partial');
     const report = unwrap(store.getReport('task_part_1'));
     expect(report.status).toBe('partial');
+    expect(report.configuration_incomplete_count).toBe(0);
+    expect(report.supported_objects_not_migrated).toBe(10);
+    expect(report.validation.blob.checked).toBe(0);
+    expect(report.online_drift.unresolved_conflict_count).toBe(0);
     expect(report.failures).toHaveLength(2);
     expect(report.unsupported.length).toBeGreaterThan(0);
     expect(report.excluded.length).toBeGreaterThan(0);

@@ -38,10 +38,24 @@ create_repo() {
         "$ACCEPTANCE_BASE_URL/api/v1/repos"
 }
 
+maven_plugin_api_jar() {
+    local executable home
+    local -a candidates
+    executable="$(readlink -f "$(command -v mvn)")"
+    home="${MAVEN_HOME:-$(cd "$(dirname "$executable")/.." && pwd)}"
+    candidates=("$home"/lib/maven-plugin-api-*.jar)
+    if [ "${#candidates[@]}" -ne 1 ] || [ ! -f "${candidates[0]}" ]; then
+        fail "无法唯一定位 Maven Plugin API"
+    fi
+    printf '%s\n' "${candidates[0]}"
+}
+
 build_plugin() {
     local plugin_jar="$LOCAL_REPO/$PLUGIN_GROUP_PATH/acceptance-maven-plugin-1.0.0.jar"
     local plugin_pom="$LOCAL_REPO/$PLUGIN_GROUP_PATH/acceptance-maven-plugin-1.0.0.pom"
-    javac -encoding UTF-8 -cp "$MAVEN_HOME/lib/maven-plugin-api-3.9.9.jar" \
+    local plugin_api_jar
+    plugin_api_jar="$(maven_plugin_api_jar)"
+    javac -encoding UTF-8 -cp "$plugin_api_jar" \
         -d "$WORK_DIR/classes" "$PLUGIN_SOURCE"/src/com/jianartifact/acceptance/*.java
     jar --create --file "$plugin_jar" \
         -C "$WORK_DIR/classes" . -C "$PLUGIN_SOURCE" META-INF
