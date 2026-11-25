@@ -59,6 +59,37 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
 
+      # 清理旧 dev 滚动预发布从 publish 前移：draft release 既是产物通道
+      # 又是最终载体，须在创建 draft 前清掉旧 dev（避免旧资产混入新发布）。
+      - name: 清理旧 dev 预发布（避免资产堆积）
+        if: steps.meta.outputs.prerelease == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --yes --cleanup-tag --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
+
+      # draft release 产物通道：同 run 跨 job cache 传产物实测不可靠，
+      # 改走 draft release 资产；draft 对外不可见，publish 校验齐备后发布。
+      - name: 创建 draft release 作为产物通道
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.meta.outputs.tag }}
+          IS_PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG_NAME}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -q '^true$'; then
+            echo "复用已有 draft release ${TAG_NAME}"
+          elif gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "::error::Release ${TAG_NAME} 已存在且非 draft，拒绝污染" >&2
+            exit 1
+          else
+            args=(--draft --title "${TAG_NAME}" --notes "release pipeline in progress")
+            [ "${IS_PRERELEASE}" = "true" ] && args+=(--prerelease)
+            gh release create "${TAG_NAME}" "${args[@]}"
+          fi
+
   # 第二步：三目标矩阵各自原生 runner 编译，产出按命名契约重命名的二进制 + .sha256，上传为构件。
   build:
     name: 构建 ${{ matrix.target }}
@@ -192,19 +223,16 @@ jobs:
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
           echo "zip_asset=${zip_asset}" >> "$GITHUB_OUTPUT"
 
-      # 上传该目标的全部资产为工作流构件（过渡版：裸 exe + 压缩包各含校验和），
-      # 交由后续 publish job 汇总发布。
-      - name: 上传构建产物
-        uses: actions/cache/save@v4
-        with:
-          key: asset-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/${{ steps.pack.outputs.asset }}
-            dist/${{ steps.pack.outputs.asset }}.sha256
-            dist/${{ steps.pack.outputs.zip_asset }}
-            dist/${{ steps.pack.outputs.zip_asset }}.sha256
-            dist/${{ steps.pack.outputs.zip_asset }}.md5
-          fail-on-cache-miss: false
+      # 上传该目标的全部资产到 draft release（跨 job 产物通道），
+      # 交由 publish job 校验齐备后发布。
+      - name: 上传构建产物到 draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG_NAME}"             "dist/${{ steps.pack.outputs.asset }}"             "dist/${{ steps.pack.outputs.asset }}.sha256"             "dist/${{ steps.pack.outputs.zip_asset }}"             "dist/${{ steps.pack.outputs.zip_asset }}.sha256"             "dist/${{ steps.pack.outputs.zip_asset }}.md5"             --clobber
 
   # 第三步：汇总三目标资产，按渠道发布为 GitHub Release（prerelease 或正式）。
   publish:
@@ -212,51 +240,53 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      # 下载全部目标构件到 dist/（每个构件解包到以其 name 命名的子目录）。
-      - name: 还原 linux-musl 构建产物
-        uses: actions/cache/restore@v4
-        with:
-          key: asset-x86_64-unknown-linux-musl-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist
-          fail-on-cache-miss: true
-
-      - name: 还原 windows-msvc 构建产物
-        uses: actions/cache/restore@v4
-        with:
-          key: asset-x86_64-pc-windows-msvc-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist
-          fail-on-cache-miss: true
-
-      - name: 还原 darwin-arm64 构建产物
-        uses: actions/cache/restore@v4
-        with:
-          key: asset-aarch64-apple-darwin-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dist
-          fail-on-cache-miss: true
-
-      # 清理旧的 dev 滚动预发布（仅 prerelease 渠道）：每次推 master 的快照资产名内嵌
-      # {run_number}+{sha}、各次不同，若不先删旧 dev 预发布，action-gh-release 只会把新资产
-      # 追加进去、旧资产永不清理而堆积。故发布前删掉旧 dev 预发布及其 tag，让本次发布为
-      # 只含当前快照的全新 dev 预发布（正式 v* tag 渠道不删、保留历史正式版）。
-      - name: 清理旧 dev 预发布（避免资产堆积）
-        if: needs.prepare.outputs.prerelease == 'true'
+      # 下载全部目标构件并校验齐备（15 件 = 3 目标 × 5 资产）。
+      - name: 下载全部构建产物并校验
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
         run: |
-          gh release delete dev --yes --cleanup-tag --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -euo pipefail
+          gh release download "${TAG_NAME}" -D dist --clobber
+          count="$(find dist -type f | wc -l)"
+          [ "${count}" -eq 15 ] || { echo "::error::资产不齐：期望 15 件，实得 ${count}"; find dist -type f; exit 1; }
+          ls -l dist/
 
-      # 发布为 GitHub Release：仓库坐标用内置 github.repository（不硬编码），
-      # 凭据用内置 GITHUB_TOKEN。prerelease 走滚动 tag dev、正式走 v* tag。
+      # 发布 draft release：转正并改名（draft 由 prepare 建、资产由各格上传）。
       - name: 发布 GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.tag }}
-          name: ${{ needs.prepare.outputs.version }}
-          prerelease: ${{ needs.prepare.outputs.prerelease }}
-          # prerelease 用滚动 tag dev：每次推 master 覆盖更新同一预发布。
-          make_latest: ${{ needs.prepare.outputs.prerelease == 'false' }}
-          files: dist/*
-          fail_on_unmatched_files: true
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release edit "${TAG_NAME}" --draft=false --title "${VERSION}"
+
+  # ── 收尾：半成品 draft 不残留（失败/中断时清理；dev 渠道删 draft 不删 tag） ──
+  cleanup-draft:
+    needs: [prepare, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 清理未发布的 draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          [ -n "${TAG_NAME}" ] || exit 0
+          if gh release view "${TAG_NAME}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -q '^true$'; then
+            # dev 渠道删掉 tag 一起清（滚动 tag 归本次发布独占）；v* 保留 tag。
+            if [ "${IS_PRERELEASE}" = "true" ]; then
+              gh release delete "${TAG_NAME}" -y --cleanup-tag
+            else
+              gh release delete "${TAG_NAME}" -y
+            fi
+            echo "已清理残留 draft release ${TAG_NAME}"
+          else
+            echo "无残留 draft（已发布或未创建）"
+          fi
