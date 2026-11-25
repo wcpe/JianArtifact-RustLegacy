@@ -195,16 +195,16 @@ jobs:
       # 上传该目标的全部资产为工作流构件（过渡版：裸 exe + 压缩包各含校验和），
       # 交由后续 publish job 汇总发布。
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/cache/save@v4
         with:
-          name: asset-${{ matrix.target }}
+          key: asset-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             dist/${{ steps.pack.outputs.asset }}
             dist/${{ steps.pack.outputs.asset }}.sha256
             dist/${{ steps.pack.outputs.zip_asset }}
             dist/${{ steps.pack.outputs.zip_asset }}.sha256
             dist/${{ steps.pack.outputs.zip_asset }}.md5
-          if-no-files-found: error
+          fail-on-cache-miss: false
 
   # 第三步：汇总三目标资产，按渠道发布为 GitHub Release（prerelease 或正式）。
   publish:
@@ -213,12 +213,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # 下载全部目标构件到 dist/（每个构件解包到以其 name 命名的子目录）。
-      - name: 下载全部构建产物
-        uses: actions/download-artifact@v4
+      - name: 还原 linux-musl 构建产物
+        uses: actions/cache/restore@v4
         with:
+          key: asset-x86_64-unknown-linux-musl-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist
-          pattern: asset-*
-          merge-multiple: true
+          fail-on-cache-miss: true
+
+      - name: 还原 windows-msvc 构建产物
+        uses: actions/cache/restore@v4
+        with:
+          key: asset-x86_64-pc-windows-msvc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+          fail-on-cache-miss: true
+
+      - name: 还原 darwin-arm64 构建产物
+        uses: actions/cache/restore@v4
+        with:
+          key: asset-aarch64-apple-darwin-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+          fail-on-cache-miss: true
 
       # 清理旧的 dev 滚动预发布（仅 prerelease 渠道）：每次推 master 的快照资产名内嵌
       # {run_number}+{sha}、各次不同，若不先删旧 dev 预发布，action-gh-release 只会把新资产
